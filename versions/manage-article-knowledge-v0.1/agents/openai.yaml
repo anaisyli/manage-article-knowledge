@@ -1,0 +1,4 @@
+interface:
+  display_name: "文章知识库运营管家 v0.1"
+  short_description: "企业资料处理、文章审核、正式知识沉淀与月度维护简报"
+  default_prompt: "使用 $manage-article-knowledge 处理企业知识库资料、文章审核、正式沉淀或生成月度维护简报；只在必须由我决定时用简单选项询问。"

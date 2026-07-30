@@ -1,0 +1,4 @@
+interface:
+  display_name: "文章知识库运营管家 v0.2"
+  short_description: "自动扫描、文章知识准备、正式沉淀、引用率与月度交接维护"
+  default_prompt: "使用 $manage-article-knowledge 初始化或维护企业文章知识库，并只在固定人工节点需要我确认。"
