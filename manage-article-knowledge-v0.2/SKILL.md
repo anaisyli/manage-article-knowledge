@@ -1,6 +1,6 @@
 ---
 name: manage-article-knowledge
-description: Run a v0.2 article-driven enterprise knowledge-base workflow for content operations in Obsidian. Use when Codex must initialize a client project from a website, source-material path and Obsidian path; inventory and navigate source files; prepare weekly article materials; verify MinerU or operator extraction inputs; propose source-grounded extraction ranges; extract, translate and structure evidence; research true knowledge gaps; review pre-writing knowledge readiness; generate the single approved writing input; process a final article and operator-provided citation rate; automatically deposit reusable knowledge and usage records; or run month-end maintenance and owner-handover audits. Preserve source provenance, separate enterprise-provided industry knowledge from Codex external research, and never infer unsupported enterprise facts or citation percentages.
+description: Run a v0.2 article-driven enterprise knowledge-base workflow for content operations in Obsidian. Use when Codex must initialize a client project from a website, source-material path and Obsidian path; inventory and navigate source files; prepare one or multiple article tasks submitted together; verify MinerU or operator extraction inputs; propose source-grounded extraction ranges; extract, translate and structure evidence; research true knowledge gaps; review pre-writing knowledge readiness; generate each article's approved writing input; process final articles and operator-provided citation rates; automatically deposit reusable knowledge and usage records; or run month-end maintenance and owner-handover audits. Preserve source provenance, separate enterprise-provided industry knowledge from Codex external research, and never infer unsupported enterprise facts or citation percentages.
 ---
 
 # 文章知识库运营管家 v0.2
@@ -41,6 +41,8 @@ description: Run a v0.2 article-driven enterprise knowledge-base workflow for co
 
 不得把正常自动步骤拆成新的人工关口。发现异常时，把异常合并到最近的固定节点；只有无法安全继续时才临时请求具体材料或决定。
 
+同一项目一次提交多篇文章时，允许把同类人工节点集中展示，但必须按文章ID和具体范围分别记录确认结果；不得用一次笼统确认替代各文章的范围、审核、终稿或引用率记录。
+
 ## 核心工作流
 
 ### 1. 初始化项目
@@ -70,6 +72,10 @@ description: Run a v0.2 article-driven enterprise knowledge-base workflow for co
 2. 客户源文件和客户官网中尚未提取的相关部分；
 3. 过去已经调研但尚未正式沉淀的外部知识；
 4. 仍有真实缺口时开展新的外部调研。
+
+一次收到同一项目多篇文章需求时，为每篇分配独立文章ID并建立独立任务目录，不合并大纲、审核、写作输入、终稿或引用率。把批次内各文章的当前节点、依赖、阻塞和下一步汇总到`00_项目管理/20_当前待办.md`，不另建第二套任务队列。
+
+相同源文件、网页、提取稿和项目级证据只处理一次，由多篇文章链接复用。互不依赖的文章局部工作可以并行；有先后依赖的步骤按依赖顺序执行；同一项目级控制文件、集中数据文件或正式知识文件必须串行写入。一篇文章受阻时，不阻塞没有共享依赖的其他文章。
 
 大纲只用于判断相关性和需求覆盖，不作为源文件提取大纲。读取[文章工作流](references/article-workflow.md)和[调研与知识沉淀](references/knowledge-research-and-deposition.md)。
 
@@ -204,7 +210,7 @@ description: Run a v0.2 article-driven enterprise knowledge-base workflow for co
 - 正式知识候选准入、项目知识地图、表格/图表转换、翻译术语、风险标签和自动派生检查：读取[派生资料、表格与翻译细则](references/derived-materials-and-translation.md)。
 - 路径迁移、当前/历史版本、控制信息、Obsidian链接、同步和并发：读取[Obsidian治理细则](references/obsidian-governance-details.md)。
 - MinerU、原生解析、OCR、音视频、网页工具、保密边界和样例验证：读取[工具选择与质量验证](references/tooling-options.md)。
-- 单篇文章的六个人工节点、写作输入和写作后闭环：读取[文章工作流](references/article-workflow.md)。
+- 单篇或批量文章的六个人工节点、任务拆分、并发、写作输入和写作后闭环：读取[文章工作流](references/article-workflow.md)。
 - 本地资料优先级、外部调研、Web Clipper、来源质量和沉淀判断：读取[调研与知识沉淀](references/knowledge-research-and-deposition.md)。
 - 文章前审核、回退、月度维护和负责人交接：读取[文章就绪、月度维护与交接](references/readiness-and-maintenance.md)。
 - 引用率CSV、知识块使用记录、计算口径和触发式评估：读取[引用率与知识使用数据](references/governance-and-citation-metrics.md)。
