@@ -1,0 +1,4 @@
+interface:
+  display_name: "文章知识库运营管家 v0.3"
+  short_description: "主Agent调度资料、调研与独立审核，完成文章知识闭环"
+  default_prompt: "使用 $manage-article-knowledge 由主Agent调度资料处理、外部调研和独立审核，并只在固定人工节点需要我确认。"
