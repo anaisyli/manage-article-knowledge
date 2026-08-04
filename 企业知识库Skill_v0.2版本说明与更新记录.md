@@ -1,6 +1,6 @@
 # 企业知识库 Skill v0.2 版本说明与更新记录
 
-> 版本状态：历史固定版本。`manage-article-knowledge-v0.2/`完整保留，不再接收v0.3的新规则；当前活动版本请查看[企业知识库 Skill v0.3 版本说明与更新记录](企业知识库Skill_v0.3版本说明与更新记录.md)。
+> 版本状态：历史固定版本。`versions/manage-article-knowledge-v0.2/`完整保留，不再接收v0.3的新规则；当前活动版本请查看[企业知识库 Skill v0.3 版本说明与更新记录](企业知识库Skill_v0.3版本说明与更新记录.md)。
 
 ## 文档维护原则
 
@@ -22,15 +22,15 @@
 
 活动版本入口：
 
-- [v0.2主Skill](manage-article-knowledge-v0.2/SKILL.md)
-- [项目与知识结构](manage-article-knowledge-v0.2/references/project-and-knowledge-structure.md)
-- [文章工作流](manage-article-knowledge-v0.2/references/article-workflow.md)
-- [月度维护与交接规则](manage-article-knowledge-v0.2/references/readiness-and-maintenance.md)
-- [任务与输出模板](manage-article-knowledge-v0.2/references/task-and-output-templates.md)
-- [高保真原文证据细则](manage-article-knowledge-v0.2/references/verbatim-evidence-rules.md)
-- [派生资料、表格与翻译细则](manage-article-knowledge-v0.2/references/derived-materials-and-translation.md)
-- [Obsidian治理细则](manage-article-knowledge-v0.2/references/obsidian-governance-details.md)
-- [工具选择与质量验证](manage-article-knowledge-v0.2/references/tooling-options.md)
+- [v0.2主Skill](versions/manage-article-knowledge-v0.2/SKILL.md)
+- [项目与知识结构](versions/manage-article-knowledge-v0.2/references/project-and-knowledge-structure.md)
+- [文章工作流](versions/manage-article-knowledge-v0.2/references/article-workflow.md)
+- [月度维护与交接规则](versions/manage-article-knowledge-v0.2/references/readiness-and-maintenance.md)
+- [任务与输出模板](versions/manage-article-knowledge-v0.2/references/task-and-output-templates.md)
+- [高保真原文证据细则](versions/manage-article-knowledge-v0.2/references/verbatim-evidence-rules.md)
+- [派生资料、表格与翻译细则](versions/manage-article-knowledge-v0.2/references/derived-materials-and-translation.md)
+- [Obsidian治理细则](versions/manage-article-knowledge-v0.2/references/obsidian-governance-details.md)
+- [工具选择与质量验证](versions/manage-article-knowledge-v0.2/references/tooling-options.md)
 
 v0.2保留了v0.1中仍有价值的细节规则，包括原文证据单元和标题子树、表格与图表处理、翻译术语和风险标签、禁用内容保护、版本与路径迁移、Obsidian链接和同步、来源质量、客户沟通卡及实际沉淀记录。它们被拆到专项规则中，避免主Skill过长；被删除的仍只是旧审批门禁和评分机制。
 
@@ -702,4 +702,10 @@ v0.2不再保留以下日常机制：
 
 - 文档由`企业知识库Skill_v0.2功能更新总结.md`统一改名为`企业知识库Skill_v0.2版本说明与更新记录.md`。
 - 明确v0.2为历史固定版本，当前活动版本为v0.3；v0.3的新规则不得回写到v0.2 Skill目录。
-- 仅维护版本文档名称、状态说明和README入口，没有修改`manage-article-knowledge-v0.2/`中的任何Skill规则、模板或脚本。
+- 仅维护版本文档名称、状态说明和README入口，没有修改`versions/manage-article-knowledge-v0.2/`中的任何Skill规则、模板或脚本。
+
+### 2026-08-04｜归档目录调整
+
+- 将冻结的v0.2目录从仓库根目录移动到`versions/manage-article-knowledge-v0.2/`，与v0.1统一归档管理。
+- 本次只调整仓库保存位置，没有修改v0.2中的Skill规则、模板、脚本或版本内容。
+- 同步更新`README.md`、v0.2版本说明和v0.3版本说明中的当前路径与入口链接。

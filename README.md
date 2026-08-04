@@ -40,22 +40,18 @@ manage-article-knowledge/
 ├── README.md
 ├── 企业知识库Skill_v0.2版本说明与更新记录.md
 ├── 企业知识库Skill_v0.3版本说明与更新记录.md
-├── manage-article-knowledge-v0.2/
-│   ├── SKILL.md
-│   ├── agents/
-│   ├── references/
-│   └── scripts/
 ├── manage-article-knowledge-v0.3/
 │   ├── SKILL.md
 │   ├── agents/
 │   ├── references/
 │   └── scripts/
 └── versions/
-    └── manage-article-knowledge-v0.1/
+    ├── manage-article-knowledge-v0.1/
+    └── manage-article-knowledge-v0.2/
 ```
 
 - `manage-article-knowledge-v0.3/`：当前活动版本；
-- `manage-article-knowledge-v0.2/`：固定保留的上一版本；
+- `versions/manage-article-knowledge-v0.2/`：固定保留的上一版本；
 - `versions/manage-article-knowledge-v0.1/`：保留的历史版本；
 - `企业知识库Skill_v0.2版本说明与更新记录.md`：固定保留的v0.2版本定位、功能说明和历史变更；
 - `企业知识库Skill_v0.3版本说明与更新记录.md`：当前v0.3版本原则、允许修改项、实际改动和校验记录。
