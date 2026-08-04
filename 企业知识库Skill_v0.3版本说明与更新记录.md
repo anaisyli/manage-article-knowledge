@@ -2,8 +2,8 @@
 
 ## 版本原则
 
-- v0.3以`manage-article-knowledge-v0.2`的完整内容为基线复制建立，不从头重写。
-- v0.2原目录保持不变，不覆盖、不移动、不删除。
+- v0.3以`versions/manage-article-knowledge-v0.2`的完整内容为基线复制建立，不从头重写。
+- v0.2内容保持冻结，统一归档在`versions/manage-article-knowledge-v0.2/`；不覆盖、不删除、不回写v0.3规则。
 - 本轮只修改Obsidian层级、路径、可见Markdown表格字段和与这些变化直接相关的说明。
 - 本轮不修改多Agent分工、自动化执行、六个人工节点、知识准入标准、引用率算法或机器CSV字段。
 - 未在本说明中登记的v0.2规则不修改。
@@ -51,11 +51,11 @@
 | SK-V03-021 | 操作手册已同步部分新规则，但缺少面向运营的一页式动作顺序、Agent职责和调研通知处理说明 | 在不新增人工节点的前提下，重组操作手册入口，补全实际动作、提交规范、确认回复示例、四类Agent分工、外部调研原文证据和异常处理 | `references/operator-quick-manual.md` | SKILL主流程、目录结构、模板、脚本和v0.2均不修改 |
 | SK-V03-022 | v0.2与v0.3版本文档分别使用“功能更新总结”和“结构与字段更新说明”，命名口径不一致 | 统一改名为`企业知识库Skill_v[版本]版本说明与更新记录.md`，并同步维护版本状态、README入口和内部引用 | 两份版本文档与README | 两个Skill目录及其业务规则不修改 |
 
-本阶段仍明确不修改：`manage-article-knowledge-v0.2/`、六个Obsidian顶层部分、七个正式知识模块及其小部分、正式知识概览字段、正式知识准入标准、四级检索优先级、引用率口径、引用率脚本和机器CSV字段。
+本阶段仍明确不修改：`versions/manage-article-knowledge-v0.2/`中的版本内容、六个Obsidian顶层部分、七个正式知识模块及其小部分、正式知识概览字段、正式知识准入标准、四级检索优先级、引用率口径、引用率脚本和机器CSV字段。
 
 ## 第一阶段明确不修改（历史记录）
 
-- `manage-article-knowledge-v0.2/`全部文件。
+- `versions/manage-article-knowledge-v0.2/`全部文件。
 - `scripts/calculate_monthly_citation_kpi.py`及其CSV字段。
 - 多Agent角色、调度、审核和并发规则（第一阶段限制；第二阶段已按SK-V03-018局部开放）。
 - 自动化机制和自动闭环业务逻辑。
@@ -89,6 +89,12 @@
 - 新的外部调研开始前按文章或批次向用户发送一次非阻塞通知。每个来源分别保存`10_网页或文章原文.md`和`20_调研整理与核验.md`；只有摘要或片段时必须标记原文不完整，不能扩写为全文结论。
 - 新增只读脚本`scripts/inspect_office_container.py`。使用用户提供的《轩泰行业知识库客户提供版.docx》实测，识别10个内嵌PDF和10个媒体对象，未识别嵌入对象为0；包括总目录及red、yellow、black、blue、brown、green、orange、carbon black、TIO2资料。
 - 校验结果：新脚本语法和`--help`通过；44个Markdown表格列数一致；25个Markdown链接均可解析；旧任务文件名无残留；v0.3中无`00_`路径；Skill frontmatter按官方快速校验同等字段规则检查通过。当前运行时缺少PyYAML，因此本轮直接调用官方`quick_validate.py`时未执行完毕；SKILL frontmatter本轮未改动，且第一阶段官方快速校验已通过。
-- `manage-article-knowledge-v0.2/`仍为15个文件且Git差异为空；引用率脚本未修改，v0.2与v0.3 SHA-256仍同为`C9518058806B4D376F8BD5A03873E31FEFA5C5FCF5CBB14D995409C962C7879A`。v0.3现为17个文件，可作为完整独立版本使用。
+- `versions/manage-article-knowledge-v0.2/`仍为15个文件且Git差异为空；引用率脚本未修改，v0.2与v0.3 SHA-256仍同为`C9518058806B4D376F8BD5A03873E31FEFA5C5FCF5CBB14D995409C962C7879A`。v0.3现为17个文件，可作为完整独立版本使用。
 - 操作手册已按SK-V03-021更新：增加“运营实际只做什么”、四类Agent职责、待提交资料规范、范围/样本确认回复示例、外部调研通知与原文保留说明，以及无需运营介入的后台事项；未增加人工节点。
 - 两份版本文档已按SK-V03-022统一为`企业知识库Skill_v0.2版本说明与更新记录.md`和`企业知识库Skill_v0.3版本说明与更新记录.md`；README入口、文档状态和相互引用已同步，两个Skill目录未因改名而修改。
+
+## 仓库归档路径调整（2026-08-04）
+
+- 将历史固定版本v0.2从仓库根目录移动到`versions/manage-article-knowledge-v0.2/`，与v0.1统一归档管理。
+- v0.2的Skill规则、模板、脚本和版本内容保持不变；本次只调整仓库位置。
+- 同步更新`README.md`及v0.2、v0.3两份版本说明中的当前路径和入口链接。
