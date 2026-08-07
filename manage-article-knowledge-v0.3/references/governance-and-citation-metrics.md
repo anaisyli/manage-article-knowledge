@@ -37,9 +37,10 @@ project_id,article_id,article_title,article_version,statistics_month,citation_ra
 
 规则：
 
-- `citation_rate`由内容运营提供，范围`0—100`；
-- `rate_provenance`固定为`operator-provided`；
-- `rate_source`记录提交引用率的文件或消息；
+- `citation_rate`由内容运营或正式平台提供，范围`0—100`；没有提供时保持空值，不填写估算值；
+- `rate_provenance`只使用`operator-provided / platform-provided / not-provided`；
+- `rate_source`记录提交引用率的文件、平台记录或消息；没有提供时可留空；
+- Obsidian可见Markdown固定显示中文：`正式引用率：未提供`、`正式引用率来源：未提供`；机器CSV继续保留英文固定字段和值；
 - 同一项目同一文章在同一统计口径下只保留一个当前纳入版本；
 - 排除文章必须填写`exclusion_reason`；
 - Codex不得用引用清单、文本相似度或自我判断填补缺失引用率。
@@ -142,10 +143,9 @@ project_id,article_id,article_title,article_version,knowledge_id,knowledge_title
 2. 更新文章引用清单；
 3. 更新知识块使用明细；
 4. 重算知识块使用总表；
-5. 记录内容运营提供的引用率；
+5. 记录内容运营或正式平台提供的引用率；没有提供时明确记录`not-provided`；
 6. 更新月度统计快照；
 7. 更新正式知识和沉淀总表；
 8. 在文章任务中链接所有结果。
 
 任一步失败时记录失败点，不把部分数据伪装成完整闭环。
-

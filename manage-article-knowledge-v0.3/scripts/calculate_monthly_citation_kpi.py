@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calculate a monthly KPI from citation rates entered by content operations."""
+"""Calculate a monthly KPI from formally supplied citation rates."""
 
 from __future__ import annotations
 
@@ -28,12 +28,14 @@ REQUIRED_COLUMNS = {
 }
 TRUE_VALUES = {"yes", "true", "1", "y"}
 FALSE_VALUES = {"no", "false", "0", "n"}
+PROVIDED_PROVENANCE = {"operator-provided", "platform-provided"}
+ALLOWED_PROVENANCE = PROVIDED_PROVENANCE | {"not-provided"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate operator-provided per-article rates and calculate their "
+            "Validate formally supplied per-article rates and calculate their "
             "monthly arithmetic mean. This script never infers a per-article rate."
         )
     )
@@ -132,11 +134,24 @@ def main() -> int:
         if not article_version:
             missing.append("article_version")
         rate_text = row["citation_rate"].strip().rstrip("%").strip()
-        if not rate_text:
+        provenance = row["rate_provenance"].strip()
+        if provenance not in ALLOWED_PROVENANCE:
+            raise ValueError(
+                f"rate_provenance must be operator-provided, platform-provided, "
+                f"or not-provided at row {row_number}"
+            )
+        if provenance == "not-provided":
+            if rate_text:
+                raise ValueError(
+                    f"citation_rate must be empty when rate_provenance is "
+                    f"not-provided at row {row_number}"
+                )
             missing.append("citation_rate")
-        if row["rate_provenance"].strip() != "operator-provided":
-            missing.append("rate_provenance=operator-provided")
-        for field in ("rate_source", "input_by", "input_at"):
+        elif not rate_text:
+            missing.append("citation_rate")
+        if provenance in PROVIDED_PROVENANCE and not row["rate_source"].strip():
+            missing.append("rate_source")
+        for field in ("input_by", "input_at"):
             if not row[field].strip():
                 missing.append(field)
         if missing:

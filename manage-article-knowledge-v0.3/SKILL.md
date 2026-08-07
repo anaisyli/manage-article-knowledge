@@ -1,6 +1,6 @@
 ---
 name: manage-article-knowledge
-description: Run a v0.3 article-driven enterprise knowledge-base workflow for content operations in Obsidian. Use when Codex must initialize a client project from a website, source-material path and Obsidian path; inventory and navigate source files; prepare one or multiple article tasks submitted together; create Codex extractions or verify operator-submitted extraction inputs; propose source-grounded extraction ranges; extract, translate and structure evidence; research true knowledge gaps; review pre-writing knowledge readiness; generate each article's approved writing input; process final articles and operator-provided citation rates; automatically deposit reusable knowledge and usage records; or run month-end maintenance and owner-handover audits. Preserve source provenance, separate enterprise-provided industry knowledge from Codex external research, and never infer unsupported enterprise facts or citation percentages.
+description: Run a v0.3 article-driven enterprise knowledge-base workflow for content operations in Obsidian. Use when Codex must initialize a client project from a website, source-material path and Obsidian path; inventory and navigate source files; prepare one or multiple article tasks submitted together; create Codex extractions or verify operator-submitted extraction inputs; propose source-grounded extraction ranges; extract, translate and structure evidence; research true knowledge gaps; review pre-writing knowledge readiness; generate each article's approved writing input; process final articles and formally supplied citation rates; automatically deposit reusable knowledge and usage records; or run month-end maintenance and owner-handover audits. Preserve source provenance, separate enterprise-provided industry knowledge from Codex external research, and never infer unsupported enterprise facts or citation percentages.
 ---
 
 # 文章知识库运营管家 v0.3
@@ -10,6 +10,8 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 以文章需求驱动客户知识库持续增长。项目初始化只建立可追溯的文件总表和内容导航，不为形式上的完整而全量提取所有历史资料。每篇文章优先复用正式知识，再处理尚未提取的客户资料，再复用已有外部调研，最后才开展新调研。
 
 让人工只介入确实需要业务判断的位置。正常处理、归类、翻译、派生、沉淀、引用清单、知识块使用记录和月度汇总由Codex自动完成。
+
+固定四层职责，任何文件不得越权：源文件级清理稿负责保真和复用；文章写作输入负责筛选已批准的完整来源段落并按大纲重排，不负责把正文总结成知识点；正式知识负责沉淀稳定、可追溯的知识；文章终稿只触发沉淀并记录使用。文章写作输入、文章摘要、AI总结和最终文章都不能成为正式知识的事实来源。
 
 ## 不可突破的边界
 
@@ -26,6 +28,10 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 - 不把外部候选链接逐页交给运营批准；只在访问失败、来源冲突或事实风险时要求人工处理。
 - 开始新的外部调研前必须按文章或批次向用户说明真实缺口、调研范围和使用边界；正常公开调研是非阻塞通知，不逐链接等待批准。
 - 不设置独立的派生处理确认或正式知识沉淀确认。
+- 面向内容运营的目录、管理字段、审核、状态、异常和处理记录默认使用中文；只在源正文、目标语言文章输入、专有名词和机器CSV字段中按需保留英文。
+- 不按文章复制运营提交稿、来源证据或清理稿；一份来源同一版本只有一个项目级当前稿。
+- 不把内容运营提出的“以后问客户”当成客户已确认，也不把它只留在即将归档的文章审核中；同一客户事实只在项目级待客户补充事项中维护一份当前记录。
+- 不把写作输入做成知识点卡、资料摘要或AI综合结论。可以按大纲筛选和重排来源内容，但选中的段落、连续语义块、表格和公式必须完整保留；不得以更短的改写替代。
 
 ## 固定人工节点
 
@@ -90,7 +96,7 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 - Office容器中的相关嵌入附件是否已登记，内嵌PDF/PPT是否已有对应Markdown稿；
 - 原文件是否仍可访问并能与提取稿对应。
 
-只向运营列出本篇必须提交的具体材料，不让运营自行判断需要什么。收到补充稿后，Codex原样保存到`运营提交`，并检查文件可读性、来源对应、页段完整性、顺序、数字、表格和明显改写风险。PDF/PPT的运营Markdown稿是必需输入，Codex仍须结合原文件核验和补充，不能用自己的直接提取替代该稿。Codex自行生成的其他内容统一保存到`Codex提取`。MinerU、OCR或其他解析工具只作为技术手段，不单独建立Obsidian分类。
+只向运营列出本篇必须提交的具体材料，不让运营自行判断需要什么。收到补充稿后，Codex原样保存到项目级`运营提交`，一份来源同一版本只保存一次，并登记关联文章。检查文件可读性、来源对应、页段完整性、顺序、数字、表格和明显改写风险。PDF/PPT的运营Markdown稿是必需输入；先用源文件确认版本、页数、标题结构和复杂内容位置，Markdown合格时直接采用，发现断行、表格、公式或结构损失时才对异常页段使用原文件提取、OCR或版面解析补正并记录差异。Codex自行生成的其他内容统一保存到项目级`Codex提取`。MinerU、OCR或其他解析工具只作为技术手段，不单独建立Obsidian分类。
 
 ### 4. 确认提取范围与处理样本
 
@@ -126,6 +132,8 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 - 可复用客户来源知识的自动归类与正式沉淀；
 - 处理结果和异常展示。
 
+每份源文件只维护一份当前清理与字段统一稿，可以只覆盖文章已确认页段。清理稿必须恢复自然段、标题层级、Markdown表格、公式和页码定位；不得生成文章话题稿，不得把多份PDF合并成巨型清理稿。处理结果、差异和旧稿进入处理记录或归档。
+
 主Agent调度资料处理Agent完成客户资料处理，必要时调度调研Agent补公开知识缺口，并调度审核Agent独立对照原文件、运营提交稿、网站范围和处理结果查漏查错。只有主Agent可以合并结果、向用户作出流程决定并写入正式知识；三个子Agent不得互相以结论代替证据。读取[多Agent分工与独立审核](references/multi-agent-orchestration.md)。
 
 不再设置派生处理执行确认。结构、数字、术语、公开权限或来源出现实质风险时，在处理结果中标出，并进入文章前知识审核。
@@ -150,21 +158,25 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 - 公开范围、客户名称、价格、认证、效果和承诺是否有风险；
 - 是否存在无来源推断、冲突或不能写的内容。
 
-审核Agent必须独立寻找遗漏页、第二页或隐藏交互、未登记附件、复杂图表误读和与主处理结论相反的证据；审核结论只允许`有证据通过`、`带明确排除通过`或`升级人工处理`，不得以多个Agent意见一致作为通过依据。
+审核Agent必须独立寻找遗漏页、第二页或隐藏交互、未登记附件、复杂图表误读和与主处理结论相反的证据，并返回实际读取、未读取、证据定位、反例和不确定点清单；审核结论只允许`有证据通过`、`带明确排除通过`或`升级人工处理`，不得以多个Agent意见一致作为通过依据。文章前审核通过后，主Agent先生成写作输入草稿，审核Agent再逐块对照确认范围、清理稿、官网原文和正式知识，检查是否把已选正文压缩为摘要、遗漏限定条件或融合成无来源的新结论。生成草稿前和交付写作输入前都必须运行v0.3项目校验，机器错误未清零或保真复核未通过时不得交付。
+
+内容运营把某个客户专属事实标记为“以后问客户”时，主Agent立即为该事实分配唯一问题ID，并在`05_数据与审核/30_异常与待决定/10_企业知识异常待处理/01_待客户补充事项.md`登记。文章审核只保留问题ID、项目级链接和当前文章的安全处理，不复制长期状态。状态只使用`待整理 / 待发送 / 已发送待回复 / 已回复待复核 / 已解决 / 无法取得 / 已关闭不再询问`。非核心内容在明确排除或安全改写后可以继续写作，但项目级事项保持未关闭；核心事实无法绕开时继续阻塞受影响文章。客户回复后登记证据位置，只重跑受影响节点；没有客户证据前不得写入正式知识。
 
 问题只返回其来源步骤。处理完成后重新审核受影响部分，不重跑全部流程。审核通过后生成`30_文章写作输入.md`。
 
 ### 8. 生成唯一写作输入
 
-把`30_文章写作输入.md`生成为可直接上传给写文章Skill的本篇知识库附件。内容运营在写文章Skill中另行填写关键词、标题、大纲和其他写作要求；附件本身只保留文章身份、目标语言、按大纲组织的获准知识、来源定位、数据日期和必要使用边界，不混入处理过程或完整审核报告。
+把`30_文章写作输入.md`生成为可直接上传给写文章Skill的本篇知识库附件。内容运营在写文章Skill中另行填写关键词、标题、大纲和其他写作要求；附件本身只保留文章身份、目标语言、按大纲组织的获准正文、来源定位、数据日期和必要使用边界，不混入处理过程或完整审核报告。不得按源文件堆放；一个大纲位置可以组合多份来源，但不同来源分别成块，每个段落或连续知识块都必须附一个最有用的来源链接和精确位置。
+
+写作输入执行“筛选，不总结”：可以从确认范围中去掉与本篇无关的完整段落，也可以把不同来源的相关段落移到对应大纲位置；一旦选中某段或连续语义块，就保留其完整解释、条件、例子、例外和上下文。目标语言不同则逐段忠实翻译，不得压缩、概括、润色成知识点卡或把多来源融合成AI综合正文。Codex派生的比较框架、结论建议、FAQ组织和风险提醒只能放在单独的`写作边界与可选组织提示`中，不能替代来源正文。
 
 翻译内容只放经过核验的目标语言版本。中文原文默认留在后台证据层，不进入写作输入；仅在译法歧义、关键术语或数字风险确实需要时，补充最小范围中文核对信息并明确标为`仅供核对`。复杂参数或对比表保留目标语言Markdown表格的结构、数字、型号、单位和限定条件，并附不增加新事实的简短写作可用说明；简单表格可转成列表或文字。
 
-源文件、Codex提取、运营提交稿、完整原表、中文原文、整理稿、审核记录和正式知识继续保留用于追溯和返工，但不要求写作者逐个打开。需求、来源、知识或大纲变化时，把旧写作输入移入`90_归档/10_文章历史版本/`并重新生成。
+源文件、Codex提取、运营提交稿、完整原表、中文原文、整理稿、审核记录和正式知识继续保留用于追溯和返工，但不要求写作者逐个打开。写作输入草稿生成后，审核Agent逐个来源块核对采用范围、未迁入内容及理由、正文完整性、表格/公式和就地来源；通过后主Agent把`20_文章前知识审核.md`中的`当前写作输入`更新为当前文件链接并记录保真复核结论，再把文章移入等待终稿。需求、来源、知识或大纲变化时，把旧写作输入移入`90_归档/10_文章历史版本/`并重新生成。
 
 ### 9. 写作后自动闭环
 
-收到最终文章标题、完整正文和内容运营提供的引用率后，自动：
+收到最终文章标题、完整正文后自动闭环；正式引用率有则记录，没有则写`未提供`，本地连续词组覆盖率不得代替。自动：
 
 1. 匹配文章任务并锁定版本；
 2. 对照写作输入和来源识别实际使用的知识块；
@@ -176,15 +188,17 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 8. 把已使用且合格的外部行业知识沉淀到`02_正式知识/50_行业知识与洞察/20_Codex外部调研/`；
 9. 把动态价格、库存和阶梯价留在数据快照，把未使用外部调研留在待决定区；
 10. 更新正式知识目录、集中沉淀记录、月度数据和待办；
-11. 关闭文章任务。
+11. 运行v0.3项目校验，修复断链、占位符、表格、状态、旧电脑路径、来源权威链和管理语言问题；
+12. 原子移动完整文章目录并同步总览、状态列表、工作台、终稿、写作输入、清理稿范围链接和集中数据；
+13. 全部成功后关闭文章任务。
 
-正式知识不得按文章标题、文章选品组合、提取批次、单个网页抓取任务或抓取日期命名。产品使用稳定SPU/型号知识ID，政策更新同一当前文件并把旧版移入历史；源证据按来源身份保存，不因被新文章复用而复制。已有正式知识被使用时只更新集中使用数据，不重复沉淀。
+正式知识不得按文章标题、文章选品组合、文章写作输入、提取批次、单个网页抓取任务、单份来源文件或抓取日期命名。产品使用稳定SPU/型号知识ID，政策更新同一当前文件并把旧版移入历史；源证据按来源身份保存，不因被新文章复用而复制。正式行业知识保留足够完整、可复用的正文和结构，但不得机械复制整份清理稿；已有正式知识被使用时只更新集中使用数据，不重复沉淀。
 
 不再询问“要不要沉淀”或“沉淀到哪里”。无法追溯的新企业事实、来源冲突、过期数据和不可靠外部内容进入异常待处理，不写入正式知识。
 
 ### 10. 月度维护与项目交接
 
-月末生成五部分维护简报：运行与规范、知识库基础情况、本月提取与沉淀、月度引用率、问题与闭环。发现几项记录几项，不限制行动数量。负责人变化时生成交接审核，确认路径、负责人、任务、待处理知识、引用率缺失和最近问题。
+月末生成五部分维护简报：运行与规范、知识库基础情况、本月提取与沉淀、月度引用率、问题与闭环。发现几项记录几项，不限制行动数量，并检查待客户补充事项的负责人、状态、发送日期、回复证据和长期未更新项。负责人变化时生成交接审核，确认路径、负责人、任务、待处理知识、待客户补充事项、引用率缺失和最近问题。
 
 读取[文章就绪、月度维护与交接](references/readiness-and-maintenance.md)和[引用率与知识使用数据](references/governance-and-citation-metrics.md)。
 
@@ -226,3 +240,4 @@ description: Run a v0.3 article-driven enterprise knowledge-base workflow for co
 - 引用率CSV、知识块使用记录、计算口径和触发式评估：读取[引用率与知识使用数据](references/governance-and-citation-metrics.md)。
 - 生成实际Markdown或CSV文件：读取[任务与输出模板](references/task-and-output-templates.md)。
 - 用户询问“怎么操作、应该提供什么”或需要交接培训：读取[内容运营操作手册](references/operator-quick-manual.md)。
+- 生成写作输入、写入正式知识、移动文章状态或关闭任务前：运行`scripts/validate_v03_project.py --project <Obsidian项目根路径>`；存在`ERROR`时先修复，不得继续迁移状态。
