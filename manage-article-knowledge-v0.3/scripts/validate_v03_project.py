@@ -4,12 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import html
 import json
 import re
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from urllib.parse import unquote
+
+
+UTF8_BOM = b"\xef\xbb\xbf"
 
 
 REQUIRED_TOP_DIRS = (
@@ -46,15 +54,270 @@ CUSTOMER_REQUEST_RELATIVE = Path(
     "05_数据与审核/30_异常与待决定/10_企业知识异常待处理/01_待客户补充事项.md"
 )
 
-CUSTOMER_REQUEST_STATUSES = {
-    "待整理",
-    "待发送",
-    "已发送待回复",
-    "已回复待复核",
-    "已解决",
-    "无法取得",
-    "已关闭不再询问",
+SOURCE_ANOMALY_RELATIVE = Path(
+    "05_数据与审核/30_异常与待决定/10_企业知识异常待处理/02_源文与事实异常台账.md"
+)
+
+WORKBENCH_TODO_RELATIVE = Path("01_工作台/20_当前待办.md")
+VERSION_ENTRY_RELATIVE = Path("01_工作台/30_版本与变更入口.md")
+CHECK_ENTRY_RELATIVE = Path("05_数据与审核/01_检查入口/01_当前待办.md")
+SKILL_FEEDBACK_RELATIVE = Path(
+    "05_数据与审核/30_异常与待决定/30_Skill运行反馈/01_Skill反馈台账.md"
+)
+
+DATA_EXPLANATION_RELATIVE = Path(
+    "05_数据与审核/20_知识使用与引用/01_数据说明.md"
+)
+
+DATA_EXPLANATION_HEADERS = (
+    "文件",
+    "类型",
+    "用途",
+    "维护责任",
+    "是否允许人工编辑",
+    "更新触发",
+    "查看方式",
+    "编码/格式",
+    "最近校验",
+)
+
+IGNORED_VAULT_DIRS = {".obsidian", ".git", ".trash"}
+IGNORED_VAULT_FILES = {".ds_store", "thumbs.db", "desktop.ini"}
+FORBIDDEN_RUNTIME_DIRS = {
+    "scripts",
+    "cache",
+    "temp",
+    "tmp",
+    ".cache",
+    ".temp",
+    ".tmp",
+    "__pycache__",
+    "node_modules",
 }
+FORBIDDEN_RUNTIME_SUFFIXES = {".py", ".pyc", ".pyo", ".tmp", ".temp", ".swp"}
+
+CUSTOMER_REQUEST_HEADERS = (
+    "问题ID",
+    "想向客户确认什么",
+    "为什么需要",
+    "回复前怎么处理",
+    "当前阶段",
+    "下一步由谁做",
+    "最近更新",
+)
+
+CUSTOMER_REQUEST_STAGES = {
+    "待判断要不要问",
+    "无需询问",
+    "准备客户话术",
+    "等待发送",
+    "等待客户回复",
+    "收到回复，待核实",
+    "已完成",
+}
+
+SOURCE_ANOMALY_HEADERS = (
+    "异常ID",
+    "通俗说明",
+    "原文是否修复",
+    "现在怎么处理",
+    "当前阶段",
+    "谁需要做什么",
+    "下一步或重开条件",
+)
+
+SOURCE_REPAIR_STATES = {"未修复", "部分修复", "已修复", "无法判断"}
+
+SOURCE_ANOMALY_STAGES = {
+    "待判断",
+    "等待材料",
+    "处理中",
+    "部分解决",
+    "已解决",
+    "已完成处置（原文未修复）",
+}
+
+SOURCE_EVIDENCE_COMPLETENESS = {"完整", "截断片段", "仅截图", "无法取得完整正文"}
+SOURCE_EVIDENCE_TYPES = {"逐字文本", "原表", "原公式", "页面截图", "音视频时间码"}
+
+SKILL_FEEDBACK_HEADERS = (
+    "反馈ID",
+    "人话说明",
+    "提出来源",
+    "类型",
+    "当前阶段",
+    "影响",
+    "下一步",
+    "最近更新",
+)
+
+SKILL_FEEDBACK_ORIGINS = {"Codex自动发现", "人工提出"}
+SKILL_FEEDBACK_TYPES = {"缺陷", "规则歧义", "校验遗漏", "模板与可读性", "流程改进", "环境兼容"}
+SKILL_FEEDBACK_STAGES = {
+    "自动记录，待维护判断",
+    "人工提出，待维护判断",
+    "已纳入维护",
+    "维护中",
+    "已修复，待项目验证",
+    "已关闭",
+    "转为项目问题",
+    "不纳入Skill",
+}
+
+FORMAL_REQUIRED_DIRS = (
+    "02_正式知识/20_产品介绍/10_产品类目",
+    "02_正式知识/20_产品介绍/20_产品主数据",
+    "02_正式知识/20_产品介绍/30_重点产品卡",
+    "02_正式知识/50_行业知识与洞察/10_企业提供",
+    "02_正式知识/50_行业知识与洞察/20_Codex外部调研",
+)
+
+FORMAL_TYPE_DIRS = {
+    "产品类目": "02_正式知识/20_产品介绍/10_产品类目/",
+    "产品主数据": "02_正式知识/20_产品介绍/20_产品主数据/",
+    "重点产品卡": "02_正式知识/20_产品介绍/30_重点产品卡/",
+    "行业知识": "02_正式知识/50_行业知识与洞察/",
+}
+
+FORMAL_TYPES = {
+    "公司概述",
+    "产品类目",
+    "产品主数据",
+    "重点产品卡",
+    "解决方案",
+    "合作案例",
+    "行业知识",
+    "FAQ",
+    "其他",
+}
+
+FORMAL_FILE_FIELDS = (
+    "知识ID",
+    "正式知识类型",
+    "知识状态",
+    "来源类型",
+    "数据或版本日期",
+    "最近核验日期",
+    "使用前复核",
+)
+
+FORMAL_CLAIM_FIELDS = (
+    "知识ID",
+    "知识类型",
+    "适用范围",
+    "不可外推",
+    "来源",
+    "精确位置",
+    "数据日期",
+    "使用前复核",
+)
+
+CANDIDATE_RELATIVE = Path("05_数据与审核/10_知识沉淀与分流/10_知识候选分流.md")
+DEPOSITION_STATE_RELATIVE = Path("05_数据与审核/10_知识沉淀与分流/20_知识沉淀记录.md")
+DEPOSITION_EVENT_RELATIVE = Path("05_数据与审核/10_知识沉淀与分流/40_正式知识沉淀记录.csv")
+CLAIM_USAGE_DETAIL_RELATIVE = Path("05_数据与审核/20_知识使用与引用/20_知识块使用明细.csv")
+CLAIM_USAGE_TOTAL_RELATIVE = Path("05_数据与审核/20_知识使用与引用/30_知识块使用总表.md")
+CLAIM_MANIFEST_DIR_RELATIVE = Path("05_数据与审核/20_知识使用与引用/40_文章引用清单")
+
+CANDIDATE_HEADERS = (
+    "候选ID",
+    "内容主题",
+    "来源类型",
+    "就绪来源文件",
+    "原文精确位置",
+    "稳定实体/主题键",
+    "主归属模块",
+    "预定正式路径",
+    "CLAIM数量",
+    "处理状态",
+    "校验结果/异常",
+    "正式知识ID或处理位置",
+    "最近更新",
+)
+
+CANDIDATE_STATUSES = {
+    "待核验",
+    "可自动沉淀",
+    "部分可沉淀",
+    "异常待处理",
+    "已沉淀",
+    "不沉淀",
+}
+
+CLAIM_USAGE_HEADERS = (
+    "project_id",
+    "article_id",
+    "article_title",
+    "article_version",
+    "claim_id",
+    "knowledge_id",
+    "knowledge_title",
+    "knowledge_path",
+    "article_location",
+    "source_location",
+    "use_type",
+    "usage_status",
+    "confirmed_at",
+    "issue_flag",
+    "citation_manifest",
+)
+
+CLAIM_USAGE_STATUSES = {"尚未核对", "已确认使用", "未使用", "未追踪"}
+
+CLAIM_TOTAL_HEADERS = (
+    "CLAIM ID",
+    "所属正式知识ID",
+    "标题",
+    "正式知识位置",
+    "来源类型",
+    "已确认使用文章",
+    "累计使用次数",
+    "尚未核对文章数",
+    "最近使用日期",
+    "异常数",
+    "当前追踪状态",
+)
+
+CLAIM_MANIFEST_HEADERS = (
+    "文章位置/主张",
+    "CLAIM ID",
+    "所属正式知识ID",
+    "正式知识位置",
+    "原始来源与精确位置",
+    "使用方式",
+    "使用判断",
+    "异常处理",
+)
+
+DEPOSITION_STATE_HEADERS = (
+    "知识ID",
+    "稳定实体或主题键",
+    "标题",
+    "来源类型",
+    "原始来源",
+    "处理状态",
+    "主归属模块",
+    "正式知识位置",
+    "数据或版本日期",
+    "更新条件",
+    "使用限制或待决定事项",
+    "最近更新日期",
+)
+
+DEPOSITION_EVENT_HEADERS = (
+    "date",
+    "knowledge_id",
+    "claim_ids",
+    "entity_key",
+    "action",
+    "formal_file",
+    "heading",
+    "source_refs",
+    "source_ready_artifact",
+    "status",
+    "operator",
+    "notes",
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +338,26 @@ def relpath(path: Path, root: Path) -> str:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def skill_file(path: Path | None = None) -> Path:
+    candidate = path if path is not None else Path(__file__).resolve().parent.parent
+    return (candidate / "SKILL.md" if candidate.is_dir() else candidate).resolve()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def normalize_sha256(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"(?i)\b[0-9a-f]{64}\b", value)
+    return match.group(0).upper() if match else None
 
 
 def line_number(text: str, start: int) -> int:
@@ -106,24 +389,246 @@ def is_separator_row(line: str) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
 
 
-def resolve_local_link(source: Path, target: str, root: Path) -> bool:
+def markdown_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def find_markdown_table(
+    text: str,
+    required_headers: tuple[str, ...],
+) -> tuple[list[str], list[tuple[int, dict[str, str]]]] | None:
+    """Return the first Markdown table whose header contains all required fields."""
+    lines = text.splitlines()
+    for index in range(len(lines) - 1):
+        if not lines[index].lstrip().startswith("|") or not is_separator_row(lines[index + 1]):
+            continue
+        headers = markdown_cells(lines[index])
+        if not all(header in headers for header in required_headers):
+            continue
+        rows: list[tuple[int, dict[str, str]]] = []
+        cursor = index + 2
+        while cursor < len(lines) and lines[cursor].lstrip().startswith("|"):
+            cells = markdown_cells(lines[cursor])
+            if len(cells) == len(headers) and any(cells):
+                rows.append((cursor + 1, dict(zip(headers, cells))))
+            cursor += 1
+        return headers, rows
+    return None
+
+
+def has_clickable_link(value: str) -> bool:
+    return bool(
+        re.search(r"\[[^\]\n]+\]\((?:<[^>]+>|[^)\n]+)\)", value)
+        or re.search(r"\[\[[^\]\n]+\]\]", value)
+    )
+
+
+def anomaly_detail(text: str, anomaly_id: str) -> str | None:
+    match = re.search(
+        rf"(?ms)^###\s+{re.escape(anomaly_id)}(?:｜[^\n]+)?\s*$\n(.*?)(?=^###\s+|^##\s+已完成处置与历史\s*$|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else None
+
+
+def customer_detail(text: str, request_id: str) -> str | None:
+    match = re.search(
+        rf"(?ms)^###\s+{re.escape(request_id)}(?:｜[^\n]+)?\s*$\n(.*?)(?=^###\s+|^##\s+|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else None
+
+
+def skill_feedback_detail(text: str, feedback_id: str) -> str | None:
+    match = re.search(
+        rf"(?ms)^###\s+{re.escape(feedback_id)}(?:｜[^\n]+)?\s*$\n(.*?)(?=^###\s+|^##\s+已关闭与不纳入\s*$|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else None
+
+
+def heading_body(text: str, heading_pattern: str) -> str | None:
+    match = re.search(
+        rf"(?ms)^#####\s+{heading_pattern}\s*$\n(.*?)(?=^####[#]?\s+|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else None
+
+
+def verbatim_body(text: str) -> str:
+    fenced = [
+        match.group(1).strip()
+        for match in re.finditer(r"(?ms)^```(?:text)?\s*$\n(.*?)^```\s*$", text)
+    ]
+    quoted = [
+        value.strip()
+        for value in re.findall(r"(?m)^>\s*(.+)$", text)
+        if not value.lstrip().startswith("[")
+    ]
+    return "\n".join(fenced + quoted).strip()
+
+
+def unprotected_double_percent_lines(text: str) -> list[int]:
+    result: list[int] = []
+    fence_char: str | None = None
+    fence_length = 0
+    for number, line in enumerate(text.splitlines(), 1):
+        fence = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if fence_char is None:
+                fence_char = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length:
+                fence_char = None
+                fence_length = 0
+            continue
+        if fence_char is not None:
+            continue
+        without_inline_code = re.sub(r"`+[^`\n]*`+", "", line)
+        if "%%" in without_inline_code:
+            result.append(number)
+    return result
+
+
+def read_csv_rows(path: Path) -> tuple[list[str], list[tuple[int, dict[str, str]]]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        headers = list(reader.fieldnames or [])
+        rows = [(line, {key: (value or "").strip() for key, value in row.items()}) for line, row in enumerate(reader, 2)]
+    return headers, rows
+
+
+def split_link_target(target: str) -> tuple[str, str | None]:
     target = target.strip().strip("<>")
-    target = target.split("#", 1)[0]
-    if not target or re.match(r"^(https?://|mailto:|obsidian://)", target, re.I):
-        return True
-    target = target.replace("%20", " ")
-    candidate = (source.parent / target).resolve()
-    if candidate.exists() or candidate.with_suffix(".md").exists():
-        return True
-    vault_candidate = root.joinpath(*target.replace("\\", "/").split("/")).resolve()
-    return vault_candidate.exists() or vault_candidate.with_suffix(".md").exists()
+    path, separator, anchor = target.partition("#")
+    return unquote(path).strip(), unquote(anchor).strip() if separator else None
+
+
+def resolve_markdown_link_target(source: Path, target: str, root: Path) -> Path | None:
+    path, _ = split_link_target(target)
+    if re.match(r"^(https?://|mailto:|obsidian://)", path, re.I):
+        return None
+    if not path:
+        return source.resolve()
+    normalized = path.replace("\\", "/")
+    candidates = [source.parent / normalized, root.joinpath(*normalized.split("/"))]
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.exists():
+            return candidate
+        markdown_candidate = candidate.with_suffix(".md")
+        if not candidate.suffix and markdown_candidate.exists():
+            return markdown_candidate
+    return None
 
 
 def build_basename_map(files: list[Path]) -> dict[str, list[Path]]:
     result: dict[str, list[Path]] = {}
     for file in files:
         result.setdefault(file.stem, []).append(file)
+        if file.name != file.stem:
+            result.setdefault(file.name, []).append(file)
     return result
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def is_ignored_vault_file(path: Path, root: Path) -> bool:
+    relative = path.relative_to(root)
+    return relative.name.lower() in IGNORED_VAULT_FILES or any(
+        part.lower() in IGNORED_VAULT_DIRS for part in relative.parts[:-1]
+    )
+
+
+def iter_link_targets(text: str) -> list[str]:
+    targets = [
+        match.group(1).strip()
+        for match in re.finditer(r"!?\[[^\]\n]*\]\((<[^>]+>|[^)\n]+)\)", text)
+    ]
+    targets.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"!?\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]", text)
+    )
+    return targets
+
+
+def resolve_vault_target(source: Path, target: str, root: Path, vault_files: list[Path]) -> Path | None:
+    target, _ = split_link_target(target)
+    if not target or re.match(r"^(https?://|mailto:|obsidian://)", target, re.I):
+        return None
+
+    normalized = target.replace("\\", "/")
+    candidates = [source.parent / normalized, root.joinpath(*normalized.split("/"))]
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.is_file() and is_within(candidate, root.resolve()):
+            return candidate
+        markdown_candidate = candidate.with_suffix(".md")
+        if not candidate.suffix and markdown_candidate.is_file() and is_within(markdown_candidate, root.resolve()):
+            return markdown_candidate
+
+    if "/" not in normalized:
+        matches = [file for file in vault_files if file.name == normalized or file.stem == normalized]
+        if len(matches) == 1:
+            return matches[0].resolve()
+    return None
+
+
+def normalize_anchor(value: str) -> str:
+    value = html.unescape(unquote(value)).strip()
+    value = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"\[\[[^\]|]+\|([^\]]+)\]\]", r"\1", value)
+    value = re.sub(r"\[\[([^\]]+)\]\]", r"\1", value)
+    value = re.sub(r"[`*_~]", "", value)
+    value = re.sub(r"\\([\\`*_{}\[\]()#+.!|~-])", r"\1", value)
+    value = unicodedata.normalize("NFKC", value)
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def markdown_anchors(text: str) -> tuple[set[str], dict[str, list[int]]]:
+    headings: set[str] = set()
+    block_ids: dict[str, list[int]] = {}
+    fence_char: str | None = None
+    fence_length = 0
+    for number, line in enumerate(text.splitlines(), 1):
+        fence = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if fence_char is None:
+                fence_char = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length:
+                fence_char = None
+                fence_length = 0
+            continue
+        if fence_char is not None:
+            continue
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            value = re.sub(r"\s+#+\s*$", "", heading.group(1)).strip()
+            headings.add(normalize_anchor(value))
+        block = re.search(r"(?:^|\s)\^([A-Za-z0-9-]+)\s*$", line)
+        if block:
+            block_ids.setdefault(block.group(1).casefold(), []).append(number)
+    return headings, block_ids
+
+
+def anchor_exists(target: Path, anchor: str | None, text_cache: dict[Path, str]) -> bool:
+    if anchor is None or not anchor or target.suffix.lower() != ".md":
+        return True
+    text = text_cache.get(target, read_text(target))
+    headings, block_ids = markdown_anchors(text)
+    if anchor.startswith("^"):
+        return anchor[1:].casefold() in block_ids
+    return normalize_anchor(anchor) in headings
 
 
 def parse_field(text: str, name: str) -> str | None:
@@ -136,6 +641,55 @@ def parse_field(text: str, name: str) -> str | None:
         if match:
             return match.group(1).strip()
     return None
+
+
+def parse_formal_field(text: str, name: str) -> str | None:
+    """Read a Chinese bullet field or its supported YAML equivalent."""
+    value = parse_field(text, name)
+    if value:
+        return value
+    yaml_names = {
+        "知识ID": "knowledge_id",
+        "正式知识类型": "formal_type",
+        "稳定实体键": "entity_key",
+        "稳定主题键": "topic_key",
+        "知识状态": "knowledge_status",
+        "来源类型": "source_type",
+        "数据或版本日期": "data_date",
+        "最近核验日期": "verified_date",
+        "使用前复核": "review_before_use",
+    }
+    yaml_name = yaml_names.get(name)
+    if not yaml_name:
+        return None
+    match = re.search(rf"(?mi)^{re.escape(yaml_name)}\s*:\s*(.+?)\s*$", text)
+    return match.group(1).strip().strip('"\'') if match else None
+
+
+def section_body(text: str, heading: str) -> str | None:
+    match = re.search(
+        rf"(?ms)^##\s+{re.escape(heading)}\s*$\n(.*?)(?=^##\s+|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else None
+
+
+def formal_claim_blocks(text: str) -> list[tuple[str, str, int]]:
+    matches = list(re.finditer(r"(?m)^###\s+(CLAIM-[^\n]+?)\s*$", text))
+    blocks: list[tuple[str, str, int]] = []
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        section_end = re.search(r"(?m)^##\s+", text[match.end():next_start])
+        end = match.end() + section_end.start() if section_end else next_start
+        blocks.append((match.group(1).strip(), text[match.end():end], line_number(text, match.start())))
+    return blocks
+
+
+def is_substantive(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = re.sub(r"[\s。；;，,、\-]", "", value)
+    return normalized not in {"", "无", "未注明", "待补", "待确认", "不适用", "未知"}
 
 
 def parse_int_field(text: str, name: str) -> int | None:
@@ -173,7 +727,7 @@ def extract_headings(text: str) -> list[str]:
     return [match.group(1).strip() for match in re.finditer(r"(?m)^#{2,6}\s+(.+?)\s*$", text)]
 
 
-def validate_project(root: Path) -> list[Issue]:
+def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issue]:
     issues: list[Issue] = []
 
     def add(severity: str, code: str, file: Path | None, line: int, message: str) -> None:
@@ -197,10 +751,194 @@ def validate_project(root: Path) -> list[Issue]:
             "缺少项目级待客户补充事项总表",
         )
 
-    md_files = sorted(root.rglob("*.md"))
+    source_anomaly_file = root / SOURCE_ANOMALY_RELATIVE
+    if not source_anomaly_file.is_file():
+        add(
+            "ERROR",
+            "MISSING_SOURCE_ANOMALY_LEDGER",
+            source_anomaly_file,
+            0,
+            "缺少项目级源文与事实异常台账",
+        )
+
+    workbench_todo_file = root / WORKBENCH_TODO_RELATIVE
+    version_entry_file = root / VERSION_ENTRY_RELATIVE
+    check_entry_file = root / CHECK_ENTRY_RELATIVE
+    skill_feedback_file = root / SKILL_FEEDBACK_RELATIVE
+    for required_file, code, message in (
+        (workbench_todo_file, "MISSING_WORKBENCH_TODO", "缺少唯一项目当前状态正文20_当前待办.md"),
+        (version_entry_file, "MISSING_VERSION_ENTRY", "缺少版本与变更入口"),
+        (check_entry_file, "MISSING_CHECK_ENTRY", "缺少数据与审核检查入口"),
+        (skill_feedback_file, "MISSING_SKILL_FEEDBACK_LEDGER", "缺少项目级Skill反馈台账"),
+    ):
+        if not required_file.is_file():
+            add("ERROR", code, required_file, 0, message)
+
+    vault_files = sorted(
+        file for file in root.rglob("*") if file.is_file() and not is_ignored_vault_file(file, root)
+    )
+    md_files = [file for file in vault_files if file.suffix.lower() == ".md"]
+    non_md_files = [file for file in vault_files if file.suffix.lower() != ".md"]
     current_md = [file for file in md_files if "/90_归档/" not in f"/{relpath(file, root)}/" and "/历史版本/" not in f"/{relpath(file, root)}/"]
-    basename_map = build_basename_map(md_files)
+    basename_map = build_basename_map(vault_files)
     text_cache = {file: read_text(file) for file in md_files}
+
+    if workbench_todo_file.is_file():
+        todo_text = text_cache.get(workbench_todo_file, read_text(workbench_todo_file))
+        for label, target in (
+            ("待客户补充事项", CUSTOMER_REQUEST_RELATIVE),
+            ("源文与事实异常", SOURCE_ANOMALY_RELATIVE),
+            ("Skill运行反馈", SKILL_FEEDBACK_RELATIVE),
+        ):
+            if not any(
+                resolve_vault_target(workbench_todo_file, raw, root, vault_files) == (root / target).resolve()
+                for raw in iter_link_targets(todo_text)
+            ):
+                add("ERROR", "WORKBENCH_CONTROL_LINK", workbench_todo_file, 1, f"当前待办缺少{label}入口")
+
+    if check_entry_file.is_file():
+        check_text = text_cache.get(check_entry_file, read_text(check_entry_file))
+        for label, target in (
+            ("工作台当前待办", WORKBENCH_TODO_RELATIVE),
+            ("待客户补充事项", CUSTOMER_REQUEST_RELATIVE),
+            ("源文与事实异常", SOURCE_ANOMALY_RELATIVE),
+            ("Skill运行反馈", SKILL_FEEDBACK_RELATIVE),
+        ):
+            if not any(
+                resolve_vault_target(check_entry_file, raw, root, vault_files) == (root / target).resolve()
+                for raw in iter_link_targets(check_text)
+            ):
+                add("ERROR", "CHECK_ENTRY_LINK", check_entry_file, 1, f"检查入口缺少{label}链接")
+
+    if version_entry_file.is_file():
+        version_text = text_cache.get(version_entry_file, read_text(version_entry_file))
+        if re.search(r"(?m)^-\s*当前项目状态\s*[：:]", version_text):
+            add("ERROR", "VERSION_ENTRY_DUPLICATE_STATE", version_entry_file, 1, "版本入口不得复制当前项目状态正文，必须链接20_当前待办.md")
+        current_state = parse_field(version_text, "当前状态") or ""
+        if not has_clickable_link(current_state):
+            add("ERROR", "VERSION_ENTRY_CURRENT_LINK", version_entry_file, 1, "版本入口的当前状态必须链接20_当前待办.md")
+        for label, target in (
+            ("当前待办", WORKBENCH_TODO_RELATIVE),
+            ("Skill运行反馈", SKILL_FEEDBACK_RELATIVE),
+        ):
+            if not any(
+                resolve_vault_target(version_entry_file, raw, root, vault_files) == (root / target).resolve()
+                for raw in iter_link_targets(version_text)
+            ):
+                add("ERROR", "VERSION_ENTRY_LINK", version_entry_file, 1, f"版本入口缺少{label}链接")
+        version_table = find_markdown_table(version_text, ("日期", "变更", "依据", "执行人", "关联对象", "影响范围"))
+        if version_table is None:
+            add("ERROR", "VERSION_ENTRY_TABLE", version_entry_file, 1, "版本入口缺少固定六列项目级变更表")
+
+        maintained_skill_file = skill_file()
+        actual_runtime_skill_file = skill_file(runtime_skill) if runtime_skill is not None else maintained_skill_file
+        if not maintained_skill_file.is_file():
+            add("ERROR", "MAINTAINED_SKILL_NOT_FOUND", maintained_skill_file, 0, "校验器所属Skill缺少SKILL.md")
+        elif not actual_runtime_skill_file.is_file():
+            add("ERROR", "RUNTIME_SKILL_NOT_FOUND", actual_runtime_skill_file, 0, "指定的实际运行Skill不存在或缺少SKILL.md")
+        else:
+            maintained_hash = sha256_file(maintained_skill_file)
+            runtime_hash = sha256_file(actual_runtime_skill_file)
+            if maintained_hash != runtime_hash:
+                add(
+                    "ERROR",
+                    "RUNTIME_SKILL_MISMATCH",
+                    actual_runtime_skill_file,
+                    0,
+                    f"实际运行Skill指纹{runtime_hash}与维护源{maintained_hash}不一致，先同步运行副本再迁移项目",
+                )
+            project_hash = normalize_sha256(parse_field(version_text, "Skill指纹"))
+            if project_hash is None:
+                add("ERROR", "PROJECT_SKILL_FINGERPRINT", version_entry_file, 1, "版本入口缺少有效的64位SHA-256 Skill指纹")
+            elif project_hash != runtime_hash:
+                add(
+                    "ERROR",
+                    "PROJECT_SKILL_MISMATCH",
+                    version_entry_file,
+                    1,
+                    f"项目登记Skill指纹{project_hash}与实际运行版本{runtime_hash}不一致，必须先执行版本迁移",
+                )
+
+    forbidden_runtime_files: set[Path] = set()
+    for file in non_md_files:
+        relative = file.relative_to(root)
+        if (
+            any(part.lower() in FORBIDDEN_RUNTIME_DIRS for part in relative.parts[:-1])
+            or file.suffix.lower() in FORBIDDEN_RUNTIME_SUFFIXES
+        ):
+            forbidden_runtime_files.add(file.resolve())
+            add("ERROR", "VAULT_RUNTIME_FILE", file, 1, "客户Obsidian项目不得包含脚本、缓存、临时文件或运行产物")
+
+    data_explanation_file = root / DATA_EXPLANATION_RELATIVE
+    registered_managed_files: set[Path] = set()
+    if not data_explanation_file.is_file():
+        add("ERROR", "MISSING_DATA_EXPLANATION", data_explanation_file, 0, "缺少受管非Markdown数据文件的Markdown导航入口")
+    else:
+        data_text = text_cache.get(data_explanation_file, read_text(data_explanation_file))
+        data_table = find_markdown_table(data_text, DATA_EXPLANATION_HEADERS)
+        if data_table is None:
+            add("ERROR", "DATA_EXPLANATION_SCHEMA", data_explanation_file, 1, "数据说明缺少固定九列表格")
+        else:
+            _, rows = data_table
+            for line, row in rows:
+                file_cell = row.get("文件", "")
+                if not has_clickable_link(file_cell):
+                    add("ERROR", "DATA_EXPLANATION_LINK", data_explanation_file, line, "受管文件必须使用可点击链接登记")
+                resolved_targets = {
+                    target
+                    for raw_target in iter_link_targets(file_cell)
+                    if (target := resolve_vault_target(data_explanation_file, raw_target, root, vault_files)) is not None
+                }
+                managed_targets = {
+                    target for target in resolved_targets if is_within(target, (root / "05_数据与审核").resolve())
+                }
+                if not managed_targets:
+                    add("ERROR", "DATA_EXPLANATION_TARGET", data_explanation_file, line, "文件链接必须指向05_数据与审核中的现存非Markdown文件")
+                for target in managed_targets:
+                    if target.suffix.lower() == ".md":
+                        add("ERROR", "DATA_EXPLANATION_TARGET", data_explanation_file, line, "数据说明只登记非Markdown受管文件")
+                    else:
+                        registered_managed_files.add(target)
+                for header in DATA_EXPLANATION_HEADERS[1:]:
+                    if not row.get(header, "").strip():
+                        add("ERROR", "DATA_EXPLANATION_FIELD", data_explanation_file, line, f"受管文件登记缺少字段：{header}")
+
+    managed_csv_root = root / "05_数据与审核"
+    if managed_csv_root.is_dir():
+        for csv_file in sorted(managed_csv_root.rglob("*.csv")):
+            try:
+                has_bom = csv_file.read_bytes().startswith(UTF8_BOM)
+            except OSError as exc:
+                add("ERROR", "CSV_READ_ERROR", csv_file, 0, f"无法读取受管CSV：{exc}")
+                continue
+            if not has_bom:
+                add("ERROR", "CSV_UTF8_BOM", csv_file, 1, "知识库受管CSV必须使用UTF-8 with BOM，避免Windows Excel中文乱码")
+
+        for managed_file in non_md_files:
+            resolved = managed_file.resolve()
+            if not is_within(resolved, managed_csv_root.resolve()) or resolved in forbidden_runtime_files:
+                continue
+            if resolved not in registered_managed_files:
+                add("ERROR", "MANAGED_FILE_NOT_REGISTERED", managed_file, 1, "05_数据与审核中的非Markdown文件未登记到01_数据说明.md")
+
+    linked_non_md_files: set[Path] = set()
+    for markdown_file in current_md:
+        for raw_target in iter_link_targets(text_cache[markdown_file]):
+            target = resolve_vault_target(markdown_file, raw_target, root, vault_files)
+            if target is not None and target.suffix.lower() != ".md":
+                linked_non_md_files.add(target.resolve())
+
+    for non_md_file in non_md_files:
+        resolved = non_md_file.resolve()
+        relative = f"/{relpath(non_md_file, root)}/"
+        if (
+            resolved in forbidden_runtime_files
+            or is_within(resolved, managed_csv_root.resolve())
+            or "/90_归档/" in relative
+        ):
+            continue
+        if resolved not in linked_non_md_files:
+            add("ERROR", "NON_MD_ORPHAN", non_md_file, 1, "Vault内非Markdown文件没有当前Markdown导航或证据回链")
 
     completed_ids: set[str] = set()
     article_dirs: list[tuple[str, Path]] = []
@@ -222,6 +960,16 @@ def validate_project(root: Path) -> list[Issue]:
     for file in current_md:
         text = text_cache[file]
         relative = relpath(file, root)
+
+        if relative.startswith("04_资料与证据/") or relative == SOURCE_ANOMALY_RELATIVE:
+            for number in unprotected_double_percent_lines(text):
+                add(
+                    "ERROR",
+                    "OBSIDIAN_CONTROL_SYNTAX",
+                    file,
+                    number,
+                    "逐字内容中的%%必须放入行内代码或text围栏代码块，避免Obsidian把后续内容解析成注释",
+                )
 
         for match in re.finditer(r"\$srcLink|\{\{[^}\n]+\}\}|(?i:\bTODO\b|\bTBD\b)", text):
             add("ERROR", "PLACEHOLDER", file, line_number(text, match.start()), f"残留未替换变量：{match.group(0)}")
@@ -250,21 +998,60 @@ def validate_project(root: Path) -> list[Issue]:
             else:
                 row += 1
 
-        for match in re.finditer(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]", text):
-            target = match.group(1).strip()
-            ok = False
-            if "/" in target or "\\" in target:
-                candidate = root / target.replace("\\", "/")
-                ok = candidate.exists() or candidate.with_suffix(".md").exists()
-            else:
-                ok = len(basename_map.get(target, [])) == 1
-            if not ok:
-                add("ERROR", "BROKEN_WIKILINK", file, line_number(text, match.start()), f"无法解析Wikilink：{target}")
+        _, block_ids = markdown_anchors(text)
+        for block_id, block_lines in block_ids.items():
+            if len(block_lines) > 1:
+                add(
+                    "ERROR",
+                    "DUPLICATE_BLOCK_ID",
+                    file,
+                    block_lines[1],
+                    f"同一Markdown文件中的块ID必须唯一：^{block_id}（出现于第{', '.join(map(str, block_lines))}行）",
+                )
 
-        for match in re.finditer(r"(?<!!)\[[^\]\n]+\]\((<[^>]+>|[^)\n]+)\)", text):
+        for match in re.finditer(r"!?\[\[([^\]|#]*)(?:#([^\]|]+))?(?:\|[^\]]+)?\]\]", text):
             target = match.group(1).strip()
-            if not resolve_local_link(file, target, root):
+            anchor = (match.group(2) or "").strip() or None
+            resolved: Path | None = None
+            if not target:
+                resolved = file.resolve()
+            elif "/" in target or "\\" in target:
+                candidate = (root / target.replace("\\", "/")).resolve()
+                if candidate.exists():
+                    resolved = candidate
+                elif candidate.with_suffix(".md").exists():
+                    resolved = candidate.with_suffix(".md")
+            else:
+                matches = basename_map.get(target, [])
+                if len(matches) == 1:
+                    resolved = matches[0].resolve()
+            if resolved is None:
+                add("ERROR", "BROKEN_WIKILINK", file, line_number(text, match.start()), f"无法解析Wikilink：{target or '#'+(anchor or '')}")
+            elif not anchor_exists(resolved, anchor, text_cache):
+                add(
+                    "ERROR",
+                    "BROKEN_LINK_ANCHOR",
+                    file,
+                    line_number(text, match.start()),
+                    f"Wikilink锚点不存在：{anchor}（目标：{relpath(resolved, root)}）",
+                )
+
+        for match in re.finditer(r"!?\[[^\]\n]*\]\((<[^>]+>|[^)\n]+)\)", text):
+            target = match.group(1).strip()
+            path, anchor = split_link_target(target)
+            if re.match(r"^(https?://|mailto:|obsidian://)", path, re.I):
+                continue
+            resolved = resolve_markdown_link_target(file, target, root)
+            if resolved is None:
                 add("ERROR", "BROKEN_MD_LINK", file, line_number(text, match.start()), f"无法解析Markdown链接：{target}")
+            elif not anchor_exists(resolved, anchor, text_cache):
+                add(
+                    "ERROR",
+                    "BROKEN_LINK_ANCHOR",
+                    file,
+                    line_number(text, match.start()),
+                    f"Markdown链接锚点不存在：{anchor}（目标：{relpath(resolved, root)}）",
+                )
 
     if customer_request_file.is_file():
         customer_text = text_cache.get(customer_request_file, read_text(customer_request_file))
@@ -278,19 +1065,8 @@ def validate_project(root: Path) -> list[Issue]:
                     f"待客户补充事项缺少小节：{heading.lstrip('# ').strip()}",
                 )
 
-        table_lines = customer_text.splitlines()
-        header_index = next(
-            (
-                index
-                for index, line in enumerate(table_lines)
-                if line.lstrip().startswith("|")
-                and "问题ID" in line
-                and "当前状态" in line
-                and "回复或证据位置" in line
-            ),
-            None,
-        )
-        if header_index is None:
+        customer_table = find_markdown_table(customer_text, CUSTOMER_REQUEST_HEADERS)
+        if customer_table is None:
             add(
                 "ERROR",
                 "CUSTOMER_REQUEST_TABLE",
@@ -299,45 +1075,249 @@ def validate_project(root: Path) -> list[Issue]:
                 "待客户补充事项缺少固定当前事项表",
             )
         else:
-            headers = [cell.strip() for cell in table_lines[header_index].strip().strip("|").split("|")]
-            id_index = headers.index("问题ID")
-            status_index = headers.index("当前状态")
-            evidence_index = headers.index("回复或证据位置")
+            headers, rows = customer_table
+            if headers != list(CUSTOMER_REQUEST_HEADERS):
+                add("ERROR", "CUSTOMER_REQUEST_TABLE", customer_request_file, 1, "待客户补充事项字段顺序或数量不符合v0.3固定结构")
             seen_request_ids: set[str] = set()
-            cursor = header_index + 2
-            while cursor < len(table_lines) and table_lines[cursor].lstrip().startswith("|"):
-                cells = [cell.strip() for cell in table_lines[cursor].strip().strip("|").split("|")]
-                if len(cells) == len(headers) and any(cells):
-                    request_id = cells[id_index]
-                    status = cells[status_index]
-                    evidence = cells[evidence_index]
-                    if request_id:
-                        if request_id in seen_request_ids:
-                            add(
-                                "ERROR",
-                                "DUPLICATE_CUSTOMER_REQUEST_ID",
-                                customer_request_file,
-                                cursor + 1,
-                                f"待客户补充事项问题ID重复：{request_id}",
-                            )
-                        seen_request_ids.add(request_id)
-                        if status not in CUSTOMER_REQUEST_STATUSES:
-                            add(
-                                "ERROR",
-                                "CUSTOMER_REQUEST_STATUS",
-                                customer_request_file,
-                                cursor + 1,
-                                f"待客户补充事项状态无效：{status or '空值'}",
-                            )
-                        if status == "已解决" and not evidence:
-                            add(
-                                "ERROR",
-                                "CUSTOMER_REQUEST_EVIDENCE",
-                                customer_request_file,
-                                cursor + 1,
-                                "已解决的客户补充事项必须填写回复或证据位置",
-                            )
-                cursor += 1
+            for line, row in rows:
+                request_id = row.get("问题ID", "")
+                stage = row.get("当前阶段", "")
+                next_actor = row.get("下一步由谁做", "")
+                for header in CUSTOMER_REQUEST_HEADERS:
+                    if not row.get(header, "").strip():
+                        add("ERROR", "CUSTOMER_REQUEST_FIELD", customer_request_file, line, f"待客户补充事项缺少字段：{header}")
+                if not request_id:
+                    add("ERROR", "CUSTOMER_REQUEST_ID_MISSING", customer_request_file, line, "待客户补充事项缺少问题ID")
+                    continue
+                if request_id in seen_request_ids:
+                    add("ERROR", "DUPLICATE_CUSTOMER_REQUEST_ID", customer_request_file, line, f"待客户补充事项问题ID重复：{request_id}")
+                seen_request_ids.add(request_id)
+                if stage not in CUSTOMER_REQUEST_STAGES:
+                    add("ERROR", "CUSTOMER_REQUEST_STAGE", customer_request_file, line, f"待客户补充事项阶段无效：{stage or '空值'}")
+                if stage == "待判断要不要问" and "知识库专员" not in next_actor:
+                    add("ERROR", "CUSTOMER_REQUEST_SPECIALIST", customer_request_file, line, "待判断要不要问的事项必须把下一步明确交给知识库专员")
+
+                detail = customer_detail(customer_text, request_id)
+                if detail is None:
+                    add("ERROR", "CUSTOMER_REQUEST_DETAIL", customer_request_file, line, f"事项{request_id}缺少对应详情")
+                    continue
+                if "#### 先看结论" not in detail:
+                    add("ERROR", "CUSTOMER_REQUEST_PLAIN_SUMMARY", customer_request_file, line, f"事项{request_id}详情必须先提供通俗结论")
+                for field in ("发生了什么", "希望客户确认或提供什么", "为什么值得询问", "客户回复前怎么处理", "当前阶段", "下一步由谁做"):
+                    if not is_substantive(parse_field(detail, field)):
+                        add("ERROR", "CUSTOMER_REQUEST_DETAIL_FIELD", customer_request_file, line, f"事项{request_id}缺少通俗字段：{field}")
+                detail_stage = parse_field(detail, "当前阶段") or ""
+                if detail_stage and detail_stage != stage:
+                    add("ERROR", "CUSTOMER_REQUEST_STAGE_MISMATCH", customer_request_file, line, f"事项{request_id}主表与详情阶段不一致")
+                if stage == "无需询问" and not is_substantive(parse_field(detail, "为什么值得询问")):
+                    add("ERROR", "CUSTOMER_REQUEST_NO_ASK_REASON", customer_request_file, line, "无需询问必须用通俗语言说明现有资料、排除或安全改写为何已经足够")
+                if stage in {"等待发送", "等待客户回复", "收到回复，待核实", "已完成"}:
+                    script = parse_field(detail, "话术") or ""
+                    specialist_confirmation = parse_field(detail, "知识库专员确认") or ""
+                    optimizer = parse_field(detail, "对客执行人（优化师）") or ""
+                    if not is_substantive(script) or not is_substantive(specialist_confirmation):
+                        add("ERROR", "CUSTOMER_REQUEST_SCRIPT_REQUIRED", customer_request_file, line, "进入发送流程前必须保存知识库专员确认的客户话术")
+                    if not is_substantive(optimizer):
+                        add("ERROR", "CUSTOMER_REQUEST_OPTIMIZER", customer_request_file, line, "进入发送流程前必须指定优化师")
+                if stage in {"等待客户回复", "收到回复，待核实", "已完成"}:
+                    if not is_substantive(parse_field(detail, "发送日期与渠道")):
+                        add("ERROR", "CUSTOMER_REQUEST_SENT_RECORD", customer_request_file, line, "实际发送后必须记录日期与渠道")
+                if stage in {"收到回复，待核实", "已完成"}:
+                    reply_evidence = parse_field(detail, "回复或客户材料证据") or ""
+                    if not has_clickable_link(reply_evidence):
+                        add("ERROR", "CUSTOMER_REQUEST_REPLY_EVIDENCE", customer_request_file, line, "收到回复后必须保存可点击回复或客户材料证据")
+                if stage == "已完成":
+                    if not is_substantive(parse_field(detail, "新材料或答复是否解决问题")):
+                        add("ERROR", "CUSTOMER_REQUEST_COMPLETION", customer_request_file, line, "已完成事项必须说明新材料或答复是否解决问题")
+                    if not is_substantive(parse_field(detail, "更新了哪些知识、候选或文章输入")):
+                        add("ERROR", "CUSTOMER_REQUEST_COMPLETION", customer_request_file, line, "已完成事项必须说明回复后的下游更新")
+
+    if source_anomaly_file.is_file():
+        anomaly_text = text_cache.get(source_anomaly_file, read_text(source_anomaly_file))
+        for heading in ("# 源文与事实异常台账", "## 当前异常", "## 异常详情", "## 已完成处置与历史"):
+            if heading not in anomaly_text:
+                add(
+                    "ERROR",
+                    "SOURCE_ANOMALY_SECTION",
+                    source_anomaly_file,
+                    1,
+                    f"源文与事实异常台账缺少小节：{heading.lstrip('# ').strip()}",
+                )
+
+        anomaly_table = find_markdown_table(anomaly_text, SOURCE_ANOMALY_HEADERS)
+        if anomaly_table is None:
+            add(
+                "ERROR",
+                "SOURCE_ANOMALY_TABLE",
+                source_anomaly_file,
+                1,
+                "源文与事实异常台账缺少固定当前异常表",
+            )
+        else:
+            headers, rows = anomaly_table
+            if headers != list(SOURCE_ANOMALY_HEADERS):
+                add(
+                    "ERROR",
+                    "SOURCE_ANOMALY_TABLE",
+                    source_anomaly_file,
+                    1,
+                    "源文与事实异常表字段顺序或数量不符合v0.3固定结构",
+                )
+            seen_anomaly_ids: set[str] = set()
+            for line, row in rows:
+                anomaly_id = row.get("异常ID", "")
+                repair_state = row.get("原文是否修复", "")
+                stage = row.get("当前阶段", "")
+                reopen = row.get("下一步或重开条件", "")
+                for header in SOURCE_ANOMALY_HEADERS:
+                    if not row.get(header, "").strip():
+                        add("ERROR", "SOURCE_ANOMALY_FIELD", source_anomaly_file, line, f"源文与事实异常缺少字段：{header}")
+                if not anomaly_id:
+                    add("ERROR", "SOURCE_ANOMALY_ID_MISSING", source_anomaly_file, line, "源文与事实异常缺少异常ID")
+                    continue
+                if anomaly_id in seen_anomaly_ids:
+                    add("ERROR", "DUPLICATE_SOURCE_ANOMALY_ID", source_anomaly_file, line, f"源文与事实异常ID重复：{anomaly_id}")
+                seen_anomaly_ids.add(anomaly_id)
+                if repair_state not in SOURCE_REPAIR_STATES:
+                    add("ERROR", "SOURCE_ANOMALY_REPAIR_STATE", source_anomaly_file, line, f"原文是否修复状态无效：{repair_state or '空值'}")
+                if stage not in SOURCE_ANOMALY_STAGES:
+                    add("ERROR", "SOURCE_ANOMALY_STAGE", source_anomaly_file, line, f"源文与事实异常阶段无效：{stage or '空值'}")
+                if stage == "已解决" and repair_state != "已修复":
+                    add("ERROR", "SOURCE_ANOMALY_STAGE_REPAIR", source_anomaly_file, line, "只有原文已修复时才能标记已解决")
+                if stage == "部分解决" and repair_state != "部分修复":
+                    add("ERROR", "SOURCE_ANOMALY_STAGE_REPAIR", source_anomaly_file, line, "部分解决必须对应原文部分修复；范围混合时应拆分异常")
+                if stage == "已完成处置（原文未修复）" and repair_state not in {"未修复", "无法判断"}:
+                    add("ERROR", "SOURCE_ANOMALY_STAGE_REPAIR", source_anomaly_file, line, "已完成处置（原文未修复）只能用于未修复或无法判断的原文")
+
+                detail = anomaly_detail(anomaly_text, anomaly_id)
+                if detail is None:
+                    add("ERROR", "SOURCE_ANOMALY_DETAIL", source_anomaly_file, line, f"异常{anomaly_id}缺少对应详情和原文现场证据包")
+                else:
+                    if "#### 先看结论" not in detail:
+                        add("ERROR", "SOURCE_ANOMALY_PLAIN_SUMMARY", source_anomaly_file, line, f"异常{anomaly_id}详情必须先提供通俗结论")
+                    for field in ("发生了什么", "为什么有风险", "现在怎么处理", "为什么本轮结束，或者还在等什么"):
+                        if not is_substantive(parse_field(detail, field)):
+                            add("ERROR", "SOURCE_ANOMALY_PLAIN_FIELD", source_anomaly_file, line, f"异常{anomaly_id}缺少通俗字段：{field}")
+                    detail_repair = parse_field(detail, "原文是否修复") or ""
+                    detail_stage = parse_field(detail, "当前阶段") or ""
+                    if detail_repair and detail_repair != repair_state:
+                        add("ERROR", "SOURCE_ANOMALY_REPAIR_MISMATCH", source_anomaly_file, line, f"异常{anomaly_id}主表与详情的原文修复状态不一致")
+                    if detail_stage and detail_stage != stage:
+                        add("ERROR", "SOURCE_ANOMALY_STAGE_MISMATCH", source_anomaly_file, line, f"异常{anomaly_id}主表与详情阶段不一致")
+                    saved_evidence = parse_field(detail, "保存原文证据") or ""
+                    original_source = parse_field(detail, "原始来源") or ""
+                    source_version = parse_field(detail, "来源版本/指纹") or ""
+                    detail_location = parse_field(detail, "精确位置") or ""
+                    detail_completeness = parse_field(detail, "证据完整性") or ""
+                    evidence_type = parse_field(detail, "现场证据类型") or ""
+                    page_evidence = parse_field(detail, "页面截图或原始版面") or ""
+                    audit_result = parse_field(detail, "审核Agent独立复核") or ""
+                    completion_evidence = parse_field(detail, "完成处置的证据") or ""
+                    actual = heading_body(detail, r"实际取得的原文或原始结构（逐字/原样）") or ""
+                    usable = heading_body(detail, r"经核验仍可使用的原文或原始结构（如有）")
+                    usable_location = parse_field(detail, "可使用证据位置") or ""
+                    if "#### 原文现场证据" not in detail:
+                        add("ERROR", "SOURCE_ANOMALY_EVIDENCE_SECTION", source_anomaly_file, line, f"异常{anomaly_id}缺少原文现场证据小节")
+                    if not has_clickable_link(saved_evidence):
+                        add("ERROR", "SOURCE_ANOMALY_SAVED_EVIDENCE", source_anomaly_file, line, f"异常{anomaly_id}缺少可点击保存原文证据")
+                    if not original_source or (not has_clickable_link(original_source) and "无法取得" not in original_source):
+                        add("ERROR", "SOURCE_ANOMALY_ORIGINAL_SOURCE", source_anomaly_file, line, f"异常{anomaly_id}必须链接原始来源，无法取得时写明原因")
+                    if not source_version:
+                        add("ERROR", "SOURCE_ANOMALY_SOURCE_VERSION", source_anomaly_file, line, f"异常{anomaly_id}缺少来源版本或指纹")
+                    if not detail_location:
+                        add("ERROR", "SOURCE_ANOMALY_DETAIL_LOCATION", source_anomaly_file, line, f"异常{anomaly_id}详情缺少精确位置")
+                    if detail_completeness not in SOURCE_EVIDENCE_COMPLETENESS:
+                        add("ERROR", "SOURCE_ANOMALY_DETAIL_COMPLETENESS", source_anomaly_file, line, f"异常{anomaly_id}详情的证据完整性无效")
+                    if evidence_type not in SOURCE_EVIDENCE_TYPES:
+                        add("ERROR", "SOURCE_ANOMALY_EVIDENCE_TYPE", source_anomaly_file, line, f"异常{anomaly_id}的现场证据类型无效")
+                    if not verbatim_body(actual):
+                        add("ERROR", "SOURCE_ANOMALY_VERBATIM", source_anomaly_file, line, f"异常{anomaly_id}缺少实际取得的逐字原文或原始结构")
+                    if "##### 必要上下文" not in detail or not (parse_field(detail, "异常位置") or ""):
+                        add("ERROR", "SOURCE_ANOMALY_CONTEXT", source_anomaly_file, line, f"异常{anomaly_id}缺少必要上下文或异常位置")
+                    if usable is None:
+                        add("ERROR", "SOURCE_ANOMALY_USABLE_EVIDENCE", source_anomaly_file, line, f"异常{anomaly_id}缺少经核验仍可使用的原文或原始结构小节")
+                    else:
+                        usable_text = verbatim_body(usable)
+                        if usable_text and usable_text != "无" and not has_clickable_link(usable_location):
+                            add("ERROR", "SOURCE_ANOMALY_USABLE_LINK", source_anomaly_file, line, f"异常{anomaly_id}存在经核验仍可使用的证据，但没有可点击定位链接")
+                    if evidence_type and evidence_type != "逐字文本" and not has_clickable_link(page_evidence):
+                        add("ERROR", "SOURCE_ANOMALY_VISUAL_EVIDENCE", source_anomaly_file, line, f"异常{anomaly_id}属于视觉/结构现场，必须链接原页、截图、原表或公式")
+                    if stage in {"已解决", "已完成处置（原文未修复）"}:
+                        current_updates = parse_field(detail, "当前正式知识/候选/项目资料稿更新")
+                        historical_impact = parse_field(detail, "已完成文章历史影响与修订决定")
+                        if not is_substantive(audit_result):
+                            add("ERROR", "SOURCE_ANOMALY_COMPLETION_AUDIT", source_anomaly_file, line, "完成异常处置前必须记录审核Agent实际核对结果")
+                        if not has_clickable_link(completion_evidence) or "本台账" in completion_evidence:
+                            add("ERROR", "SOURCE_ANOMALY_COMPLETION_EVIDENCE", source_anomaly_file, line, "完成异常处置必须链接原文现场、审核记录或下游更新，不能只写本台账")
+                        if current_updates is None or historical_impact is None:
+                            add("ERROR", "SOURCE_ANOMALY_DOWNSTREAM", source_anomaly_file, line, "完成异常处置必须登记当前下游更新和已完成文章历史影响")
+                        customer_issue = parse_field(detail, "关联客户问题ID") or ""
+                        specialist_review = parse_field(detail, "知识库专员必要性判断") or ""
+                        if stage == "已完成处置（原文未修复）" and is_substantive(customer_issue) and not is_substantive(specialist_review):
+                            add("ERROR", "SOURCE_ANOMALY_SPECIALIST_REVIEW", source_anomaly_file, line, "客户专属事实原文未修复时，必须先记录知识库专员是否需要向客户补充询问的判断")
+                        if not reopen:
+                            add("ERROR", "SOURCE_ANOMALY_REOPEN_CONDITION", source_anomaly_file, line, "已解决或已完成处置的异常必须填写重开条件")
+
+    if skill_feedback_file.is_file():
+        feedback_text = text_cache.get(skill_feedback_file, read_text(skill_feedback_file))
+        for heading in ("# Skill反馈台账", "## 当前反馈", "## 反馈详情", "## 已关闭与不纳入"):
+            if heading not in feedback_text:
+                add("ERROR", "SKILL_FEEDBACK_SECTION", skill_feedback_file, 1, f"Skill反馈台账缺少小节：{heading.lstrip('# ').strip()}")
+        feedback_table = find_markdown_table(feedback_text, SKILL_FEEDBACK_HEADERS)
+        if feedback_table is None:
+            add("ERROR", "SKILL_FEEDBACK_TABLE", skill_feedback_file, 1, "Skill反馈台账缺少固定八列表")
+        else:
+            headers, rows = feedback_table
+            if headers != list(SKILL_FEEDBACK_HEADERS):
+                add("ERROR", "SKILL_FEEDBACK_TABLE", skill_feedback_file, 1, "Skill反馈表字段顺序或数量不符合v0.3固定结构")
+            seen_feedback_ids: set[str] = set()
+            for line, row in rows:
+                feedback_id = row.get("反馈ID", "")
+                origin = row.get("提出来源", "")
+                feedback_type = row.get("类型", "")
+                stage = row.get("当前阶段", "")
+                for header in SKILL_FEEDBACK_HEADERS:
+                    if not row.get(header, "").strip():
+                        add("ERROR", "SKILL_FEEDBACK_FIELD", skill_feedback_file, line, f"Skill反馈缺少字段：{header}")
+                if not feedback_id:
+                    continue
+                if feedback_id in seen_feedback_ids:
+                    add("ERROR", "DUPLICATE_SKILL_FEEDBACK_ID", skill_feedback_file, line, f"Skill反馈ID重复：{feedback_id}")
+                seen_feedback_ids.add(feedback_id)
+                if origin not in SKILL_FEEDBACK_ORIGINS:
+                    add("ERROR", "SKILL_FEEDBACK_ORIGIN", skill_feedback_file, line, f"Skill反馈提出来源无效：{origin or '空值'}")
+                if feedback_type not in SKILL_FEEDBACK_TYPES:
+                    add("ERROR", "SKILL_FEEDBACK_TYPE", skill_feedback_file, line, f"Skill反馈类型无效：{feedback_type or '空值'}")
+                if stage not in SKILL_FEEDBACK_STAGES:
+                    add("ERROR", "SKILL_FEEDBACK_STAGE", skill_feedback_file, line, f"Skill反馈阶段无效：{stage or '空值'}")
+                expected_stage = {
+                    "Codex自动发现": "自动记录，待维护判断",
+                    "人工提出": "人工提出，待维护判断",
+                }.get(origin)
+                if expected_stage and stage in {"自动记录，待维护判断", "人工提出，待维护判断"} and stage != expected_stage:
+                    add("ERROR", "SKILL_FEEDBACK_ORIGIN_STAGE", skill_feedback_file, line, "待维护判断阶段必须与首次提出来源一致")
+                detail = skill_feedback_detail(feedback_text, feedback_id)
+                if detail is None:
+                    add("ERROR", "SKILL_FEEDBACK_DETAIL", skill_feedback_file, line, f"反馈{feedback_id}缺少对应详情")
+                    continue
+                for field in ("实际发生了什么", "原本希望怎样", "对当前项目有什么影响", "当前临时处理", "提出来源", "提出日期", "当前阶段", "下一步由谁做"):
+                    if not is_substantive(parse_field(detail, field)):
+                        add("ERROR", "SKILL_FEEDBACK_DETAIL_FIELD", skill_feedback_file, line, f"反馈{feedback_id}缺少字段：{field}")
+                if origin == "Codex自动发现" and not is_substantive(parse_field(detail, "自动总结依据（Codex自动发现时必填）")):
+                    add("ERROR", "SKILL_FEEDBACK_AUTO_EVIDENCE", skill_feedback_file, line, f"自动反馈{feedback_id}缺少自动总结依据")
+                if origin == "人工提出" and not is_substantive(parse_field(detail, "人工提出摘要（人工提出时必填）")):
+                    add("ERROR", "SKILL_FEEDBACK_HUMAN_EVIDENCE", skill_feedback_file, line, f"人工反馈{feedback_id}缺少人工提出摘要")
+                related_file = parse_field(detail, "相关文件") or ""
+                related_ids = " ".join(
+                    parse_field(detail, name) or ""
+                    for name in ("相关文章ID（有才写）", "关联客户事项ID（有才写）", "关联源文异常ID（有才写）", "关联校验结果（有才写）")
+                )
+                if not has_clickable_link(related_file) and not is_substantive(related_ids):
+                    add("ERROR", "SKILL_FEEDBACK_RELATION", skill_feedback_file, line, f"反馈{feedback_id}必须关联项目文件、文章、CUS、ANM或校验结果")
+                if stage not in {"已关闭", "转为项目问题", "不纳入Skill"} and workbench_todo_file.is_file():
+                    todo_text = text_cache.get(workbench_todo_file, read_text(workbench_todo_file))
+                    if feedback_id not in todo_text:
+                        add("ERROR", "SKILL_FEEDBACK_NOT_IN_WORKBENCH", workbench_todo_file, 1, f"未关闭反馈{feedback_id}未出现在当前待办")
 
     knowledge_ids: dict[str, tuple[Path, int]] = {}
     for file in current_md:
@@ -353,23 +1333,142 @@ def validate_project(root: Path) -> list[Issue]:
                 knowledge_ids[knowledge_id] = (file, line_number(text, match.start()))
 
     formal_root = root / "02_正式知识"
+    formal_files: list[Path] = []
+    formal_file_ids: dict[str, Path] = {}
+    formal_claim_ids: dict[str, Path] = {}
+    formal_issue_files: set[str] = set()
+
+    def add_formal(code: str, file: Path, line: int, message: str) -> None:
+        add("ERROR", code, file, line, message)
+        formal_issue_files.add(relpath(file, root))
+
     if formal_root.exists():
+        for required in FORMAL_REQUIRED_DIRS:
+            required_path = root / required
+            if not required_path.is_dir():
+                add("ERROR", "MISSING_FORMAL_SUBDIR", required_path, 0, f"缺少正式知识硬映射子目录：{required}")
+
         for file in formal_root.rglob("*.md"):
             relative = relpath(file, root)
             if "/01_" in f"/{relative}" and ("目录" in file.name or "总览" in file.name):
                 continue
+            formal_files.append(file)
             text = text_cache.get(file, read_text(file))
+
+            if file.parent == root / "02_正式知识/20_产品介绍":
+                add_formal("FORMAL_FILE_AT_MODULE_ROOT", file, 1, "产品正式知识不得直接放在产品介绍根目录；必须进入三个规定子目录之一")
+            if file.parent == root / "02_正式知识/50_行业知识与洞察":
+                add_formal("FORMAL_FILE_AT_MODULE_ROOT", file, 1, "行业正式知识不得直接放在行业知识与洞察根目录；必须按来源进入规定子目录")
+
             for match in re.finditer(r"\]\(([^)]+)\)|\[\[([^\]]+)\]\]", text):
                 target = " ".join(group or "" for group in match.groups())
                 if "30_文章写作输入" in target or "40_最终文章与引用率" in target:
-                    add("ERROR", "FORMAL_FROM_ARTICLE", file, line_number(text, match.start()), "正式知识不得把写作输入或最终文章作为事实来源")
-            if "## 来源" not in text:
-                add("ERROR", "FORMAL_SOURCE_SECTION", file, 1, "正式知识缺少“来源”小节")
+                    add_formal("FORMAL_FROM_ARTICLE", file, line_number(text, match.start()), "正式知识不得把写作输入或最终文章作为事实来源")
 
-            if "/10_企业提供/" in f"/{relative}" and re.search(r"(?mi)^source_type\s*:\s*Codex外部调研", text):
-                add("ERROR", "SOURCE_DIR_MIXED", file, 1, "Codex外部调研误放入企业提供目录")
-            if "/20_Codex外部调研/" in f"/{relative}" and re.search(r"(?mi)^source_type\s*:\s*企业提供", text):
-                add("ERROR", "SOURCE_DIR_MIXED", file, 1, "企业提供资料误放入Codex外部调研目录")
+            for field in FORMAL_FILE_FIELDS:
+                if not parse_formal_field(text, field):
+                    add_formal("FORMAL_REQUIRED_FIELD", file, 1, f"正式知识缺少文件级字段：{field}")
+            if not (parse_formal_field(text, "稳定实体键") or parse_formal_field(text, "稳定主题键")):
+                add_formal("FORMAL_REQUIRED_FIELD", file, 1, "正式知识缺少稳定实体键或稳定主题键")
+            for heading in ("已处理内容", "使用限制", "来源"):
+                if section_body(text, heading) is None:
+                    add_formal("FORMAL_REQUIRED_SECTION", file, 1, f"正式知识缺少小节：{heading}")
+
+            file_id = parse_formal_field(text, "知识ID")
+            if file_id and file_id not in {"未分配", "无"}:
+                formal_file_ids[file_id] = file
+
+            formal_type = parse_formal_field(text, "正式知识类型") or ""
+            if formal_type and formal_type not in FORMAL_TYPES:
+                add_formal("FORMAL_TYPE_INVALID", file, 1, f"正式知识类型不在固定枚举中：{formal_type}")
+            expected_prefix = FORMAL_TYPE_DIRS.get(formal_type)
+            if expected_prefix and not relative.startswith(expected_prefix):
+                add_formal("FORMAL_TYPE_WRONG_DIR", file, 1, f"正式知识类型“{formal_type}”必须位于：{expected_prefix}")
+            if relative.startswith("02_正式知识/20_产品介绍/") and formal_type not in {"产品类目", "产品主数据", "重点产品卡"}:
+                add_formal("PRODUCT_FORMAL_TYPE", file, 1, "产品正式知识必须声明正式知识类型为产品类目、产品主数据或重点产品卡")
+
+            source_type = parse_formal_field(text, "来源类型") or ""
+            if relative.startswith("02_正式知识/50_行业知识与洞察/"):
+                if source_type in {"企业提供", "客户源文件", "客户官网"} and "/10_企业提供/" not in f"/{relative}":
+                    add_formal("INDUSTRY_SOURCE_WRONG_DIR", file, 1, "企业提供的行业知识必须进入10_企业提供目录")
+                if source_type == "Codex外部调研" and "/20_Codex外部调研/" not in f"/{relative}":
+                    add_formal("INDUSTRY_SOURCE_WRONG_DIR", file, 1, "Codex外部调研行业知识必须进入20_Codex外部调研目录")
+
+            claims = formal_claim_blocks(text)
+            if not claims:
+                add_formal("FORMAL_CLAIM_MISSING", file, 1, "正式知识不能只保留摘要；“已处理内容”中至少需要一个可独立核验的CLAIM块")
+            for claim_name, block, claim_line in claims:
+                claim_id = claim_name.split("｜", 1)[0].strip()
+                if claim_id in formal_claim_ids:
+                    add_formal(
+                        "DUPLICATE_FORMAL_CLAIM_ID",
+                        file,
+                        claim_line,
+                        f"CLAIM ID重复；另一处为{relpath(formal_claim_ids[claim_id], root)}：{claim_id}",
+                    )
+                else:
+                    formal_claim_ids[claim_id] = file
+                for field in FORMAL_CLAIM_FIELDS:
+                    if not parse_field(block, field):
+                        add_formal("FORMAL_CLAIM_FIELD", file, claim_line, f"{claim_name}缺少字段：{field}")
+                stable_key = parse_field(block, "稳定实体键") or parse_field(block, "稳定主题键")
+                if not is_substantive(stable_key):
+                    add_formal("FORMAL_CLAIM_FIELD", file, claim_line, f"{claim_name}缺少稳定实体键或稳定主题键")
+                verified = parse_field(block, "已核验事实") or parse_field(block, "已核验规则")
+                if not is_substantive(verified):
+                    add_formal("FORMAL_CLAIM_FIELD", file, claim_line, f"{claim_name}缺少已核验事实或已核验规则")
+                claim_source = parse_field(block, "来源") or ""
+                for field in ("适用范围", "不可外推", "来源", "精确位置"):
+                    if parse_field(block, field) is not None and not is_substantive(parse_field(block, field)):
+                        add_formal("FORMAL_CLAIM_VALUE", file, claim_line, f"{claim_name}字段不能使用空泛值：{field}")
+                if "30_文章写作输入" in claim_source or "40_最终文章与引用率" in claim_source:
+                    add_formal("FORMAL_FROM_ARTICLE", file, claim_line, f"{claim_name}把文章派生文件作为事实来源")
+
+        index_file = formal_root / "01_正式知识目录/01_正式知识目录.md"
+        if not index_file.is_file():
+            add("ERROR", "MISSING_FORMAL_INDEX", index_file, 0, "缺少唯一正式知识目录")
+        else:
+            index_text = text_cache.get(index_file, read_text(index_file))
+            for knowledge_id, file in formal_file_ids.items():
+                if knowledge_id not in index_text:
+                    add_formal("FORMAL_INDEX_MISSING_ID", file, 1, f"正式知识目录未登记知识ID：{knowledge_id}")
+
+        for module_name, module_dir, overview_name in (
+            ("产品介绍", formal_root / "20_产品介绍", "01_产品介绍总览.md"),
+            ("行业知识与洞察", formal_root / "50_行业知识与洞察", "01_行业知识与洞察总览.md"),
+        ):
+            module_files = [file for file in formal_files if module_dir in file.parents]
+            overview = module_dir / overview_name
+            if not overview.is_file():
+                add("ERROR", "MISSING_MODULE_OVERVIEW", overview, 0, f"缺少{module_name}总览")
+            elif module_files:
+                overview_text = text_cache.get(overview, read_text(overview))
+                processed = section_body(overview_text, "已处理内容") or ""
+                normalized = re.sub(r"[\s\-。；;]", "", processed)
+                empty_overview = re.fullmatch(
+                    r"(?:当前|本轮)?(?:无|暂无|未处理)(?:正式知识|已处理内容)?",
+                    normalized,
+                )
+                if not processed or normalized in {"0", "零"} or empty_overview:
+                    add("ERROR", "OVERVIEW_FORMAL_CONTRADICTION", overview, 1, f"{module_name}已有正式知识文件，但总览仍声明无已处理内容")
+
+        deposition_log = root / DEPOSITION_EVENT_RELATIVE
+        if not deposition_log.is_file():
+            add("ERROR", "MISSING_DEPOSITION_EVENT_LOG", deposition_log, 0, "缺少正式知识沉淀事件记录")
+        else:
+            event_headers, _ = read_csv_rows(deposition_log)
+            if event_headers != list(DEPOSITION_EVENT_HEADERS):
+                add(
+                    "ERROR",
+                    "DEPOSITION_EVENT_SCHEMA",
+                    deposition_log,
+                    1,
+                    "正式知识沉淀事件记录字段不符合v0.3固定结构，且不得包含文章使用字段",
+                )
+        if deposition_log.is_file() and formal_issue_files:
+            log_text = read_text(deposition_log)
+            if re.search(r"(?mi)(?:^|,)(?:completed|已沉淀|已完成)(?:,|$)", log_text):
+                add("ERROR", "DEPOSITION_COMPLETED_WITH_FORMAL_ERRORS", deposition_log, 1, "存在正式知识错误时，沉淀记录不得标记completed/已沉淀/已完成")
 
     clean_dir = root / "04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿"
     clean_ids: dict[str, Path] = {}
@@ -410,6 +1509,157 @@ def validate_project(root: Path) -> list[Issue]:
                     add("ERROR", "TABLE_LOSS", file, 1, "清理稿保留表格数少于确认范围原始表格数，且未说明排除")
                 if original_formulas is not None and clean_formulas is not None and clean_formulas < original_formulas and not exclusion_is_valid:
                     add("ERROR", "FORMULA_LOSS", file, 1, "清理稿保留公式数少于确认范围原始公式数，且未说明排除")
+
+    candidate_file = root / CANDIDATE_RELATIVE
+    candidate_text = ""
+    if not candidate_file.is_file():
+        add("ERROR", "MISSING_CANDIDATE_LEDGER", candidate_file, 0, "缺少唯一知识就绪队列：10_知识候选分流.md")
+    else:
+        candidate_text = read_text(candidate_file)
+        candidate_table = find_markdown_table(candidate_text, CANDIDATE_HEADERS)
+        if candidate_table is None:
+            add("ERROR", "CANDIDATE_LEDGER_SCHEMA", candidate_file, 1, "知识候选分流表缺少v0.3固定字段")
+        else:
+            headers, rows = candidate_table
+            if headers != list(CANDIDATE_HEADERS):
+                add("ERROR", "CANDIDATE_LEDGER_SCHEMA", candidate_file, 1, "知识候选分流表字段顺序或数量不符合v0.3固定结构")
+            seen_candidates: set[str] = set()
+            for line, row in rows:
+                candidate_id = row.get("候选ID", "")
+                status = row.get("处理状态", "")
+                target = row.get("正式知识ID或处理位置", "")
+                issue = row.get("校验结果/异常", "")
+                if not candidate_id:
+                    add("ERROR", "CANDIDATE_ID_MISSING", candidate_file, line, "知识候选缺少候选ID")
+                elif candidate_id in seen_candidates:
+                    add("ERROR", "DUPLICATE_CANDIDATE_ID", candidate_file, line, f"候选ID重复：{candidate_id}")
+                seen_candidates.add(candidate_id)
+                if status not in CANDIDATE_STATUSES:
+                    add("ERROR", "CANDIDATE_STATUS_INVALID", candidate_file, line, f"知识候选状态无效：{status or '空值'}")
+                if status == "可自动沉淀":
+                    add("ERROR", "READY_CANDIDATE_NOT_DEPOSITED", candidate_file, line, "可自动沉淀只允许作为事务中间态；本轮结束前必须完成沉淀或记录真实异常")
+                if status == "部分可沉淀" and (not is_substantive(issue) or not is_substantive(target)):
+                    add("ERROR", "PARTIAL_CANDIDATE_UNRESOLVED", candidate_file, line, "部分可沉淀必须同时记录已沉淀位置和剩余CLAIM异常")
+                if status == "已沉淀":
+                    known_target = any(knowledge_id in target for knowledge_id in formal_file_ids) or any(
+                        file.name in target or file.stem in target for file in formal_files
+                    )
+                    if not is_substantive(target) or not known_target:
+                        add("ERROR", "DEPOSITED_CANDIDATE_TARGET", candidate_file, line, "已沉淀候选必须指向实际存在的正式知识ID或正式知识文件")
+                gate_text = " ".join(row.values())
+                if re.search(r"文章未使用|未被文章使用|等待终稿|终稿未使用|待文章使用", gate_text):
+                    add("ERROR", "ARTICLE_USE_AS_DEPOSIT_GATE", candidate_file, line, "文章是否使用或是否提交终稿不得作为知识沉淀条件")
+
+        for source_id, file in clean_ids.items():
+            clean_text = text_cache.get(file, read_text(file))
+            if (parse_field(clean_text, "核验状态") or "").strip() == "已核验":
+                if source_id not in candidate_text and file.name not in candidate_text and file.stem not in candidate_text:
+                    add("ERROR", "VERIFIED_SOURCE_NOT_ROUTED", file, 1, "已核验清理稿未登记到知识候选分流表")
+
+        external_root = root / "04_资料与证据/50_外部调研"
+        if external_root.exists():
+            for file in external_root.rglob("20_调研整理与核验.md"):
+                text = text_cache.get(file, read_text(file))
+                status = parse_field(text, "核验状态") or parse_field(text, "verification_status") or ""
+                if status.strip().lower() in {"已核验", "通过", "verified", "passed"}:
+                    relative = relpath(file, root)
+                    if relative not in candidate_text and file.name not in candidate_text and file.stem not in candidate_text:
+                        add("ERROR", "VERIFIED_EXTERNAL_NOT_ROUTED", file, 1, "已核验外部调研未登记到知识候选分流表")
+
+    deposition_state = root / DEPOSITION_STATE_RELATIVE
+    if not deposition_state.is_file():
+        add("ERROR", "MISSING_DEPOSITION_STATE", deposition_state, 0, "缺少正式知识当前沉淀状态表")
+    else:
+        state_table = find_markdown_table(read_text(deposition_state), DEPOSITION_STATE_HEADERS)
+        if state_table is None or state_table[0] != list(DEPOSITION_STATE_HEADERS):
+            add("ERROR", "DEPOSITION_STATE_SCHEMA", deposition_state, 1, "知识沉淀记录缺少v0.3固定字段")
+
+    usage_detail = root / CLAIM_USAGE_DETAIL_RELATIVE
+    confirmed_articles: dict[str, set[str]] = {}
+    pending_articles: dict[str, set[str]] = {}
+    if not usage_detail.is_file():
+        add("ERROR", "MISSING_CLAIM_USAGE_DETAIL", usage_detail, 0, "缺少CLAIM级知识块使用明细")
+    else:
+        usage_headers, usage_rows = read_csv_rows(usage_detail)
+        if usage_headers != list(CLAIM_USAGE_HEADERS):
+            add("ERROR", "CLAIM_USAGE_SCHEMA", usage_detail, 1, "知识块使用明细字段不符合v0.3固定结构")
+        else:
+            seen_usage: set[tuple[str, str, str]] = set()
+            for line, row in usage_rows:
+                claim_id = row["claim_id"]
+                article_id = row["article_id"]
+                status = row["usage_status"]
+                key = (article_id, row["article_version"], claim_id)
+                if key in seen_usage:
+                    add("ERROR", "DUPLICATE_CLAIM_USAGE", usage_detail, line, f"同一文章版本与CLAIM存在重复当前关系：{article_id}/{claim_id}")
+                seen_usage.add(key)
+                if status not in CLAIM_USAGE_STATUSES:
+                    add("ERROR", "CLAIM_USAGE_STATUS", usage_detail, line, f"CLAIM使用状态无效：{status or '空值'}")
+                if claim_id and claim_id not in formal_claim_ids:
+                    add("ERROR", "CLAIM_USAGE_UNKNOWN_CLAIM", usage_detail, line, f"使用明细引用不存在的正式CLAIM：{claim_id}")
+                if status == "已确认使用":
+                    required_values = ("article_id", "claim_id", "knowledge_path", "article_location", "source_location", "confirmed_at", "citation_manifest")
+                    missing = [field for field in required_values if not row[field]]
+                    if missing:
+                        add("ERROR", "CONFIRMED_USAGE_INCOMPLETE", usage_detail, line, f"已确认使用缺少定位字段：{'、'.join(missing)}")
+                    if article_id and claim_id:
+                        confirmed_articles.setdefault(claim_id, set()).add(article_id)
+                elif status == "尚未核对":
+                    if row["confirmed_at"]:
+                        add("ERROR", "UNVERIFIED_USAGE_CONFIRMED", usage_detail, line, "尚未核对的关系不得填写确认时间或计入使用次数")
+                    if article_id and claim_id:
+                        pending_articles.setdefault(claim_id, set()).add(article_id)
+
+    usage_total = root / CLAIM_USAGE_TOTAL_RELATIVE
+    if not usage_total.is_file():
+        add("ERROR", "MISSING_CLAIM_USAGE_TOTAL", usage_total, 0, "缺少CLAIM级知识块使用总表")
+    else:
+        total_table = find_markdown_table(read_text(usage_total), CLAIM_TOTAL_HEADERS)
+        if total_table is None or total_table[0] != list(CLAIM_TOTAL_HEADERS):
+            add("ERROR", "CLAIM_USAGE_TOTAL_SCHEMA", usage_total, 1, "知识块使用总表缺少v0.3固定字段")
+        else:
+            seen_totals: set[str] = set()
+            for line, row in total_table[1]:
+                claim_id = row["CLAIM ID"]
+                if claim_id in seen_totals:
+                    add("ERROR", "DUPLICATE_CLAIM_TOTAL", usage_total, line, f"知识块使用总表重复CLAIM：{claim_id}")
+                seen_totals.add(claim_id)
+                try:
+                    total_count = int(row["累计使用次数"])
+                    pending_count = int(row["尚未核对文章数"])
+                except ValueError:
+                    add("ERROR", "CLAIM_USAGE_TOTAL_COUNT", usage_total, line, "累计使用次数和尚未核对文章数必须为整数")
+                    continue
+                expected_total = len(confirmed_articles.get(claim_id, set()))
+                expected_pending = len(pending_articles.get(claim_id, set()))
+                if total_count != expected_total or pending_count != expected_pending:
+                    add("ERROR", "CLAIM_USAGE_TOTAL_MISMATCH", usage_total, line, f"CLAIM汇总与使用明细不一致：应为使用{expected_total}、尚未核对{expected_pending}")
+            for claim_id, file in formal_claim_ids.items():
+                if claim_id not in seen_totals:
+                    add("ERROR", "FORMAL_CLAIM_NOT_IN_USAGE_TOTAL", file, 1, f"正式CLAIM未进入知识块使用总表：{claim_id}")
+
+    manifest_dir = root / CLAIM_MANIFEST_DIR_RELATIVE
+    manifest_files = sorted(manifest_dir.glob("*.md")) if manifest_dir.is_dir() else []
+    if not manifest_dir.is_dir():
+        add("ERROR", "MISSING_CLAIM_MANIFEST_DIR", manifest_dir, 0, "缺少文章CLAIM引用清单目录")
+    manifest_texts: dict[Path, str] = {}
+    for file in manifest_files:
+        text = read_text(file)
+        manifest_texts[file] = text
+        table = find_markdown_table(text, CLAIM_MANIFEST_HEADERS)
+        if table is None or table[0] != list(CLAIM_MANIFEST_HEADERS):
+            add("ERROR", "CLAIM_MANIFEST_SCHEMA", file, 1, "文章引用清单缺少CLAIM级固定字段")
+            continue
+        for line, row in table[1]:
+            status = row["使用判断"]
+            if status not in CLAIM_USAGE_STATUSES:
+                add("ERROR", "CLAIM_MANIFEST_STATUS", file, line, f"文章引用清单使用判断无效：{status or '空值'}")
+            if status == "已确认使用":
+                missing = [field for field in ("文章位置/主张", "CLAIM ID", "正式知识位置", "原始来源与精确位置") if not row[field]]
+                if missing:
+                    add("ERROR", "CLAIM_MANIFEST_CONFIRMED_INCOMPLETE", file, line, f"已确认使用缺少定位字段：{'、'.join(missing)}")
+            if row["CLAIM ID"] and row["CLAIM ID"] not in formal_claim_ids:
+                add("ERROR", "CLAIM_MANIFEST_UNKNOWN_CLAIM", file, line, f"文章引用清单引用不存在的正式CLAIM：{row['CLAIM ID']}")
 
     for status, article_dir in article_dirs:
         article_id = article_dir.name.split("_", 1)[0]
@@ -499,6 +1749,13 @@ def validate_project(root: Path) -> list[Issue]:
                         add("ERROR", "WRITING_OUTLINE_MISSING", writing, 1, f"写作输入未按大纲建立对应标题：{item}")
 
         if status == "30_已完成":
+            matching_manifests = [
+                file
+                for file, text in manifest_texts.items()
+                if article_id in file.name or re.search(rf"(?m)^-\s*文章ID\s*[：:]\s*{re.escape(article_id)}\s*$", text)
+            ]
+            if not matching_manifests:
+                add("ERROR", "COMPLETED_ARTICLE_MISSING_CLAIM_MANIFEST", article_dir, 0, "已完成文章缺少CLAIM级文章引用清单；未完成回对时也必须建立清单并标记尚未核对")
             final_file = article_dir / "40_最终文章与引用率.md"
             if final_file.exists():
                 final_text = text_cache.get(final_file, read_text(final_file))
@@ -516,6 +1773,12 @@ def validate_project(root: Path) -> list[Issue]:
             if article_id in text and "03_文章任务/10_进行中/" in text:
                 add("ERROR", "STALE_ARTICLE_STATE_LINK", file, 1, f"已完成文章{article_id}仍链接进行中路径")
 
+    if completed_ids and version_entry_file.is_file():
+        version_text = text_cache.get(version_entry_file, read_text(version_entry_file))
+        for article_id in completed_ids:
+            if article_id not in version_text:
+                add("ERROR", "COMPLETED_ARTICLE_MISSING_VERSION_EVENT", version_entry_file, 1, f"已完成文章{article_id}没有对应的项目级完成变更记录")
+
     return sorted(issues, key=lambda item: (item.severity != "ERROR", item.file, item.line, item.code))
 
 
@@ -524,14 +1787,53 @@ def create_self_test_project(root: Path) -> None:
         (root / name).mkdir(parents=True, exist_ok=True)
     for path in (
         "02_正式知识/01_正式知识目录",
+        "02_正式知识/20_产品介绍/10_产品类目",
+        "02_正式知识/20_产品介绍/20_产品主数据",
+        "02_正式知识/20_产品介绍/30_重点产品卡",
         "02_正式知识/50_行业知识与洞察/10_企业提供",
         "02_正式知识/50_行业知识与洞察/20_Codex外部调研",
         "03_文章任务/01_文章总览",
         "03_文章任务/30_已完成/2026-08/TEST-ART-001_测试文章",
         "04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿",
+        "05_数据与审核/01_检查入口",
+        "05_数据与审核/10_知识沉淀与分流",
+        "05_数据与审核/20_知识使用与引用/40_文章引用清单",
         "05_数据与审核/30_异常与待决定/10_企业知识异常待处理",
+        "05_数据与审核/30_异常与待决定/30_Skill运行反馈",
     ):
         (root / path).mkdir(parents=True, exist_ok=True)
+
+    (root / WORKBENCH_TODO_RELATIVE).write_text(
+        "# 当前待办\n\n- 项目ID：TEST\n- 更新日期：2026-08-11\n- 当前节点：测试完成\n- 当前状态：测试项目已完成\n"
+        "- 待客户补充事项：[[05_数据与审核/30_异常与待决定/10_企业知识异常待处理/01_待客户补充事项]]\n"
+        "- 源文与事实异常：[[05_数据与审核/30_异常与待决定/10_企业知识异常待处理/02_源文与事实异常台账]]\n"
+        "- Skill运行反馈：[[05_数据与审核/30_异常与待决定/30_Skill运行反馈/01_Skill反馈台账]]\n",
+        encoding="utf-8",
+    )
+    (root / VERSION_ENTRY_RELATIVE).write_text(
+        "# 版本与变更入口\n\n- 项目ID：TEST\n- 当前状态：[[20_当前待办]]\n- 使用Skill：manage-article-knowledge v0.3\n"
+        f"- Skill版本日期：2026-08-12\n- Skill指纹：{sha256_file(skill_file())}\n- 初始化日期：2026-08-06\n- 最近项目级变更：2026-08-11｜测试文章完成\n\n"
+        "## 项目级变更\n\n| 日期 | 变更 | 依据 | 执行人 | 关联对象 | 影响范围 |\n|---|---|---|---|---|---|\n"
+        "| 2026-08-11 | 测试文章完成 | 终稿闭环 | Codex | TEST-ART-001 | 文章任务与数据 |\n\n"
+        "## 相关入口\n\n- [当前待办](20_当前待办.md)\n"
+        "- [待客户补充事项](../05_数据与审核/30_异常与待决定/10_企业知识异常待处理/01_待客户补充事项.md)\n"
+        "- [源文与事实异常](../05_数据与审核/30_异常与待决定/10_企业知识异常待处理/02_源文与事实异常台账.md)\n"
+        "- [Skill运行反馈](../05_数据与审核/30_异常与待决定/30_Skill运行反馈/01_Skill反馈台账.md)\n",
+        encoding="utf-8",
+    )
+    (root / CHECK_ENTRY_RELATIVE).write_text(
+        "# 当前待办检查入口\n\n- [工作台当前待办](../../01_工作台/20_当前待办.md)\n"
+        "- [待客户补充事项](../30_异常与待决定/10_企业知识异常待处理/01_待客户补充事项.md)\n"
+        "- [源文与事实异常](../30_异常与待决定/10_企业知识异常待处理/02_源文与事实异常台账.md)\n"
+        "- [Skill运行反馈](../30_异常与待决定/30_Skill运行反馈/01_Skill反馈台账.md)\n",
+        encoding="utf-8",
+    )
+    (root / SKILL_FEEDBACK_RELATIVE).write_text(
+        "# Skill反馈台账\n\n- 项目ID：TEST\n- 最近检查日期：2026-08-11\n\n## 当前反馈\n\n"
+        "| 反馈ID | 人话说明 | 提出来源 | 类型 | 当前阶段 | 影响 | 下一步 | 最近更新 |\n"
+        "|---|---|---|---|---|---|---|---|\n\n## 反馈详情\n\n## 已关闭与不纳入\n",
+        encoding="utf-8",
+    )
 
     article = root / "03_文章任务/30_已完成/2026-08/TEST-ART-001_测试文章"
     (article / "01_文章要求与大纲.md").write_text("# 文章要求与大纲\n\n## 大纲\n\n1. 测试主题\n", encoding="utf-8")
@@ -556,13 +1858,125 @@ def create_self_test_project(root: Path) -> None:
 
     formal = root / "02_正式知识/50_行业知识与洞察/10_企业提供/测试主题.md"
     formal.write_text(
-        "---\nknowledge_id: KB-TEST-001\nsource_type: 企业提供\n---\n\n# 测试主题\n\n## 已处理内容\n\n测试知识。\n\n## 使用限制\n\n无。\n\n## 来源\n\n- [测试清理稿](../../../04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md)；PDF p.1\n",
+        "# 测试主题\n\n- 知识ID：KB-TEST-IND-001\n- 正式知识类型：行业知识\n- 稳定主题键：industry:test-topic\n- 知识状态：有效\n- 来源类型：企业提供\n- 数据或版本日期：2026-08-06\n- 最近核验日期：2026-08-06\n- 使用前复核：否\n\n## 已处理内容\n\n### CLAIM-TEST-IND-001-01｜测试事实\n\n- 知识ID：KB-TEST-IND-001-01\n- 稳定主题键：industry:test-topic\n- 知识类型：事实\n- 已核验事实：测试资料在PDF第1页明确给出测试正文。\n- 适用范围：测试项目与该测试主题\n- 不可外推：不得外推为其他项目或其他主题的事实\n- 来源：[测试清理稿](../../../04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md)\n- 精确位置：PDF p.1，清理后的正文\n- 数据日期：2026-08-06\n- 使用前复核：否\n\n## 使用限制\n\n仅用于测试。\n\n## 来源\n\n- [测试清理稿](../../../04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md)\n",
+        encoding="utf-8",
+    )
+
+    (root / "02_正式知识/01_正式知识目录/01_正式知识目录.md").write_text(
+        "# 正式知识目录\n\n| 知识ID | 稳定实体/主题键 | 标题 | 模块 | 正式知识位置 | 当前状态 | 数据日期/最近核验 |\n|---|---|---|---|---|---|---|\n| KB-TEST-IND-001 | industry:test-topic | 测试主题 | 行业知识 | 测试主题.md | 有效 | 2026-08-06 |\n",
+        encoding="utf-8",
+    )
+    (root / "02_正式知识/20_产品介绍/01_产品介绍总览.md").write_text(
+        "# 产品介绍总览\n\n## 已处理内容\n\n- 无\n",
+        encoding="utf-8",
+    )
+    (root / "02_正式知识/50_行业知识与洞察/01_行业知识与洞察总览.md").write_text(
+        "# 行业知识与洞察总览\n\n## 已处理内容\n\n- KB-TEST-IND-001｜测试主题\n",
+        encoding="utf-8",
+    )
+
+    (root / CANDIDATE_RELATIVE).write_text(
+        "# 知识候选分流\n\n"
+        "| 候选ID | 内容主题 | 来源类型 | 就绪来源文件 | 原文精确位置 | 稳定实体/主题键 | 主归属模块 | 预定正式路径 | CLAIM数量 | 处理状态 | 校验结果/异常 | 正式知识ID或处理位置 | 最近更新 |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "| TEST-CAND-001 | 测试主题 | 客户源文件 | TEST-SRC-001_测试_清理与字段统一稿.md | PDF p.1 | industry:test-topic | 行业知识与洞察/企业提供 | 02_正式知识/50_行业知识与洞察/10_企业提供/测试主题.md | 1 | 已沉淀 | 通过 | KB-TEST-IND-001 | 2026-08-06 |\n",
+        encoding="utf-8",
+    )
+    (root / DEPOSITION_STATE_RELATIVE).write_text(
+        "# 知识沉淀记录\n\n"
+        "| 知识ID | 稳定实体或主题键 | 标题 | 来源类型 | 原始来源 | 处理状态 | 主归属模块 | 正式知识位置 | 数据或版本日期 | 更新条件 | 使用限制或待决定事项 | 最近更新日期 |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "| KB-TEST-IND-001 | industry:test-topic | 测试主题 | 客户源文件 | TEST-SRC-001 | 已沉淀 | 行业知识与洞察/企业提供 | 测试主题.md | 2026-08-06 | 来源变化 | 仅用于测试 | 2026-08-06 |\n",
+        encoding="utf-8",
+    )
+    (root / DEPOSITION_EVENT_RELATIVE).write_text(
+        "date,knowledge_id,claim_ids,entity_key,action,formal_file,heading,source_refs,source_ready_artifact,status,operator,notes\n"
+        "2026-08-06,KB-TEST-IND-001,CLAIM-TEST-IND-001-01,industry:test-topic,create,测试主题.md,测试事实,TEST-SRC-001,TEST-SRC-001_测试_清理与字段统一稿.md,completed,Codex,test\n",
+        encoding="utf-8-sig",
+    )
+    (root / CLAIM_USAGE_DETAIL_RELATIVE).write_text(
+        "project_id,article_id,article_title,article_version,claim_id,knowledge_id,knowledge_title,knowledge_path,article_location,source_location,use_type,usage_status,confirmed_at,issue_flag,citation_manifest\n"
+        "TEST,TEST-ART-001,测试文章,v1,CLAIM-TEST-IND-001-01,KB-TEST-IND-001,测试主题,02_正式知识/50_行业知识与洞察/10_企业提供/测试主题.md,正文第1段,TEST-SRC-001/PDF p.1,直接事实,已确认使用,2026-08-06,,TEST-ART-001.md\n",
+        encoding="utf-8-sig",
+    )
+    (root / CLAIM_USAGE_TOTAL_RELATIVE).write_text(
+        "# 知识块使用总表\n\n"
+        "| CLAIM ID | 所属正式知识ID | 标题 | 正式知识位置 | 来源类型 | 已确认使用文章 | 累计使用次数 | 尚未核对文章数 | 最近使用日期 | 异常数 | 当前追踪状态 |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "| CLAIM-TEST-IND-001-01 | KB-TEST-IND-001 | 测试事实 | 测试主题.md | 企业提供 | TEST-ART-001 | 1 | 0 | 2026-08-06 | 0 | 正常 |\n",
+        encoding="utf-8",
+    )
+    (root / DATA_EXPLANATION_RELATIVE).write_text(
+        "# 数据说明\n\n- 最近检查日期：2026-08-11\n\n## 受管非Markdown数据文件\n\n"
+        "| 文件 | 类型 | 用途 | 维护责任 | 是否允许人工编辑 | 更新触发 | 查看方式 | 编码/格式 | 最近校验 |\n"
+        "|---|---|---|---|---|---|---|---|---|\n"
+        "| [正式知识沉淀记录](../10_知识沉淀与分流/40_正式知识沉淀记录.csv) | CSV | 沉淀事件 | 主Agent | 否 | 正式知识变更 | Excel或CSV工具 | UTF-8 with BOM | 2026-08-11，通过 |\n"
+        "| [知识块使用明细](20_知识块使用明细.csv) | CSV | CLAIM使用关系 | 主Agent | 否 | 终稿核对 | Excel或CSV工具 | UTF-8 with BOM | 2026-08-11，通过 |\n\n"
+        "## 数据口径与查看说明\n\n- CSV保存逐行机器明细，本页不复制完整数据行。\n",
+        encoding="utf-8",
+    )
+    (root / CLAIM_MANIFEST_DIR_RELATIVE / "TEST-ART-001.md").write_text(
+        "# 文章引用清单\n\n- 文章ID：TEST-ART-001\n- 标题：测试文章\n- 版本：v1\n- 正文指纹：test\n- 生成时间：2026-08-06\n\n"
+        "| 文章位置/主张 | CLAIM ID | 所属正式知识ID | 正式知识位置 | 原始来源与精确位置 | 使用方式 | 使用判断 | 异常处理 |\n"
+        "|---|---|---|---|---|---|---|---|\n"
+        "| 正文第1段 | CLAIM-TEST-IND-001-01 | KB-TEST-IND-001 | 测试主题.md | TEST-SRC-001/PDF p.1 | 直接事实 | 已确认使用 | 无 |\n\n"
+        "## 未追踪内容\n\n| 文章位置/主张 | 原因 | 是否企业事实 | 风险 | 处理位置 |\n|---|---|---|---|---|\n",
         encoding="utf-8",
     )
 
     customer_request = root / CUSTOMER_REQUEST_RELATIVE
     customer_request.write_text(
-        "# 待客户补充事项\n\n- 项目ID：TEST\n- 最近检查日期：2026-08-06\n\n## 当前事项\n\n| 问题ID | 事实主题 | 希望客户提供 | 关联文章与大纲位置 | 当前安全处理 | 当前影响 | 内部接收人/对客沟通人 | 当前状态 | 计划或发送日期 | 回复或证据位置 | 返回节点 | 最近更新 |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n\n## 事项详情\n",
+        "# 待客户补充事项\n\n- 项目ID：TEST\n- 最近检查日期：2026-08-11\n\n## 当前事项\n\n"
+        "| 问题ID | 想向客户确认什么 | 为什么需要 | 回复前怎么处理 | 当前阶段 | 下一步由谁做 | 最近更新 |\n"
+        "|---|---|---|---|---|---|---|\n"
+        "| TEST-CUS-BASE | 是否需要客户补充测试事实 | 当前资料无法确认该事实 | 本篇先排除该事实 | 待判断要不要问 | 知识库专员判断是否值得询问 | 2026-08-11 |\n\n"
+        "## 事项详情\n\n"
+        "### TEST-CUS-BASE｜是否需要客户补充测试事实\n\n"
+        "#### 先看结论\n\n"
+        "- 发生了什么：当前资料没有说明测试事实。\n"
+        "- 希望客户确认或提供什么：确认测试事实是否成立并提供可核验材料。\n"
+        "- 为什么值得询问：这项事实可能影响后续文章，但本篇可以先排除。\n"
+        "- 客户回复前怎么处理：不把该事实写入正式知识或文章。\n"
+        "- 当前阶段：待判断要不要问\n"
+        "- 下一步由谁做：知识库专员判断是否值得询问。\n\n"
+        "> [!info]- 内部追溯信息\n> - 发现来源：审核Agent\n> - 关联文章与大纲位置：TEST-ART-001/测试主题\n> - 返回节点：节点5\n",
+        encoding="utf-8",
+    )
+    source_anomaly = root / SOURCE_ANOMALY_RELATIVE
+    source_anomaly.write_text(
+        "# 源文与事实异常台账\n\n- 项目ID：TEST\n- 最近检查日期：2026-08-11\n\n"
+        "## 当前异常\n\n"
+        "| 异常ID | 通俗说明 | 原文是否修复 | 现在怎么处理 | 当前阶段 | 谁需要做什么 | 下一步或重开条件 |\n"
+        "|---|---|---|---|---|---|---|\n"
+        "| TEST-ANM-BASE | 原文中的测试参数写法无法确认含义 | 未修复 | 不使用这条参数，其他可靠内容照常使用 | 已完成处置（原文未修复） | 主Agent保留限制，审核Agent已核对证据 | 取得完整且可核验的新版本时重开 |\n\n"
+        "## 异常详情\n\n"
+        "### TEST-ANM-BASE｜原文中的测试参数写法无法确认含义\n\n"
+        "#### 先看结论\n\n"
+        "- 发生了什么：原文把测试参数写成包含特殊符号的形式，现有上下文不足以确认它代表什么。\n"
+        "- 为什么有风险：直接改写或补全可能把错误参数当成真实参数。\n"
+        "- 现在怎么处理：不使用这条参数，其他可独立核验的内容继续使用。\n"
+        "- 为什么本轮结束，或者还在等什么：当前能做的安全隔离和下游检查已经完成，等待新的完整版本。\n"
+        "- 原文是否修复：未修复\n"
+        "- 当前阶段：已完成处置（原文未修复）\n"
+        "- 谁需要做什么：主Agent保留使用限制；有新材料时重新核验。\n\n"
+        "#### 原文现场证据\n\n"
+        "- 保存原文证据：[打开保存的原文证据](../../../04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md#清理后的正文)\n"
+        "- 原始来源：[打开原始来源](https://example.com/test)\n- 来源版本/指纹：test-sha256\n- 精确位置：PDF p.1\n- 证据完整性：完整\n- 现场证据类型：逐字文本\n\n"
+        "##### 实际取得的原文或原始结构（逐字/原样）\n\n```text\n0.00004%%T @220nm\n```\n\n"
+        "##### 必要上下文\n\n- 前文：测试条件如下。\n- 异常位置：见上方围栏代码块中的测试参数。\n- 后文：无更多解释。\n- 表头、脚注或公式上下文：不适用\n- 页面截图或原始版面：不适用\n\n"
+        "##### 经核验仍可使用的原文或原始结构（如有）\n\n```text\n无\n```\n\n- 可使用证据位置：无\n\n"
+        "#### 内部追溯与处理记录\n\n"
+        "- 首次发现日期：2026-08-11\n- 问题类型：语义不确定或事实风险\n"
+        "- 受影响CLAIM、正式知识、候选和文章（有才写）：CLAIM-TEST-IND-001-01\n"
+        "- 负责人：主Agent\n- 本次只重跑的范围：测试参数范围\n"
+        "- 资料处理Agent结果：保留原文并隔离该参数。\n"
+        "- 审核Agent独立复核：已打开原文链接并核对逐字文本与上下文。\n"
+        "- 当前正式知识/候选/项目资料稿更新：候选保留不沉淀限制。\n"
+        "- 进行中的文章写作输入更新：没有进行中的受影响文章。\n"
+        "- 已完成文章历史影响与修订决定：没有已完成的受影响文章。\n"
+        "- 完成处置的证据：[打开原文现场](../../../04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md#清理后的正文)\n"
+        "- 最近更新：2026-08-11\n\n"
+        "## 已完成处置与历史\n",
         encoding="utf-8",
     )
 
@@ -577,6 +1991,35 @@ def run_self_test() -> int:
             for issue in issues:
                 print(asdict(issue))
             return 1
+        managed_csv = root / CLAIM_USAGE_DETAIL_RELATIVE
+        valid_csv_bytes = managed_csv.read_bytes()
+        managed_csv.write_bytes(valid_csv_bytes.removeprefix(UTF8_BOM))
+        issues = validate_project(root)
+        if not any(issue.code == "CSV_UTF8_BOM" for issue in issues):
+            print("SELF-TEST FAILED: managed CSV without UTF-8 BOM was not detected")
+            return 1
+        managed_csv.write_bytes(valid_csv_bytes)
+        data_explanation = root / DATA_EXPLANATION_RELATIVE
+        valid_data_explanation = read_text(data_explanation)
+        data_explanation.write_text(
+            "\n".join(
+                line for line in valid_data_explanation.splitlines() if "(20_知识块使用明细.csv)" not in line
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "MANAGED_FILE_NOT_REGISTERED" for issue in issues):
+            print("SELF-TEST FAILED: unregistered managed non-Markdown file was not detected")
+            return 1
+        data_explanation.write_text(valid_data_explanation, encoding="utf-8")
+        orphan = root / "04_资料与证据/未登记证据.bin"
+        orphan.write_bytes(b"test")
+        issues = validate_project(root)
+        if not any(issue.code == "NON_MD_ORPHAN" for issue in issues):
+            print("SELF-TEST FAILED: orphan non-Markdown file was not detected")
+            return 1
+        orphan.unlink()
         formal = root / "02_正式知识/50_行业知识与洞察/10_企业提供/测试主题.md"
         formal.write_text(read_text(formal) + "\n$srcLink\n", encoding="utf-8")
         issues = validate_project(root)
@@ -584,6 +2027,98 @@ def run_self_test() -> int:
             print("SELF-TEST FAILED: placeholder was not detected")
             return 1
         formal.write_text(read_text(formal).replace("\n$srcLink\n", "\n"), encoding="utf-8")
+        valid_formal = read_text(formal)
+        formal.write_text(
+            re.sub(
+                r"(?ms)(## 已处理内容\s*\n).*?(?=^## 使用限制)",
+                r"\1\n测试知识摘要。\n\n",
+                valid_formal,
+            ),
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "FORMAL_CLAIM_MISSING" for issue in issues):
+            print("SELF-TEST FAILED: summary-only formal knowledge was not detected")
+            return 1
+        formal.write_text(valid_formal, encoding="utf-8")
+
+        formal.write_text(valid_formal.replace("- 精确位置：PDF p.1，清理后的正文\n", ""), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "FORMAL_CLAIM_FIELD" and "精确位置" in issue.message for issue in issues):
+            print("SELF-TEST FAILED: missing claim source position was not detected")
+            return 1
+        formal.write_text(valid_formal, encoding="utf-8")
+
+        product_at_root = root / "02_正式知识/20_产品介绍/错误落位产品.md"
+        product_at_root.write_text(
+            valid_formal.replace("KB-TEST-IND-001", "KB-TEST-PROD-001")
+            .replace("行业知识", "产品主数据")
+            .replace("industry:test-topic", "product:TEST-001")
+            .replace("来源类型：企业提供", "来源类型：客户官网"),
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "FORMAL_FILE_AT_MODULE_ROOT" for issue in issues):
+            print("SELF-TEST FAILED: formal knowledge at module root was not detected")
+            return 1
+        product_at_root.unlink()
+
+        industry_overview = root / "02_正式知识/50_行业知识与洞察/01_行业知识与洞察总览.md"
+        valid_overview = read_text(industry_overview)
+        industry_overview.write_text("# 行业知识与洞察总览\n\n## 已处理内容\n\n- 无\n", encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "OVERVIEW_FORMAL_CONTRADICTION" for issue in issues):
+            print("SELF-TEST FAILED: contradictory module overview was not detected")
+            return 1
+        industry_overview.write_text(valid_overview, encoding="utf-8")
+
+        formal.write_text(valid_formal.replace("- 精确位置：PDF p.1，清理后的正文\n", ""), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "DEPOSITION_COMPLETED_WITH_FORMAL_ERRORS" for issue in issues):
+            print("SELF-TEST FAILED: completed deposition with invalid formal knowledge was not detected")
+            return 1
+        formal.write_text(valid_formal, encoding="utf-8")
+
+        candidate_file = root / CANDIDATE_RELATIVE
+        valid_candidate = read_text(candidate_file)
+        candidate_file.write_text(valid_candidate.replace("| 已沉淀 | 通过 |", "| 可自动沉淀 | 通过 |"), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "READY_CANDIDATE_NOT_DEPOSITED" for issue in issues):
+            print("SELF-TEST FAILED: ready candidate left undeposited was not detected")
+            return 1
+        candidate_file.write_text(valid_candidate.replace("| 已沉淀 | 通过 |", "| 异常待处理 | 文章未使用 |"), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "ARTICLE_USE_AS_DEPOSIT_GATE" for issue in issues):
+            print("SELF-TEST FAILED: article use as deposition gate was not detected")
+            return 1
+        candidate_file.write_text(
+            valid_candidate.replace("TEST-SRC-001_测试_清理与字段统一稿.md", "OTHER-SRC-001_其他清理稿.md"),
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "VERIFIED_SOURCE_NOT_ROUTED" for issue in issues):
+            print("SELF-TEST FAILED: verified source missing from candidate routing was not detected")
+            return 1
+        candidate_file.write_text(valid_candidate, encoding="utf-8")
+
+        usage_detail = root / CLAIM_USAGE_DETAIL_RELATIVE
+        valid_usage = read_text(usage_detail)
+        usage_detail.write_text(valid_usage.replace("正文第1段,TEST-SRC-001", ",TEST-SRC-001"), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "CONFIRMED_USAGE_INCOMPLETE" for issue in issues):
+            print("SELF-TEST FAILED: incomplete confirmed claim usage was not detected")
+            return 1
+        usage_detail.write_text(valid_usage, encoding="utf-8")
+
+        usage_total = root / CLAIM_USAGE_TOTAL_RELATIVE
+        valid_total = read_text(usage_total)
+        usage_total.write_text(valid_total.replace("| 1 | 0 |", "| 2 | 0 |"), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "CLAIM_USAGE_TOTAL_MISMATCH" for issue in issues):
+            print("SELF-TEST FAILED: claim usage aggregate mismatch was not detected")
+            return 1
+        usage_total.write_text(valid_total, encoding="utf-8")
+
         writing = root / "03_文章任务/30_已完成/2026-08/TEST-ART-001_测试文章/30_文章写作输入.md"
         valid_writing = read_text(writing)
         writing.write_text(
@@ -614,26 +2149,166 @@ def run_self_test() -> int:
             print("SELF-TEST FAILED: missing writing input fidelity review was not detected")
             return 1
         audit.write_text(valid_audit, encoding="utf-8")
-        customer_request = root / CUSTOMER_REQUEST_RELATIVE
-        customer_request.write_text(
-            read_text(customer_request).replace(
-                "\n\n## 事项详情",
-                "\n| TEST-CUS-001 | 测试事实 | 客户答复 | TEST-ART-001/测试主题 | 明确排除 | 不阻塞 | 运营/待定 | 错误状态 |  |  | 节点5 | 2026-08-06 |\n\n## 事项详情",
+
+        anchor_target = root / "04_资料与证据/锚点目标.md"
+        anchor_target.write_text("# 完整标题｜测试对象\n\n可定位正文。 ^test-block\n", encoding="utf-8")
+        anchor_source = root / "04_资料与证据/锚点链接测试.md"
+        anchor_source.write_text(
+            "# 锚点链接测试\n\n"
+            "- [[04_资料与证据/锚点目标#完整标题｜测试对象|标题锚点]]\n"
+            "- [块锚点](锚点目标.md#^test-block)\n",
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if any(issue.code == "BROKEN_LINK_ANCHOR" and issue.file.endswith("锚点链接测试.md") for issue in issues):
+            print("SELF-TEST FAILED: valid heading or block anchor was incorrectly rejected")
+            return 1
+        anchor_source.write_text(
+            read_text(anchor_source)
+            + "- [[04_资料与证据/锚点目标#不存在的短锚点|错误标题锚点]]\n"
+            + "- [错误块锚点](锚点目标.md#^missing-block)\n",
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        broken_anchor_issues = [
+            issue
+            for issue in issues
+            if issue.code == "BROKEN_LINK_ANCHOR" and issue.file.endswith("锚点链接测试.md")
+        ]
+        if len(broken_anchor_issues) != 2:
+            print("SELF-TEST FAILED: missing heading and block anchors were not both detected")
+            return 1
+        anchor_target.write_text(read_text(anchor_target) + "重复定位。 ^test-block\n", encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "DUPLICATE_BLOCK_ID" and issue.file.endswith("锚点目标.md") for issue in issues):
+            print("SELF-TEST FAILED: duplicate block ID was not detected")
+            return 1
+        anchor_source.unlink()
+        anchor_target.unlink()
+
+        version_entry = root / VERSION_ENTRY_RELATIVE
+        valid_version_entry = read_text(version_entry)
+        version_entry.write_text(valid_version_entry + "\n- 当前项目状态：旧状态\n", encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "VERSION_ENTRY_DUPLICATE_STATE" for issue in issues):
+            print("SELF-TEST FAILED: duplicated current project state in version entry was not detected")
+            return 1
+        version_entry.write_text(valid_version_entry, encoding="utf-8")
+
+        current_skill_hash = sha256_file(skill_file())
+        version_entry.write_text(valid_version_entry.replace(current_skill_hash, "0" * 64), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "PROJECT_SKILL_MISMATCH" for issue in issues):
+            print("SELF-TEST FAILED: outdated project Skill fingerprint was not detected")
+            return 1
+        version_entry.write_text(valid_version_entry, encoding="utf-8")
+
+        fake_runtime_skill = Path(temp) / "runtime-skill" / "SKILL.md"
+        fake_runtime_skill.parent.mkdir(parents=True, exist_ok=True)
+        fake_runtime_skill.write_text("---\nname: manage-article-knowledge\ndescription: stale runtime\n---\n", encoding="utf-8")
+        issues = validate_project(root, fake_runtime_skill)
+        if not any(issue.code == "RUNTIME_SKILL_MISMATCH" for issue in issues):
+            print("SELF-TEST FAILED: stale installed/runtime Skill was not detected")
+            return 1
+
+        check_entry = root / CHECK_ENTRY_RELATIVE
+        valid_check_entry = read_text(check_entry)
+        check_entry.write_text(
+            "\n".join(line for line in valid_check_entry.splitlines() if "Skill运行反馈" not in line) + "\n",
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "CHECK_ENTRY_LINK" and "Skill运行反馈" in issue.message for issue in issues):
+            print("SELF-TEST FAILED: missing Skill feedback link in check entry was not detected")
+            return 1
+        check_entry.write_text(valid_check_entry, encoding="utf-8")
+
+        skill_feedback = root / SKILL_FEEDBACK_RELATIVE
+        valid_skill_feedback = read_text(skill_feedback)
+        skill_feedback.write_text(
+            valid_skill_feedback.replace(
+                "\n\n## 反馈详情",
+                "\n| TEST-SKFB-001 | Codex发现测试入口矛盾 | Codex自动发现 | 校验遗漏 | 人工提出，待维护判断 | 可能遗漏状态错误 | AI知识库专员判断 | 2026-08-11 |\n\n## 反馈详情",
+            )
+            .replace(
+                "\n\n## 已关闭与不纳入",
+                "\n\n### TEST-SKFB-001｜Codex发现测试入口矛盾\n\n#### 先看结论\n\n- 实际发生了什么：检查入口没有覆盖测试反馈。\n- 原本希望怎样：检查入口应链接全部反馈。\n- 对当前项目有什么影响：维护人员可能看不到反馈。\n- 当前临时处理：人工打开反馈台账。\n- 提出来源：Codex自动发现\n- 提出日期：2026-08-11\n- 当前阶段：人工提出，待维护判断\n- 下一步由谁做：AI知识库专员判断。\n\n#### 发现与关联\n\n- 自动总结依据（Codex自动发现时必填）：项目校验发现入口缺失。\n- 相关文件：[检查入口](../../../01_检查入口/01_当前待办.md)\n- 使用的Skill版本、日期和指纹：v0.3；2026-08-11；test\n- 是否可以复现：是\n- 敏感信息处理：无需脱敏\n\n## 已关闭与不纳入",
             ),
             encoding="utf-8",
         )
         issues = validate_project(root)
-        if not any(issue.code == "CUSTOMER_REQUEST_STATUS" for issue in issues):
-            print("SELF-TEST FAILED: invalid customer request status was not detected")
+        if not any(issue.code == "SKILL_FEEDBACK_ORIGIN_STAGE" for issue in issues):
+            print("SELF-TEST FAILED: inconsistent Skill feedback origin and stage was not detected")
+            return 1
+        skill_feedback.write_text(valid_skill_feedback, encoding="utf-8")
+
+        customer_request = root / CUSTOMER_REQUEST_RELATIVE
+        valid_customer_request = read_text(customer_request)
+        customer_request.write_text(valid_customer_request.replace("| 待判断要不要问 |", "| 错误阶段 |", 1), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "CUSTOMER_REQUEST_STAGE" for issue in issues):
+            print("SELF-TEST FAILED: invalid customer request stage was not detected")
             return 1
         customer_request.write_text(
-            read_text(customer_request).replace("错误状态", "待发送"),
+            valid_customer_request.replace("| 待判断要不要问 |", "| 等待发送 |", 1).replace(
+                "- 当前阶段：待判断要不要问", "- 当前阶段：等待发送"
+            ),
             encoding="utf-8",
         )
+        issues = validate_project(root)
+        if not any(issue.code == "CUSTOMER_REQUEST_SCRIPT_REQUIRED" for issue in issues):
+            print("SELF-TEST FAILED: missing confirmed customer script was not detected")
+            return 1
+        customer_request.write_text(valid_customer_request, encoding="utf-8")
         audit.write_text(read_text(audit) + "\n以后问客户。\n", encoding="utf-8")
         issues = validate_project(root)
         if not any(issue.code == "AUDIT_CUSTOMER_REQUEST_LINK" for issue in issues):
             print("SELF-TEST FAILED: missing customer request backlink was not detected")
+            return 1
+        source_anomaly = root / SOURCE_ANOMALY_RELATIVE
+        valid_source_anomaly = read_text(source_anomaly)
+        source_anomaly.write_text(valid_source_anomaly.replace("| 已完成处置（原文未修复） |", "| 错误阶段 |", 1), encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "SOURCE_ANOMALY_STAGE" for issue in issues):
+            print("SELF-TEST FAILED: invalid source anomaly stage was not detected")
+            return 1
+        source_anomaly.write_text(
+            valid_source_anomaly.replace("| 未修复 |", "| 已修复 |", 1).replace("- 原文是否修复：未修复", "- 原文是否修复：已修复"),
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "SOURCE_ANOMALY_STAGE_REPAIR" for issue in issues):
+            print("SELF-TEST FAILED: inconsistent anomaly repair stage was not detected")
+            return 1
+        source_anomaly.write_text(
+            valid_source_anomaly.replace(
+                "[打开保存的原文证据](../../../04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md#清理后的正文)",
+                "TEST-SRC-001/PDF p.1",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "SOURCE_ANOMALY_SAVED_EVIDENCE" for issue in issues):
+            print("SELF-TEST FAILED: missing source anomaly evidence link was not detected")
+            return 1
+        source_anomaly.write_text(valid_source_anomaly, encoding="utf-8")
+        control_syntax = root / "04_资料与证据/控制语法测试.md"
+        control_syntax.write_text("# 测试\n\n原文为0.00004%%T @220nm。\n", encoding="utf-8")
+        issues = validate_project(root)
+        if not any(issue.code == "OBSIDIAN_CONTROL_SYNTAX" for issue in issues):
+            print("SELF-TEST FAILED: unprotected Obsidian control syntax was not detected")
+            return 1
+        control_syntax.write_text("# 测试\n\n```text\n原文为0.00004%%T @220nm。\n```\n", encoding="utf-8")
+        issues = validate_project(root)
+        if any(issue.code == "OBSIDIAN_CONTROL_SYNTAX" and issue.file.endswith("控制语法测试.md") for issue in issues):
+            print("SELF-TEST FAILED: protected Obsidian control syntax was incorrectly rejected")
+            return 1
+        control_syntax.unlink()
+        source_anomaly.unlink()
+        issues = validate_project(root)
+        if not any(issue.code == "MISSING_SOURCE_ANOMALY_LEDGER" for issue in issues):
+            print("SELF-TEST FAILED: missing source anomaly ledger was not detected")
             return 1
         customer_request.unlink()
         issues = validate_project(root)
@@ -649,6 +2324,7 @@ def main() -> int:
     parser.add_argument("--project", type=Path, help="Obsidian项目根目录")
     parser.add_argument("--json", action="store_true", help="输出JSON")
     parser.add_argument("--self-test", action="store_true", help="运行内置正反例测试")
+    parser.add_argument("--runtime-skill", type=Path, help="实际运行Skill目录或SKILL.md；用于发布、安装和迁移一致性检查")
     args = parser.parse_args()
 
     if args.self_test:
@@ -657,7 +2333,7 @@ def main() -> int:
         parser.error("--project is required unless --self-test is used")
 
     root = args.project.resolve()
-    issues = validate_project(root)
+    issues = validate_project(root, args.runtime_skill)
     errors = sum(issue.severity == "ERROR" for issue in issues)
     warnings = sum(issue.severity == "WARNING" for issue in issues)
 
