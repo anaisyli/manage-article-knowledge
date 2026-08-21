@@ -801,9 +801,14 @@ def split_link_target(target: str) -> tuple[str, str | None]:
     return unquote(path).strip(), unquote(anchor).strip() if separator else None
 
 
+def is_external_uri(value: str) -> bool:
+    """Treat every explicit URI scheme except file: as external to the Vault."""
+    return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value)) and not value.casefold().startswith("file:")
+
+
 def resolve_markdown_link_target(source: Path, target: str, root: Path) -> Path | None:
     path, _ = split_link_target(target)
-    if re.match(r"^(https?://|mailto:|obsidian://)", path, re.I):
+    if is_external_uri(path):
         return None
     if not path:
         return source.resolve()
@@ -857,7 +862,7 @@ def iter_link_targets(text: str) -> list[str]:
 
 def resolve_vault_target(source: Path, target: str, root: Path, vault_files: list[Path]) -> Path | None:
     target, _ = split_link_target(target)
-    if not target or re.match(r"^(https?://|mailto:|obsidian://)", target, re.I):
+    if not target or is_external_uri(target):
         return None
 
     normalized = target.replace("\\", "/")
@@ -1477,6 +1482,44 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
         text = text_cache[file]
         relative = relpath(file, root)
 
+        if (
+            relative.startswith("04_资料与证据/20_原文提取/10_Codex提取/")
+            and file.name.upper().startswith("WEB-")
+        ):
+            failed_markers = ("当前不可用", "失败试样", "## 可见正文快照")
+            if any(marker in text for marker in failed_markers):
+                add(
+                    "ERROR",
+                    "WEB_EVIDENCE_FAILED_SAMPLE_CURRENT",
+                    file,
+                    1,
+                    "网页失败试样不得留在当前Codex提取目录；如需复现Skill问题，移入项目运行历史",
+                )
+            if parse_field(text, "网页原文质量") != "通过":
+                add(
+                    "ERROR",
+                    "WEB_EVIDENCE_QUALITY_GATE",
+                    file,
+                    1,
+                    "Codex网页原文缺少发布前质量通过状态",
+                )
+            if not parse_field(text, "主内容起止边界"):
+                add(
+                    "ERROR",
+                    "WEB_EVIDENCE_QUALITY_GATE",
+                    file,
+                    1,
+                    "Codex网页原文缺少可复核的主内容起止边界",
+                )
+            if not re.search(r"(?m)^##\s+(?:按原顺序保存的可见正文|主内容原文)\s*$", text):
+                add(
+                    "ERROR",
+                    "WEB_EVIDENCE_QUALITY_GATE",
+                    file,
+                    1,
+                    "Codex网页原文缺少结构化主内容正文区，不得用整页DOM快照代替",
+                )
+
         for match in re.finditer(r"AI知识库专员(?:自动|自行执行)|由AI知识库专员自动", text):
             add(
                 "ERROR",
@@ -1574,7 +1617,11 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
         for match in re.finditer(r"!?\[[^\]\n]*\]\((<[^>]+>|[^)\n]+)\)", text):
             target = match.group(1).strip()
             path, anchor = split_link_target(target)
-            if re.match(r"^(https?://|mailto:|obsidian://)", path, re.I):
+            if is_external_uri(path):
+                continue
+            if not path and relative.startswith("04_资料与证据/20_原文提取/"):
+                # Web Clipper and preserved source pages may contain same-page UI
+                # fragments that are not Obsidian project anchors.
                 continue
             resolved = resolve_markdown_link_target(file, target, root)
             if resolved is None:
@@ -1694,10 +1741,13 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
                 elif material_id in seen_material_ids:
                     add("ERROR", "DUPLICATE_MATERIAL_TODO_ID", material_todo_file, line, f"源资料处理事项ID重复：{material_id}")
                 seen_material_ids.add(material_id)
-                if not source_id:
+                linked_source_ids = split_ids(source_id)
+                if not linked_source_ids:
                     add("ERROR", "MATERIAL_TODO_SOURCE_ID", material_todo_file, line, "源资料处理事项必须登记资料ID")
-                elif source_ids and source_id not in source_ids:
-                    add("ERROR", "MATERIAL_TODO_SOURCE_ID", material_todo_file, line, f"源资料处理事项指向不存在的资料ID：{source_id}")
+                elif source_ids:
+                    missing_source_ids = sorted(linked_source_ids - source_ids)
+                    if missing_source_ids:
+                        add("ERROR", "MATERIAL_TODO_SOURCE_ID", material_todo_file, line, f"源资料处理事项指向不存在的资料ID：{'、'.join(missing_source_ids)}")
                 if stage not in MATERIAL_TODO_STAGES:
                     add("ERROR", "MATERIAL_TODO_STAGE", material_todo_file, line, f"源资料处理事项阶段无效：{stage or '空值'}")
                 if stage == "待专员判断" and "知识库专员" not in (decision + next_step):
@@ -2086,7 +2136,16 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
             if re.search(r"(?i)(topic[_-]|话题稿)", file.name):
                 add("ERROR", "TOPIC_DRAFT", file, 1, "当前整理区禁止文章话题稿")
 
-            required = ("对应原文件", "已确认范围", "范围确认", "核验状态", "原始语言", "清理正文语言", "内容类型")
+            required = (
+                "对应原文件",
+                "已确认范围",
+                "范围确认",
+                "核验状态",
+                "原始语言",
+                "清理正文语言",
+                "内容类型",
+                "源文保真对账状态",
+            )
             for field in required:
                 if not parse_field(text, field):
                     add("ERROR", "CLEAN_REQUIRED_FIELD", file, 1, f"清理稿缺少字段：{field}")
@@ -2102,9 +2161,36 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
             clean_body = section_body(text, "清理后的正文") or ""
             if strong_language_mismatch(clean_body, clean_language or original_language):
                 add("ERROR", "SOURCE_LANGUAGE_MISMATCH", file, 1, "清理后的正文与声明语言明显不一致")
-            for heading in ("## 位置与正文结构定位", "## 清理后的正文", "## 差异与补核记录", "## 未处理或明确排除范围", "## 来源与回溯"):
+            for heading in ("## 位置与正文结构定位", "## 清理后的正文", "## 差异与补核记录", "## 源文保真对账", "## 未处理或明确排除范围", "## 来源与回溯"):
                 if heading not in text:
                     add("ERROR", "CLEAN_REQUIRED_SECTION", file, 1, f"清理稿缺少小节：{heading[3:]}")
+            fidelity_status = (parse_field(text, "源文保真对账状态") or "").strip()
+            fidelity_headers = (
+                "批准范围ID",
+                "直接来源与位置",
+                "应保留的标题/段落/列表/表格/公式/图示",
+                "清理稿对应位置",
+                "未迁入内容及理由",
+                "视觉关系核验",
+                "非原文派生说明",
+                "交叉核验来源",
+                "结论",
+            )
+            fidelity_table = find_markdown_table(text, fidelity_headers)
+            if fidelity_status != "通过":
+                add("ERROR", "SOURCE_FIDELITY_GATE", file, 1, "清理稿源文保真对账未通过，不得进入候选分流或文章审核")
+            if fidelity_table is None or fidelity_table[0] != list(fidelity_headers) or not fidelity_table[1]:
+                add("ERROR", "SOURCE_FIDELITY_GATE", file, 1, "清理稿缺少逐批准范围的源文保真对账表")
+            else:
+                for fidelity_line, fidelity_row in fidelity_table[1]:
+                    missing_fidelity = [field for field in fidelity_headers if not fidelity_row.get(field, "").strip()]
+                    invalid_reason = re.search(r"已总结|已归纳|与另一稿相同", fidelity_row.get("未迁入内容及理由", ""))
+                    if missing_fidelity:
+                        add("ERROR", "SOURCE_FIDELITY_GATE", file, fidelity_line, f"源文保真对账缺少字段：{'、'.join(missing_fidelity)}")
+                    if fidelity_row.get("结论", "").strip() != "通过":
+                        add("ERROR", "SOURCE_FIDELITY_GATE", file, fidelity_line, "源文保真对账行结论必须为通过")
+                    if invalid_reason:
+                        add("ERROR", "SOURCE_FIDELITY_GATE", file, fidelity_line, "未迁入理由不得用总结、归纳或另一来源相同代替源文保留")
 
             original_file = parse_field(text, "对应原文件") or ""
             if re.search(r"(?i)\.(pdf|pptx?)\b", original_file):
@@ -2355,6 +2441,8 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
             if row["CLAIM ID"] and row["CLAIM ID"] not in formal_claim_ids:
                 add("ERROR", "CLAIM_MANIFEST_UNKNOWN_CLAIM", file, line, f"文章引用清单引用不存在的正式CLAIM：{row['CLAIM ID']}")
 
+    stale_state_reported: set[Path] = set()
+    project_info_file = root / "01_工作台/01_项目基础信息.md"
     for status, article_dir in article_dirs:
         article_id = article_dir.name.split("_", 1)[0]
         for name in ARTICLE_FILES:
@@ -2364,6 +2452,20 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
         scope = article_dir / "15_提取范围与处理样本确认.md"
         scope_text = text_cache.get(scope, read_text(scope)) if scope.is_file() else ""
         range_table = find_markdown_table(scope_text, SCOPE_RANGE_HEADERS) if scope_text else None
+        derived_roots = (
+            root / "04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿",
+            root / "04_资料与证据/30_整理与翻译稿/20_翻译稿",
+            root / "04_资料与证据/30_整理与翻译稿/30_表格与结构稿",
+            root / "04_资料与证据/30_整理与翻译稿/90_处理记录",
+        )
+        downstream_files = [
+            file
+            for derived_root in derived_roots
+            if derived_root.is_dir()
+            for file in derived_root.glob("*.md")
+            if article_id in file.name and "独立审核调度" not in file.name
+        ]
+        downstream_started = bool(downstream_files) or status != "10_进行中"
         scope_started = bool(
             parse_field(scope_text, "范围版本")
             or parse_field(scope_text, "当前状态")
@@ -2371,7 +2473,28 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
         )
         if scope_started:
             current_state = (parse_field(scope_text, "当前状态") or "").strip()
-            if current_state != "已人工确认":
+            approval_required = current_state == "已人工确认" or downstream_started
+            if downstream_started and current_state == "已人工确认":
+                stale_patterns = re.compile(
+                    r"当前等待节点4|待节点4(?:人工)?确认|节点4范围确认.{0,20}尚未开始|须在完成节点4范围确认后|尚未正式提取或清理"
+                )
+                for state_file in (project_info_file, article_dir / "10_待提交资料清单与就绪检查.md"):
+                    if not state_file.is_file() or state_file in stale_state_reported:
+                        continue
+                    state_text = text_cache.get(state_file, read_text(state_file))
+                    stale_match = stale_patterns.search(state_text)
+                    if stale_match:
+                        stale_state_reported.add(state_file)
+                        add(
+                            "ERROR",
+                            "STALE_CONTROL_STATE",
+                            state_file,
+                            line_number(state_text, stale_match.start()),
+                            "节点4已确认且下游资料已形成，但控制文件仍保留等待节点4或尚未处理的旧状态",
+                        )
+            if current_state not in {"待人工确认", "已人工确认"}:
+                add("ERROR", "SCOPE_STATE", scope, 1, "范围草案状态只能是待人工确认或已人工确认")
+            if approval_required and current_state != "已人工确认":
                 add("ERROR", "SCOPE_HUMAN_APPROVAL_REQUIRED", scope, 1, "已开始处理的文章范围必须由真实人工确认后才能进入下游")
             required_scope_fields = (
                 "范围版本",
@@ -2384,25 +2507,27 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
                 "外部调研决定",
                 "人工原话摘要",
             )
-            missing_scope = [field for field in required_scope_fields if not is_substantive(parse_field(scope_text, field))]
-            if missing_scope:
-                add("ERROR", "SCOPE_APPROVAL_DETAIL_MISSING", scope, 1, f"人工范围确认缺少：{'、'.join(missing_scope)}")
-            if (parse_field(scope_text, "确认方式") or "").strip() != "人工确认":
-                add("ERROR", "SCOPE_HUMAN_APPROVAL_REQUIRED", scope, 1, "确认方式必须明确为人工确认")
-            if not field_is_human_identity(parse_field(scope_text, "确认人")):
-                add("ERROR", "SCOPE_HUMAN_APPROVAL_REQUIRED", scope, 1, "确认人必须是真实人工姓名，不能填写Skill、Codex、Agent或AI知识库专员")
+            if approval_required:
+                missing_scope = [field for field in required_scope_fields if not is_substantive(parse_field(scope_text, field))]
+                if missing_scope:
+                    add("ERROR", "SCOPE_APPROVAL_DETAIL_MISSING", scope, 1, f"人工范围确认缺少：{'、'.join(missing_scope)}")
+                if (parse_field(scope_text, "确认方式") or "").strip() != "人工确认":
+                    add("ERROR", "SCOPE_HUMAN_APPROVAL_REQUIRED", scope, 1, "确认方式必须明确为人工确认")
+                if not field_is_human_identity(parse_field(scope_text, "确认人")):
+                    add("ERROR", "SCOPE_HUMAN_APPROVAL_REQUIRED", scope, 1, "确认人必须是真实人工姓名，不能填写Skill、Codex、Agent或AI知识库专员")
             if re.search(r"(?i)(?:可以继续|继续处理).{0,40}(?:视为|等同|代表).{0,20}(?:范围确认|批准)|(?:Skill|Codex|Agent).{0,20}(?:自动确认|一致同意)", scope_text):
                 add("ERROR", "GENERIC_CONTINUE_USED_AS_APPROVAL", scope, 1, "通用的‘可以继续’或Agent一致意见不能替代本文章、本范围版本的人工确认")
-            research_decision = (parse_field(scope_text, "外部调研决定") or "").strip()
-            if not (
-                research_decision in {"若缺口仍存在则开展", "不开展"}
-                or research_decision.startswith("仅研究指定问题：")
-            ):
-                add("ERROR", "RESEARCH_DECISION_MISSING", scope, 1, "范围确认必须给出条件式外部调研决定")
+            if approval_required:
+                research_decision = (parse_field(scope_text, "外部调研决定") or "").strip()
+                if not (
+                    research_decision in {"若缺口仍存在则开展", "不开展"}
+                    or research_decision.startswith("仅研究指定问题：")
+                ):
+                    add("ERROR", "RESEARCH_DECISION_MISSING", scope, 1, "范围确认必须给出条件式外部调研决定")
 
             if range_table is None or range_table[0] != list(SCOPE_RANGE_HEADERS) or not range_table[1]:
                 add("ERROR", "SCOPE_APPROVAL_DETAIL_MISSING", scope, 1, "范围确认缺少固定范围总览表或有效范围行")
-            else:
+            elif approval_required:
                 approved_ids = split_ids(parse_field(scope_text, "批准范围ID"))
                 table_ids = {row.get("范围ID", "").strip() for _, row in range_table[1] if row.get("范围ID", "").strip()}
                 if not approved_ids or not approved_ids.issubset(table_ids):
@@ -2441,6 +2566,14 @@ def validate_project(root: Path, runtime_skill: Path | None = None) -> list[Issu
         audit_text = ""
         if audit.exists():
             audit_text = text_cache.get(audit, read_text(audit))
+            if downstream_started:
+                compact_audit = re.sub(r"\s+", "", audit_text)
+                audit_has_structure = all(
+                    heading in audit_text
+                    for heading in ("## 审核对象与范围", "## 独立审核状态", "## 当前阻断与返回步骤")
+                )
+                if len(compact_audit) < 180 or not audit_has_structure:
+                    add("ERROR", "ARTICLE_AUDIT_INCOMPLETE", audit, 1, "资料处理结果已形成，但文章前审核仍是占位或缺少独立审核状态、对象和返回步骤")
             audit_source_text = re.sub(
                 r"(?m)^-\s*(?:当前写作输入|复核对象)\s*[：:].*$",
                 "",
@@ -2655,7 +2788,11 @@ def create_self_test_project(root: Path) -> None:
         encoding="utf-8",
     )
     (article / "20_文章前知识审核.md").write_text(
-        "# 文章前知识审核\n\n- 当前写作输入：[当前写作输入](30_文章写作输入.md)\n\n## 总体结论\n\n可以进入写作\n\n## 写作输入保真复核\n\n- 复核对象：[当前写作输入](30_文章写作输入.md)\n- 采用范围与未迁入理由：已逐块核对\n- 完整段落及限定条件：通过\n- 表格、公式、数字、单位和脚注：不适用\n- 多来源分块与来源定位：通过\n- 摘要、知识点卡或AI综合正文检查：通过\n- 结论：通过\n",
+        "# 文章前知识审核\n\n- 当前写作输入：[当前写作输入](30_文章写作输入.md)\n\n"
+        "## 审核对象与范围\n\n- TEST-SRC-001，PDF p.1；已读取清理稿、范围确认和原文件。\n\n"
+        "## 独立审核状态\n\n- 审核Agent已完成独立核验；实际读取、未读取、证据定位和反例检查均已记录。\n\n"
+        "## 当前阻断与返回步骤\n\n- 无；如来源变化则返回节点4重新确认受影响范围。\n\n"
+        "## 总体结论\n\n可以进入写作\n\n## 写作输入保真复核\n\n- 复核对象：[当前写作输入](30_文章写作输入.md)\n- 采用范围与未迁入理由：已逐块核对\n- 完整段落及限定条件：通过\n- 表格、公式、数字、单位和脚注：不适用\n- 多来源分块与来源定位：通过\n- 摘要、知识点卡或AI综合正文检查：通过\n- 结论：通过\n",
         encoding="utf-8",
     )
     (article / "30_文章写作输入.md").write_text(
@@ -2667,7 +2804,7 @@ def create_self_test_project(root: Path) -> None:
     scope_link = "../../../03_文章任务/30_已完成/2026-08/TEST-ART-001_测试文章/15_提取范围与处理样本确认.md"
     clean = root / "04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md"
     clean.write_text(
-        "# 测试｜清理与字段统一稿\n\n- 资料ID：TEST-SRC-001\n- 对应原文件：test.pdf\n- 对应运营Markdown：test.md\n- 已确认范围：PDF p.1\n- 范围确认：[确认](" + scope_link + ")\n- 原始语言：中文\n- 清理正文语言：中文\n- 内容类型：source-language-clean\n- 核验状态：已核验\n- 原始表格数（确认范围内）：0\n- 当前保留表格数：0\n- 原始公式数（确认范围内）：0\n- 当前保留公式数：0\n- 结构排除说明：不适用\n\n## 位置与正文结构定位\n\nPDF p.1\n\n## 清理后的正文\n\n测试正文。\n\n## 差异与补核记录\n\n确认范围内未发现需要补核的结构或文字差异。\n\n## 未处理或明确排除范围\n\n- 无\n\n## 来源与回溯\n\n- 原文件：test.pdf\n",
+        "# 测试｜清理与字段统一稿\n\n- 资料ID：TEST-SRC-001\n- 对应原文件：test.pdf\n- 对应运营Markdown：test.md\n- 已确认范围：PDF p.1\n- 范围确认：[确认](" + scope_link + ")\n- 原始语言：中文\n- 清理正文语言：中文\n- 内容类型：source-language-clean\n- 核验状态：已核验\n- 源文保真对账状态：通过\n- 原始表格数（确认范围内）：0\n- 当前保留表格数：0\n- 原始公式数（确认范围内）：0\n- 当前保留公式数：0\n- 结构排除说明：不适用\n\n## 位置与正文结构定位\n\nPDF p.1\n\n## 清理后的正文\n\n测试正文。\n\n## 差异与补核记录\n\n确认范围内未发现需要补核的结构或文字差异。\n\n## 源文保真对账\n\n| 批准范围ID | 直接来源与位置 | 应保留的标题/段落/列表/表格/公式/图示 | 清理稿对应位置 | 未迁入内容及理由 | 视觉关系核验 | 非原文派生说明 | 交叉核验来源 | 结论 |\n|---|---|---|---|---|---|---|---|---|\n| TEST-RNG-001 | test.pdf p.1 | 1个完整段落 | 清理后的正文 | 无 | 不适用 | 无 | 无 | 通过 |\n\n## 未处理或明确排除范围\n\n- 无\n\n## 来源与回溯\n\n- 原文件：test.pdf\n",
         encoding="utf-8",
     )
 
@@ -3039,6 +3176,23 @@ def run_self_test() -> int:
             return 1
         scope.write_text(valid_scope, encoding="utf-8")
 
+        project_info = root / "01_工作台/01_项目基础信息.md"
+        project_info.parent.mkdir(parents=True, exist_ok=True)
+        project_info_existed = project_info.exists()
+        valid_project_info = read_text(project_info) if project_info_existed else ""
+        project_info.write_text(
+            "# 项目基础信息\n\n- 官网可访问与提取状态：官网当前可以连接，当前等待节点4人工确认范围。\n",
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "STALE_CONTROL_STATE" for issue in issues):
+            print("SELF-TEST FAILED: stale pre-node-4 control state after downstream processing was not detected")
+            return 1
+        if project_info_existed:
+            project_info.write_text(valid_project_info, encoding="utf-8")
+        else:
+            project_info.unlink()
+
         clean_file = root / "04_资料与证据/30_整理与翻译稿/10_清理与字段统一稿/TEST-SRC-001_测试_清理与字段统一稿.md"
         valid_clean = read_text(clean_file)
         clean_file.write_text(valid_clean.replace("- 清理正文语言：中文", "- 清理正文语言：英文"), encoding="utf-8")
@@ -3093,6 +3247,22 @@ def run_self_test() -> int:
             print("SELF-TEST FAILED: mislabeled human/automation actor was not detected")
             return 1
         workbench.write_text(valid_workbench, encoding="utf-8")
+
+        bad_web_dir = root / "04_资料与证据/20_原文提取/10_Codex提取"
+        bad_web_dir.mkdir(parents=True, exist_ok=True)
+        bad_web = bad_web_dir / "WEB-TEST_网页原文.md"
+        bad_web.write_text(
+            "# 失败网页试样\n\n> [!warning] 当前不可用\n\n- 直达URL：https://example.com/test\n\n## 可见正文快照\n\nHome Products Footer",
+            encoding="utf-8",
+        )
+        issues = validate_project(root)
+        if not any(issue.code == "WEB_EVIDENCE_FAILED_SAMPLE_CURRENT" for issue in issues):
+            print("SELF-TEST FAILED: failed flattened web sample in current evidence was not detected")
+            return 1
+        if not any(issue.code == "WEB_EVIDENCE_QUALITY_GATE" for issue in issues):
+            print("SELF-TEST FAILED: web evidence publish quality gate was not enforced")
+            return 1
+        bad_web.unlink()
 
         mineru_assets = root / "04_资料与证据/20_Codex提取/TEST-SRC-001_assets"
         mineru_assets.mkdir(parents=True, exist_ok=True)
