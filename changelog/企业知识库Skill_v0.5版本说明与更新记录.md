@@ -197,6 +197,7 @@ v0.4的证据追溯、状态一致性、路径与链接治理、机器文件安�
 | SK-V05-092 | 文章阻塞型MAT的责任顺序不统一，复杂资料和视觉核验容易直接交AI知识库专员，且MAT候选表缺少决定方校验 | 文章阻塞事项统一先交内容运营；内容运营明确无法处理后退回项目负责人，由用户决定是否指定AI知识库专员。视觉核验类先由Codex按需调用MinerU并结合原始PDF/PPT对照，能够唯一判断时自动处理；校验器固定MAT候选表九列、决定方枚举和`待决定`选项，初始化模板、运行清单、文章工作流、来源规则、运营手册和月度/交接模板同步该顺序 | 主Skill、文章工作流、项目结构模板、运行清单、来源索引与复杂资料、内容运营手册、月度与交接、`initialize_project.py`、`advance_ready_tasks.py`、`validate_v05_project.py` |
 
 | SK-V05-093 | 人工可读管理字段仍可能由脚本写入英文，Faithfulness支撑汇总对描述性Claim标题兼容不足，导致出现英文管理说明或“未在正式知识目录定位” | 来源台账自动生成的索引范围/未索引内容统一中文；Faithfulness支撑判断和无结果占位统一中文；处置管理字段增加中文门禁；支撑汇总兼容“描述性标题 + Claim ID元数据”并在无法定位时拒绝写入；MinerU失败结果增加中文阶段/类型字段；运营手册精简MAT候选流程并将无法处理事项转AI知识库专员 | `build_source_index.py`、`record_knowledge_gap.py`、`import_faithfulness.py`、`calculate_monthly_faithfulness.py`、`run_mineru.py`、`operator-guide.md` |
+| SK-V05-094 | 外部调研或客户资料可能把竞品特定信息混入正式知识，项目虽有公开限制但没有固定的竞品排除门禁和文章继承字段 | 项目级默认禁止搜索、保存和沉淀竞品品牌、型号、特殊产品、参数、价格、案例、排名及比较结论；文章限制不可放宽；外部调研、RES、Claim、`30/35`、覆盖页、月报和交接统一执行去品牌化规则；仅保留可独立支持通用结论的行业知识、一般原理、方法说明和公开标准；新增竞品筛查字段与校验提示 | `SKILL.md`、`references/external-research-contract.md`、`references/source-index-and-materials.md`、`references/project-structure-and-templates.md`、`references/naming-and-layout-contract.md`、`references/operator-guide.md`、`references/monthly-and-handoff.md`、`scripts/initialize_project.py`、`scripts/validate_v05_project.py` |
 
 ## 八、已知限制
 

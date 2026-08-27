@@ -802,11 +802,17 @@ def validate_claims(root: Path, errors: list[str], warnings: list[str]) -> None:
             )
 
 
-def validate_external_claim_links(root: Path, errors: list[str]) -> None:
+def validate_external_claim_links(
+    root: Path,
+    errors: list[str],
+    warnings: list[str] | None = None,
+) -> None:
     """Require external Claims to point back to one RES evidence and review record."""
     external_root = root / "03_正式知识/20_外部公共知识"
     if not external_root.is_dir():
         return
+    project_info = root / "01_工作台/10_项目基础信息.md"
+    is_competitor_policy_project = project_info.is_file() and "竞品信息限制：" in project_info.read_text(encoding="utf-8-sig")
     marker = re.compile(r"^\s*[-*]\s*Claim ID[：:]\s*([A-Za-z0-9_.-]+)\s*$", re.MULTILINE)
     for path in external_root.rglob("*.md"):
         text = path.read_text(encoding="utf-8-sig")
@@ -823,6 +829,13 @@ def validate_external_claim_links(root: Path, errors: list[str]) -> None:
                 errors.append(f"外部Claim {claim_id} 缺少RES原文证据回链：{path}")
             if not review or "RES-" not in review:
                 errors.append(f"外部Claim {claim_id} 缺少RES调研核验回链：{path}")
+            competitor_screen = parse_field(block, "竞品信息筛查")
+            if not competitor_screen and is_competitor_policy_project:
+                errors.append(f"外部Claim {claim_id} 缺少竞品信息筛查记录：{path}")
+            elif not competitor_screen and warnings is not None:
+                warnings.append(f"外部Claim {claim_id} 缺少竞品信息筛查记录（旧知识不自动改写）：{path}")
+            elif competitor_screen and "通过" not in competitor_screen:
+                errors.append(f"外部Claim {claim_id} 未通过竞品信息筛查：{path}")
 
 
 def validate_ledgers(root: Path, errors: list[str]) -> None:
@@ -1070,6 +1083,31 @@ def validate_project_profile(root: Path, errors: list[str], warnings: list[str])
             errors.append(f"关系待确认站点未在关系依据中说明：{website_id}")
         if status == "暂时无法访问" and item["下次复核条件"].strip() in {"", "无", "不适用"}:
             errors.append(f"暂时无法访问站点缺少重试条件：{website_id}")
+
+
+def validate_competitor_policy(root: Path, errors: list[str], warnings: list[str]) -> None:
+    """Check that the project/article templates carry the non-relaxable competitor boundary."""
+    project_info = root / "01_工作台/10_项目基础信息.md"
+    if project_info.is_file():
+        text = project_info.read_text(encoding="utf-8-sig")
+        if "竞品信息限制：" not in text:
+            warnings.append(f"项目基础信息缺少固定竞品信息限制字段（旧项目不自动改写）：{project_info}")
+        elif "禁止搜索、保存或沉淀" not in text or "仅允许保留去品牌化" not in text:
+            errors.append(f"项目基础信息的竞品信息限制未使用禁止搜索/去品牌化固定规则：{project_info}")
+        if "竞品限制继承规则：" not in text:
+            warnings.append(f"项目基础信息缺少竞品限制继承规则字段（旧项目不自动改写）：{project_info}")
+
+    task_root = root / "04_文章任务"
+    if not task_root.is_dir():
+        return
+    for request in task_root.rglob("10_文章知识需求.md"):
+        if "90_归档" in request.parts:
+            continue
+        text = request.read_text(encoding="utf-8-sig")
+        if "竞品信息限制：" not in text:
+            warnings.append(f"文章知识需求缺少竞品信息限制字段（旧任务不自动改写）：{request}")
+        elif "继承项目级禁止" not in text or "不可放宽" not in text:
+            errors.append(f"文章知识需求的竞品信息限制必须继承项目级禁止且不可放宽：{request}")
 
 
 def validate_coverage_freshness(
@@ -2172,11 +2210,12 @@ def main() -> None:
     validate_source_exclusions(root, errors, warnings)
     validate_version_entry(root, errors, warnings)
     validate_project_profile(root, errors, warnings)
+    validate_competitor_policy(root, errors, warnings)
     validate_layout(root, errors, warnings, strict_coverage=args.completion_gate)
     validate_version_archives(root, errors)
     validate_token_usage(root, errors)
     validate_claims(root, errors, warnings)
-    validate_external_claim_links(root, errors)
+    validate_external_claim_links(root, errors, warnings)
     validate_ledgers(root, errors)
     validate_feedback_details(root, errors)
     for markdown_path in root.rglob("*.md"):
