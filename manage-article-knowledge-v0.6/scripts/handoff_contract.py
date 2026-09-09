@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -24,7 +25,10 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
         raise HandoffContractError(f"handoff contract not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise HandoffContractError(f"handoff contract is not valid JSON: {path}") from exc
-    required = {"contract_id", "handoff_contract_version", "compatible_versions", "faithfulness_executor", "events"}
+    required = {
+        "contract_id", "handoff_contract_version", "compatible_versions",
+        "faithfulness_executor", "event_lifecycle", "revision_modes", "events",
+    }
     missing = sorted(required - set(value)) if isinstance(value, dict) else sorted(required)
     if missing:
         raise HandoffContractError(f"handoff contract missing fields: {', '.join(missing)}")
@@ -33,6 +37,38 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
     executor = value.get("faithfulness_executor", {})
     if executor.get("skill_name") != "deepeval-article-audit":
         raise HandoffContractError("faithfulness executor must be deepeval-article-audit")
+    lifecycle = value.get("event_lifecycle", {})
+    if lifecycle.get("success_terminal_event") != "article_completed":
+        raise HandoffContractError("success terminal event must be article_completed")
+    non_terminal = set(lifecycle.get("non_terminal_events", []))
+    required_non_terminal = {
+        "writing_request", "writing_ready", "writing_completed",
+        "faithfulness_request", "faithfulness_completed",
+    }
+    if not required_non_terminal.issubset(non_terminal):
+        raise HandoffContractError("handoff lifecycle is missing required non-terminal events")
+    revision_modes = value.get("revision_modes", {})
+    required_modes = {
+        "new_article", "knowledge_refresh_and_rewrite", "article_rewrite_only",
+    }
+    if not required_modes.issubset(revision_modes):
+        raise HandoffContractError("handoff contract is missing required revision modes")
+    for mode in required_modes:
+        rule = revision_modes.get(mode, {})
+        if not isinstance(rule.get("requires_base_article"), bool):
+            raise HandoffContractError(f"revision mode {mode} must declare requires_base_article")
+        pattern = str(rule.get("base_article_version_pattern") or "")
+        if rule["requires_base_article"] and not pattern:
+            raise HandoffContractError(
+                f"revision mode {mode} must declare base_article_version_pattern"
+            )
+        if pattern:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise HandoffContractError(
+                    f"revision mode {mode} has invalid base version pattern"
+                ) from exc
     return value
 
 
@@ -73,6 +109,21 @@ def validate_event(event: str, payload: Mapping[str, Any], contract: Mapping[str
         raise HandoffContractError(
             f"{event} missing required fields: {', '.join(missing)}"
         )
+    if event == "writing_request":
+        revision_mode = str(payload.get("revision_mode") or "new_article").strip()
+        if revision_mode not in contract.get("revision_modes", {}):
+            raise HandoffContractError(f"unsupported revision_mode: {revision_mode}")
+        mode_contract = contract["revision_modes"][revision_mode]
+        if mode_contract.get("requires_base_article"):
+            base_article_id = str(payload.get("base_article_id") or "").strip()
+            base_article_version = str(payload.get("base_article_version") or "").strip()
+            if not base_article_id or not base_article_version:
+                raise HandoffContractError(
+                    "revision writing_request requires base_article_id and base_article_version"
+                )
+            version_pattern = str(mode_contract.get("base_article_version_pattern") or r"^v[1-9]\d*$")
+            if not re.fullmatch(version_pattern, base_article_version):
+                raise HandoffContractError("base_article_version must use vN")
 
 
 def self_test() -> None:
@@ -86,6 +137,52 @@ def self_test() -> None:
         "article_version": "v1",
     }
     validate_event("faithfulness_completed", payload, contract)
+    revision_payload = {
+        "handoff_event": "writing_request",
+        "handoff_contract_version": version,
+        "project": "C:/knowledge/PROJECT",
+        "external_task_key": "TASK-001",
+        "request_text": "按原大纲重新整理知识并重写",
+        "request_record_path": "C:/writing/task.md",
+        "request_record_locator": "TASK-001",
+        "title_or_topic": "Product guide",
+        "product_or_content_object": "Product",
+        "topic_direction": "Guide",
+        "keywords": "product",
+        "outline": "- Main question",
+        "outline_status": "已确认",
+        "target_language": "English",
+        "constraints": "无",
+        "original_writing_requirements": "Keep the original workflow",
+        "current_status": "可准备知识",
+        "writing_skill": "writer",
+        "revision_mode": "knowledge_refresh_and_rewrite",
+        "base_article_id": "ARTICLE",
+        "base_article_version": "v1",
+    }
+    validate_event("writing_request", revision_payload, contract)
+    missing_baseline = dict(revision_payload)
+    missing_baseline.pop("base_article_id")
+    try:
+        validate_event("writing_request", missing_baseline, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("revision request without base article identity was accepted")
+    invalid_baseline = dict(revision_payload, base_article_version="2")
+    try:
+        validate_event("writing_request", invalid_baseline, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("revision request with invalid base version was accepted")
+    revision_payload["revision_mode"] = "guess_and_rewrite"
+    try:
+        validate_event("writing_request", revision_payload, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("unsupported revision mode was accepted")
     try:
         validate_version("MAK-HANDOFF-99.0", contract)
     except HandoffContractError:

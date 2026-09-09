@@ -12,6 +12,8 @@ Faithfulness由独立文章审核Skill产生。本Skill不抽取文章原子事�
 
 不能因为资料包链接了知识库，就把整个知识库放入retrieval context。写作提示、SEO/GEO规则和文章评价指令都不是证据。`30`中的直接写作事实、英文表达、控制、建议、缺口处理和审计说明都不是可引用的正向证据；审核Skill只提取第一至第三节中明确标明为“证据正文”的连续来源正文或已核验目标语言翻译。直接写作事实可以指导作者，但外部审核的证据引文必须落在对应证据正文。
 
+受管v0.6的`40_最终文章.md`必须且只能包含一组`<!-- ARTICLE_BODY_START -->`与`<!-- ARTICLE_BODY_END -->`。审核器只解析两标记之间的正文文字、列表和表格；标题、关键词、TDK、图片说明、交付管理字段和审核文字不进入文章单元。标记缺失、重复或倒置时硬失败，并要求知识库桥接器重新规范化`40`，不得由审核器猜测正文范围。
+
 Faithfulness只报告“终稿事实被实际交付事实附件支持的比例”。它不是SEO/GEO质量、搜索表现、可发布性、文风或模型能力的总分，不设置100%门槛，也不要求每句话都有附件证据。模型可以为文章完整性补充行业常识、一般原理、解释、结构和过渡；这些内容若没有进入事实附件，可能被标为`unsupported`，但仅表示本次上下文未覆盖，不能单独视为写错或要求重写。单篇结果用于记录本次覆盖，并在完成本地检索后触发轻量公共知识缺口登记：核心章节或高风险公共事实首次出现即进入`待外部调研`；普通公共知识首次为`观察中`，第二个不同文章ID出现时升级。客户专属、未处理本地资料和来源异常仍分别进入CUS、MAT、ANM，不由外部调研替代。
 
 ## 3. 可接收文件
@@ -82,7 +84,7 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
 
 `knowledge_domains`只使用：`none / customer_fact / technical / method / regulation_standard / safety_limit / detection_validity / procurement_selection / dynamic_fact / other_public_knowledge`。一组涉及多个领域时列多个值；`none`不能与其他值并存。
 
-导入器执行以下硬校验：每个unsupported claim_id恰好出现一次；supported ID不得出现；`group_id`唯一；分类和必填字段有效；人工管理字段包含中文人话；`existing_gap/new_public_gap`的`issue_key`已经存在于知识缺口CSV且关联当前文章ID；`cus/mat/anm`的ID前缀正确，且现有项目台账中确有该ID。`package_omission`只表示项目已有经核验的客户正式知识却漏入当前`30`：必须声明`customer_fact`、不可跨文章复用，分类依据必须写明已核对的正式Claim/正式知识或`35`映射；一组最多包含八条同一稳定知识问题的claim，超过时必须拆组。行业常识、一般原理、选型、方法和运营判断不得用`package_omission`规避公共知识缺口。没有unsupported时不需要本文件。校验失败时不得写指标、`50`、台账或完成文章迁移。
+导入器执行以下硬校验：每个unsupported claim_id恰好出现一次；supported ID不得出现；`group_id`唯一；同一公共缺口`issue_key`在本篇只能有一个归组（该组可包含任意数量的相关Claim）；分类和必填字段有效；人工管理字段包含中文人话；`existing_gap/new_public_gap`的`issue_key`已经存在于知识缺口CSV且关联当前文章ID；`cus/mat/anm`的ID前缀正确，且现有项目台账中确有该ID。`package_omission`只表示项目已有经核验的客户正式知识却漏入当前`30`：必须声明`customer_fact`、不可跨文章复用，分类依据必须写明已核对的正式Claim/正式知识或`35`映射。归组按一个稳定、可解释的知识问题组织，Claim数量不设机械上限；只有知识问题不同才拆组。行业常识、一般原理、选型、方法和运营判断不得用`package_omission`规避公共知识缺口。没有unsupported时不需要本文件。校验失败时不得写指标、`50`、台账或完成文章迁移。
 
 `writing_only`还执行独立硬门禁：`contains_factual_judgment`和`reusable_across_articles`都必须为`false`，`knowledge_domains`必须恰好为`["none"]`，`why_not_knowledge_issue`必须具体说明其纯结构、过渡、CTA、修辞或一次性观点作用。任一claim含事实而同组另有纯写作内容时必须拆组。法规、标准、认证、安全、限值、检测有效性、采购选型或动态事实的实质判断禁止归为`writing_only`；导入器对judgments原文中的明显高风险信号再做一层拒绝检查。其他类别必须至少声明“含事实判断”或“可跨文章复用”，且`knowledge_domains`不能为`none`。
 

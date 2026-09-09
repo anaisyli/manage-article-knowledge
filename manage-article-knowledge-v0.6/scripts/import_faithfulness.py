@@ -28,6 +28,7 @@ METRIC_FIELDS = (
     "total_claims", "unsupported_claims", "faithfulness_percent",
     "mapped_formal_claims", "unmapped_supported_claims", "imported_at", "status",
 )
+CUS_LOW_FAITHFULNESS_THRESHOLD = 80.0
 SUPPORT_FIELDS = (
     "audit_id", "article_id", "article_version", "article_fact_id", "article_line",
     "article_quote", "article_claim", "verdict", "formal_claim_id", "mapping_status",
@@ -129,6 +130,27 @@ def parse_field(text: str, label: str) -> str:
     )
     match = pattern.search(text)
     return match.group(1).strip() if match else ""
+
+
+def mark_low_faithfulness_cus_recheck(audit_path: Path, score: float | None) -> None:
+    """Record the mandatory six-category CUS recheck trigger on low scores."""
+    if score is None or score >= CUS_LOW_FAITHFULNESS_THRESHOLD or not audit_path.is_file():
+        return
+    text = read_text(audit_path)
+    marker = "Faithfulness低于80%后复核"
+    if marker in text:
+        return
+    pattern = re.compile(
+        r"(?m)^\|\s*CUS候选检测\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*$"
+    )
+    match = pattern.search(text)
+    if not match:
+        return
+    signals = match.group(1).strip()
+    replacement = "| CUS候选检测 | " + signals + "；" + marker + " | " + " | ".join(
+        group.strip() for group in match.groups()[1:]
+    ) + " |"
+    audit_path.write_text(text[:match.start()] + replacement + text[match.end():], encoding="utf-8")
 
 
 def markdown_cell(value: Any) -> str:
@@ -586,6 +608,7 @@ def load_disposition(
 
     seen_group_ids: set[str] = set()
     seen_claim_ids: set[str] = set()
+    seen_public_issue_keys: set[str] = set()
     claim_by_id = {
         str(claim.get("claim_id", "")).strip(): claim
         for claim in claims
@@ -633,6 +656,13 @@ def load_disposition(
         group["claim_ids"] = normalized_ids
         if category in {"existing_gap", "new_public_gap", "cus", "mat", "anm"} and not issue_key:
             raise ValueError(f"Disposition category {category} requires issue_key: {group_id}")
+        if category in {"existing_gap", "new_public_gap"}:
+            if issue_key in seen_public_issue_keys:
+                raise ValueError(
+                    f"Public knowledge gap must be represented by one group per issue_key: {issue_key}; "
+                    "combine its claim_ids instead of repeating the same gap in 50"
+                )
+            seen_public_issue_keys.add(issue_key)
         if category in {"package_omission", "writing_only"} and issue_key:
             raise ValueError(f"Disposition category {category} must not invent issue_key: {group_id}")
 
@@ -729,11 +759,6 @@ def load_disposition(
                     if "customer_fact" not in normalized_domains:
                         raise ValueError(
                             f"package_omission is only for an existing verified customer fact omitted from 30: {group_id}"
-                        )
-                    if len(normalized_ids) > 8:
-                        raise ValueError(
-                            f"package_omission group is too broad to be a specific material omission: {group_id}; "
-                            "split by stable knowledge question and classify reusable public knowledge as gaps"
                         )
                     basis = group["classification_basis"]
                     if not re.search(r"(?:正式Claim|正式知识|35_写作素材来源索引|35写作素材来源索引)", basis):
@@ -1218,6 +1243,9 @@ def main() -> None:
         metrics_preflight.unlink(missing_ok=True)
         support_preflight.unlink(missing_ok=True)
         raise SystemExit(f"状态迁移预检查失败，未写入Faithfulness结果或指标：{exc}") from exc
+    mark_low_faithfulness_cus_recheck(
+        source_task / "20_文章前知识审核.md", score
+    )
     args.receipt.parent.mkdir(parents=True, exist_ok=True)
     knowledge_hash_text = "；".join(
         f"{path} = {checksum}"

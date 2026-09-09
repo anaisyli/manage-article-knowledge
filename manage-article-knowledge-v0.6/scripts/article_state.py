@@ -151,6 +151,11 @@ def _article_package_ready(task_dir: Path) -> bool:
     return mapping_count > 0 and evidence_lines <= mapped_evidence_lines
 
 
+def article_package_ready(task_dir: Path) -> bool:
+    """Validate a reusable 30/35 bundle against templates and formal Claims."""
+    return _article_package_ready(task_dir.resolve())
+
+
 def project_root_for_task(task_dir: Path) -> Path:
     task_dir = task_dir.resolve()
     if task_dir.parent.name not in ARTICLE_STATES or task_dir.parent.parent.name != "04_文章任务":
