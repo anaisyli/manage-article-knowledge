@@ -17,6 +17,9 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import zipfile
 
+from mat_lifecycle import current_table, formalize_scan_candidates
+from source_topic_mapping import classify_role, derive_mappings, mapping_status_summary
+
 
 TEXT_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
@@ -31,6 +34,15 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
 DEFAULT_USE_SCOPE = "项目级通用（默认）"
 DEFAULT_RELATED_ARTICLES = "全部文章（默认）"
+FORMAL_MODULE_DIRS = {
+    "公司概述": Path("03_正式知识/10_客户知识/10_公司概述"),
+    "产品介绍": Path("03_正式知识/10_客户知识/20_产品介绍"),
+    "解决方案": Path("03_正式知识/10_客户知识/30_解决方案"),
+    "合作案例": Path("03_正式知识/10_客户知识/40_合作案例"),
+    "行业知识与洞察": Path("03_正式知识/10_客户知识/50_行业知识与洞察"),
+    "FAQ": Path("03_正式知识/10_客户知识/60_FAQ"),
+    "其他": Path("03_正式知识/10_客户知识/70_其他"),
+}
 
 
 class TextHTMLParser(HTMLParser):
@@ -359,6 +371,7 @@ def create_database(path: Path) -> sqlite3.Connection:
         DROP TABLE IF EXISTS chunks;
         DROP TABLE IF EXISTS chunks_fts;
         DROP TABLE IF EXISTS relationships;
+        DROP TABLE IF EXISTS source_topic_mappings;
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE sources (
             source_id TEXT PRIMARY KEY,
@@ -374,11 +387,16 @@ def create_database(path: Path) -> sqlite3.Connection:
             duplicate_of TEXT,
             relation_note TEXT,
             mat_candidate TEXT,
+            mat_id TEXT,
+            mat_disposition TEXT,
             media_duration TEXT,
-            possible_subject TEXT,
             transcript_status TEXT,
             office_media_count INTEGER,
-            office_embedded_count INTEGER
+            office_embedded_count INTEGER,
+            source_role TEXT NOT NULL,
+            role_basis TEXT NOT NULL,
+            role_confidence TEXT NOT NULL,
+            role_status TEXT NOT NULL
         );
         CREATE TABLE chunks (
             chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,6 +415,16 @@ def create_database(path: Path) -> sqlite3.Connection:
             related_source_id TEXT NOT NULL,
             relationship TEXT NOT NULL,
             basis TEXT NOT NULL
+        );
+        CREATE TABLE source_topic_mappings (
+            source_id TEXT NOT NULL,
+            module TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            basis TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            PRIMARY KEY (source_id, module, topic)
         );
         """
     )
@@ -436,7 +464,55 @@ def load_ledger_human_fields(path: Path) -> dict[str, dict[str, str]]:
                 "related_articles": row.get("关联文章", ""),
                 "handling": row.get("当前处理状态", ""),
                 "mat": row.get("MAT", ""),
+                "mat_disposition": row.get("MAT处置说明", ""),
+                "source_role": row.get("资料角色", ""),
             }
+    return result
+
+
+def load_ledger_topic_mappings(path: Path) -> dict[str, list[dict[str, str]]]:
+    """Read the generated mapping table so verified mappings survive index rebuilds."""
+    if not path.is_file():
+        return {}
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    try:
+        start = next(index for index, line in enumerate(lines) if line.strip() == "## 来源主题与模块候选")
+    except StopIteration:
+        return {}
+    header_index = next(
+        (index for index in range(start + 1, len(lines)) if lines[index].strip().startswith("|") and "资料ID/资料名称" in lines[index]),
+        None,
+    )
+    if header_index is None:
+        return {}
+    header = [cell.strip() for cell in lines[header_index].strip().strip("|").split("|")]
+    result: dict[str, list[dict[str, str]]] = {}
+    for line in lines[header_index + 2:]:
+        if not line.strip().startswith("|"):
+            break
+        cells = [cell.strip().replace("\\|", "|") for cell in line.strip().strip("|").split("|")]
+        if len(cells) != len(header):
+            continue
+        row = dict(zip(header, cells))
+        source_id = row.get("资料ID/资料名称", "").split("，", 1)[0].strip()
+        if source_id:
+            result.setdefault(source_id, []).append(row)
+    return result
+
+
+def verified_modules_for_source(project: Path, source_id: str, absolute_path: Path) -> set[str]:
+    """Return modules whose current Formal Claims explicitly cite this source."""
+    identifiers = (source_id, str(absolute_path), absolute_path.as_posix())
+    result: set[str] = set()
+    for module, relative in FORMAL_MODULE_DIRS.items():
+        directory = project / relative
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*.md"):
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            if any(identifier and identifier in text for identifier in identifiers):
+                result.add(module)
+                break
     return result
 
 
@@ -527,6 +603,58 @@ def run_self_test() -> int:
         if resolve_source_scope(human_fields) != ("仅本篇：ART-001", "[[ART-001]]"):
             print(json.dumps({"ok": False, "stage": "source-scope-preservation", "fields": human_fields}, ensure_ascii=False))
             return 1
+        mapping_ledger = Path(temp) / "mapping-ledger.md"
+        mapping_ledger.write_text(
+            "## 来源主题与模块候选\n\n"
+            "| 资料ID/资料名称 | 资料角色 | 标准模块候选 | 主题候选 | 判断依据 | 归类状态 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| SRC-SELFTEST，示例资料.docx | 客户事实资料 | 产品介绍 | 示例产品 | 人工核验原件 | 已核验 |\n",
+            encoding="utf-8",
+        )
+        preserved_mapping = load_ledger_topic_mappings(mapping_ledger)
+        if preserved_mapping.get("SRC-SELFTEST", [{}])[0].get("归类状态") != "已核验":
+            print(json.dumps({"ok": False, "stage": "source-topic-preservation"}, ensure_ascii=False))
+            return 1
+        factual = Path(temp) / "Catalog for Watch Box 2026.pdf"
+        role = classify_role(factual, [("page 1", "Product catalog with packaging box specifications and materials")])
+        mappings = derive_mappings(factual, [("page 1", "Product catalog with packaging box specifications and materials")], role)
+        if role["role"] != "客户事实资料" or not any(item["module"] == "产品介绍" for item in mappings):
+            print(json.dumps({"ok": False, "stage": "source-topic-product", "role": role, "mappings": mappings}, ensure_ascii=False))
+            return 1
+        operational = Path(temp) / "杰睿文章要求.docx"
+        role = classify_role(operational, [("paragraph 1", "SEO、CTA与文章内链要求")])
+        if role["role"] != "写作运营资料" or derive_mappings(operational, [], role):
+            print(json.dumps({"ok": False, "stage": "source-role-exclusion", "role": role}, ensure_ascii=False))
+            return 1
+        project = Path(temp) / "TEST_Project"
+        mat_path = project / "05_数据与审核/30_异常与待决定/20_源资料处理/01_源资料处理台账.md"
+        mat_path.parent.mkdir(parents=True, exist_ok=True)
+        mat_path.write_text(
+            "# 源资料处理台账\n\n## 当前事项\n\n"
+            "| MAT ID | 事项名称 | 代表文件/资料范围 | 资料数量 | 通俗问题 | 当前文章影响 | 当前阶段 | 下一责任人/动作 | 重开条件 | 详情入口 | 最近更新 |\n"
+            "|---|---|---|---:|---|---|---|---|---|---|---|\n\n## 事项详情\n",
+            encoding="utf-8",
+        )
+        candidate_rows = [{
+            "source_id": "SRC-MATSELF",
+            "relative_path": "资料/sample.zip",
+            "extension": "zip",
+            "mat_candidate": "建议建立MAT",
+            "duplicate_of": "",
+            "relation_note": "",
+            "searchability": "仅文件信息可搜索",
+            "office_embedded_count": 0,
+        }]
+        first_map, _ = formalize_scan_candidates(project, candidate_rows, {}, "2026-08-25T00:00:00+08:00")
+        second_map, _ = formalize_scan_candidates(project, candidate_rows, {"SRC-MATSELF": {"mat": first_map["SRC-MATSELF"]}}, "2026-08-25T00:00:00+08:00")
+        table = current_table(mat_path)
+        if first_map.get("SRC-MATSELF") != "TEST-MAT-001" or second_map != first_map or table is None:
+            print(json.dumps({"ok": False, "stage": "mat-formalization", "first": first_map, "second": second_map}, ensure_ascii=False))
+            return 1
+        ids = [row[0] for row in table["rows"] if row and row[0].endswith("-MAT-001")]
+        if ids != ["TEST-MAT-001"]:
+            print(json.dumps({"ok": False, "stage": "mat-idempotence", "ids": ids}, ensure_ascii=False))
+            return 1
         history = Path(temp) / "source_version_history.jsonl"
         event = {
             "schema_version": 1,
@@ -591,6 +719,7 @@ def main() -> None:
         raise SystemExit(f"Source root not found: {source_root}")
 
     existing_human_fields = load_ledger_human_fields(ledger_path)
+    existing_topic_mappings = load_ledger_topic_mappings(ledger_path)
     exclusions = load_exclusions(exclusions_path)
     excluded_outputs = {db_path, ledger_path, description_path, version_history_path}
     paths = sorted(
@@ -608,18 +737,20 @@ def main() -> None:
     connection.executemany(
         "INSERT INTO metadata(key, value) VALUES (?, ?)",
         (
-            ("schema_version", "1.2"),
+            ("schema_version", "1.4"),
             ("built_at", built_at),
             ("source_root", str(source_root)),
             ("exclusions_path", str(exclusions_path)),
         ),
     )
 
+    project_root = db_path.parent.parent if db_path.parent.name == "02_源资料" else db_path.parent
     rows: list[dict[str, str | int]] = []
     rows_by_id: dict[str, dict[str, str | int]] = {}
     first_by_hash: dict[str, str] = {}
     groups: dict[str, list[str]] = {}
     samples_by_id: dict[str, set[str]] = {}
+    mappings_by_id: dict[str, list[dict[str, str]]] = {}
     for path in paths:
         relative = path.relative_to(source_root).as_posix()
         source_id = stable_source_id(relative)
@@ -664,7 +795,6 @@ def main() -> None:
         except (OSError, KeyError, zipfile.BadZipFile):
             office_media_count, office_embedded_count = 0, 0
         duration = media_duration(path) if ext in AUDIO_EXTS | VIDEO_EXTS else "不适用"
-        subject = f"仅据文件名初判：{path.stem}" if ext in AUDIO_EXTS | VIDEO_EXTS else "不适用"
         transcript_status = possible_transcript(path, paths)
         complex_material = (
             ext in AUDIO_EXTS
@@ -675,6 +805,45 @@ def main() -> None:
             or office_embedded_count > 0
         )
         mat_candidate = "建议建立MAT" if complex_material and not duplicate_of else ""
+        verified_modules = verified_modules_for_source(project_root, source_id, path.resolve())
+        previous_same_file = bool(
+            existing_human_fields.get(source_id, {}).get("sha256")
+            and existing_human_fields[source_id]["sha256"].lower() == checksum.lower()
+        )
+        previous_mappings = existing_topic_mappings.get(source_id, [])
+        if previous_same_file and previous_mappings and any(item.get("归类状态", "").startswith("已核验") for item in previous_mappings):
+            role = {
+                "role": existing_human_fields.get(source_id, {}).get("source_role", "客户事实资料"),
+                "basis": "沿用来源台账已核验资料角色",
+                "confidence": "高",
+                "status": "已核验",
+            }
+            topic_mappings = [
+                {
+                    "module": item.get("标准模块候选", ""),
+                    "topic": item.get("主题候选", ""),
+                    "basis": item.get("判断依据", "") or "来源台账已核验",
+                    "confidence": "高",
+                    "status": "已核验",
+                }
+                for item in previous_mappings
+                if item.get("标准模块候选", "")
+            ]
+        elif duplicate_of and not verified_modules:
+            role = {
+                key: str(rows_by_id[duplicate_of][key])
+                for key in ("source_role", "role_basis", "role_confidence", "role_status")
+            }
+            role = {
+                "role": role["source_role"],
+                "basis": "完全重复，复用代表资料的资料角色判断",
+                "confidence": role["role_confidence"],
+                "status": role["role_status"],
+            }
+            topic_mappings = [dict(item) for item in mappings_by_id.get(duplicate_of, [])]
+        else:
+            role = classify_role(path, chunks, bool(verified_modules))
+            topic_mappings = derive_mappings(path, chunks, role, verified_modules)
         row = {
             "source_id": source_id,
             "relative_path": relative,
@@ -690,29 +859,47 @@ def main() -> None:
             "relation_note": "",
             "mat_candidate": mat_candidate,
             "media_duration": duration,
-            "possible_subject": subject,
             "transcript_status": transcript_status,
             "office_media_count": office_media_count,
             "office_embedded_count": office_embedded_count,
+            "source_role": role["role"],
+            "role_basis": role["basis"],
+            "role_confidence": role["confidence"],
+            "role_status": role["status"],
         }
         rows.append(row)
         rows_by_id[source_id] = row
+        mappings_by_id[source_id] = topic_mappings
         connection.execute(
             """
             INSERT INTO sources(
                 source_id, relative_path, absolute_path, extension, size_bytes,
                 modified_time, sha256, searchability, indexed_scope, excluded_scope,
-                duplicate_of, relation_note, mat_candidate, media_duration,
-                possible_subject, transcript_status, office_media_count, office_embedded_count
+                duplicate_of, relation_note, mat_candidate, mat_id, mat_disposition, media_duration,
+                transcript_status, office_media_count, office_embedded_count,
+                source_role, role_basis, role_confidence, role_status
             ) VALUES (
                 :source_id, :relative_path, :absolute_path, :extension, :size_bytes,
                 :modified_time, :sha256, :searchability, :indexed_scope, :excluded_scope,
-                :duplicate_of, :relation_note, :mat_candidate, :media_duration,
-                :possible_subject, :transcript_status, :office_media_count, :office_embedded_count
+                :duplicate_of, :relation_note, :mat_candidate, NULL, NULL, :media_duration,
+                :transcript_status, :office_media_count, :office_embedded_count,
+                :source_role, :role_basis, :role_confidence, :role_status
             )
             """,
             row,
         )
+        for mapping in topic_mappings:
+            connection.execute(
+                """
+                INSERT INTO source_topic_mappings(
+                    source_id, module, topic, basis, confidence, status, source_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id, mapping["module"], mapping["topic"], mapping["basis"],
+                    mapping["confidence"], mapping["status"], checksum,
+                ),
+            )
         if not duplicate_of and exclusion_state not in {"approved", "stale"}:
             for locator, text in chunks:
                 connection.execute(
@@ -777,6 +964,22 @@ def main() -> None:
                 )
 
     connection.commit()
+
+    mat_mapping, mat_dispositions = formalize_scan_candidates(
+        project_root,
+        rows,
+        existing_human_fields,
+        built_at,
+    )
+    for row in rows:
+        source_id = str(row["source_id"])
+        mat_id = mat_mapping.get(source_id, "")
+        disposition = mat_dispositions.get(source_id, "")
+        connection.execute(
+            "UPDATE sources SET mat_id=?, mat_disposition=? WHERE source_id=?",
+            (mat_id, disposition, source_id),
+        )
+    connection.commit()
     connection.close()
 
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -787,8 +990,8 @@ def main() -> None:
         f"- 最近扫描：{built_at}",
         f"- 机器索引：[[{db_path.name}]]",
         "",
-        "| 资料ID | 资料名称 | 原始相对路径 | 格式 | 大小 | 修改时间 | SHA-256 | 可检索状态 | 已索引范围 | 未索引内容 | 媒体时长 | 可能主题 | 疑似文字稿 | Office媒体/结构数 | Office嵌入对象数 | 重复/版本关系 | 使用范围 | 关联文章 | 当前处理状态 | MAT |",
-        "|---|---|---|---:|---:|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---|",
+        "| 资料ID | 资料名称 | 原始相对路径 | 格式 | 大小 | 修改时间 | SHA-256 | 可检索状态 | 已索引范围 | 未索引内容 | 媒体时长 | 疑似文字稿 | Office媒体/结构数 | Office嵌入对象数 | 重复/版本关系 | 使用范围 | 关联文章 | 当前处理状态 | MAT | MAT处置说明 |",
+        "|---|---|---|---:|---:|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---|---|",
     ]
     for row in rows:
         relationship = str(row["relation_note"])
@@ -797,9 +1000,10 @@ def main() -> None:
         preserved = existing_human_fields.get(str(row["source_id"]), {})
         use_scope, related_articles = resolve_source_scope(preserved)
         handling = preserved.get("handling", "") or str(row["mat_candidate"] or "已登记")
-        mat_id = preserved.get("mat", "")
-        if row["mat_candidate"] and handling == "已登记" and not mat_id:
-            handling = str(row["mat_candidate"])
+        mat_id = mat_mapping.get(str(row["source_id"]), preserved.get("mat", ""))
+        mat_disposition = preserved.get("mat_disposition", "") or mat_dispositions.get(str(row["source_id"]), "")
+        if row["mat_candidate"] and handling in {"已登记", "建议建立MAT"} and mat_id:
+            handling = f"已建立正式MAT：{mat_id}"
         if not row["mat_candidate"] and handling == "建议建立MAT" and not mat_id:
             handling = "已登记"
         if preserved.get("sha256") and preserved["sha256"] != str(row["sha256"]):
@@ -816,7 +1020,6 @@ def main() -> None:
             row["indexed_scope"],
             row["excluded_scope"],
             row["media_duration"],
-            row["possible_subject"],
             row["transcript_status"],
             row["office_media_count"],
             row["office_embedded_count"],
@@ -825,8 +1028,33 @@ def main() -> None:
             related_articles,
             handling,
             mat_id,
+            mat_disposition,
         )
         ledger_lines.append("| " + " | ".join(markdown_escape(str(value)) for value in fields) + " |")
+    ledger_lines.extend([
+        "",
+        "## 来源主题与模块候选",
+        "",
+        "> 本表用于来源导航。模块和主题候选不代表已经回源核验或形成正式Claim；同一来源可以对应多个模块。",
+        "",
+        "| 资料ID/资料名称 | 资料角色 | 标准模块候选 | 主题候选 | 判断依据 | 归类状态 |",
+        "|---|---|---|---|---|---|",
+    ])
+    for row in rows:
+        source_id = str(row["source_id"])
+        mappings = mappings_by_id.get(source_id, [])
+        modules = "；".join(dict.fromkeys(item["module"] for item in mappings)) or "不适用"
+        topics = "；".join(dict.fromkeys(item["topic"] for item in mappings)) or "不适用"
+        bases = "；".join(dict.fromkeys(item["basis"] for item in mappings)) or str(row["role_basis"])
+        mapping_fields = (
+            f"{source_id}，{Path(str(row['relative_path'])).name}",
+            row["source_role"], modules, topics, bases,
+            mapping_status_summary(mappings, {
+                "status": str(row["role_status"]),
+                "confidence": str(row["role_confidence"]),
+            }),
+        )
+        ledger_lines.append("| " + " | ".join(markdown_escape(str(value)) for value in mapping_fields) + " |")
     version_events: list[dict[str, str | int]] = []
     for row in rows:
         source_id = str(row["source_id"])
@@ -887,7 +1115,7 @@ def main() -> None:
                 "- 音频和视频仅登记基础信息，不检索内容。",
                 "- 压缩包默认只登记成员名，不处理成员正文。",
                 "- Office媒体、图表和嵌入对象已做只读计数，但正文内容默认未进入索引；需要细查时使用inspect_office_container.py。",
-                "- 建议建立MAT的项目需要由Codex合并到正式MAT台账并分配正式编号。",
+                "- 带复杂资料风险的非重复来源必须在本次构建后关联正式MAT，或在来源台账写明无需建立MAT的中文理由；正式MAT默认不推送内容运营，只有当前文章阻塞且无法唯一处理时才推送。",
                 "- 明确禁止正文的文件必须登记在source-index-exclusions.json；构建器按资料ID、相对路径和SHA-256核对，匹配时只保留文件身份，不写入chunks。",
                 "",
             ]

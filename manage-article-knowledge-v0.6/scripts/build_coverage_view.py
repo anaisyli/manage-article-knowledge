@@ -130,6 +130,70 @@ def source_counts(root: Path) -> tuple[dict[str, int], int]:
     return counts, total
 
 
+def source_topic_candidates(root: Path) -> tuple[dict[str, list[dict[str, str]]], int | str]:
+    """Load source-level module candidates without treating them as Formal Knowledge."""
+    db = root / "02_源资料/source-index.sqlite"
+    result: dict[str, list[dict[str, str]]] = {}
+    if not db.is_file():
+        return result, "待重建"
+    connection = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        source_columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
+        if "source_topic_mappings" not in tables or "source_role" not in source_columns:
+            return result, "待重建"
+        rows = connection.execute(
+            """
+            SELECT s.source_id, s.relative_path, s.absolute_path, s.source_role,
+                   m.module, m.topic, m.confidence, m.status
+            FROM sources AS s
+            LEFT JOIN source_topic_mappings AS m ON m.source_id = s.source_id
+            ORDER BY s.relative_path COLLATE NOCASE, m.module, m.topic
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    unmapped_ids: set[str] = set()
+    mapped_ids: set[str] = set()
+    valid_modules = {module for partition, module, _ in MODULES if partition == "客户知识"}
+    for source_id, relative_path, absolute_path, role, module, topic, confidence, status in rows:
+        if role != "客户事实资料" or module not in valid_modules:
+            unmapped_ids.add(str(source_id))
+            continue
+        mapped_ids.add(str(source_id))
+        result.setdefault(str(module), []).append({
+            "source_id": str(source_id),
+            "name": Path(str(relative_path)).name,
+            "absolute_path": str(absolute_path),
+            "topic": str(topic),
+            "confidence": str(confidence),
+            "status": str(status),
+        })
+    return result, len(unmapped_ids - mapped_ids)
+
+
+def cited_source_ids(files: list[Path], candidates: list[dict[str, str]]) -> set[str]:
+    if not files or not candidates:
+        return set()
+    text = "\n".join(read_text(path) for path in files)
+    return {
+        item["source_id"] for item in candidates
+        if item["source_id"] in text or item["absolute_path"] in text
+    }
+
+
+def unprocessed_source_summary(files: list[Path], candidates: list[dict[str, str]]) -> str:
+    cited = cited_source_ids(files, candidates)
+    remaining = [item for item in candidates if item["source_id"] not in cited]
+    entries = [
+        f"{item['name']}（{item['topic']}，{item['status']}·{item['confidence']}）"
+        for item in remaining[:4]
+    ]
+    if len(remaining) > 4:
+        entries.append(f"另{len(remaining) - 4}项见来源台账")
+    return "；".join(entries)
+
+
 def formal_files(root: Path, relative: Path) -> list[Path]:
     directory = root / relative
     if not directory.is_dir():
@@ -277,7 +341,43 @@ def knowledge_gaps(root: Path) -> list[dict[str, str]]:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != GAP_FIELDS:
             return []
-        return [{field: row.get(field, "") for field in GAP_FIELDS} for row in reader]
+        rows = [{field: row.get(field, "") for field in GAP_FIELDS} for row in reader]
+
+    # Older runs could create a fresh GAP key for every article even when the
+    # human knowledge question was identical.  Keep the machine ledger intact
+    # for traceability, but present one public problem in the current view.
+    merged: dict[str, dict[str, str]] = {}
+    # An open gap must remain visible when legacy duplicate rows disagree;
+    # resolved/closed rows must not hide a still-actionable occurrence.
+    status_rank = {"已关闭": 0, "已解决": 1, "观察中": 2, "待外部调研": 3}
+    for row in rows:
+        topic_key = re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", row.get("gap_topic", "").casefold())
+        key = topic_key or row.get("gap_key", "")
+        current = merged.get(key)
+        if current is None:
+            current = dict(row)
+            merged[key] = current
+            continue
+        article_ids = list(dict.fromkeys(
+            [item.strip() for item in (current.get("article_ids", "") + ";" + row.get("article_ids", "")).split(";") if item.strip()]
+        ))
+        current["article_ids"] = ";".join(article_ids)
+        current["article_count"] = str(len(article_ids))
+        if status_rank.get(row.get("status", ""), 0) > status_rank.get(current.get("status", ""), 0):
+            current["status"] = row.get("status", "")
+        if row.get("first_seen", "") and (not current.get("first_seen") or row["first_seen"] < current["first_seen"]):
+            current["first_seen"] = row["first_seen"]
+        if row.get("last_seen", "") > current.get("last_seen", ""):
+            current["last_seen"] = row["last_seen"]
+        refs = list(dict.fromkeys(
+            [item.strip() for item in (current.get("related_governance_ref", "") + ";" + row.get("related_governance_ref", "")).split(";") if item.strip() and item.strip() != "无"]
+        ))
+        current["related_governance_ref"] = ";".join(refs) if refs else "无"
+        if len(row.get("gap_topic", "")) > len(current.get("gap_topic", "")):
+            current["gap_topic"] = row["gap_topic"]
+        if current.get("article_count", "0") != "1" and current.get("trigger_basis") == "首篇普通缺口":
+            current["trigger_basis"] = "重复文章"
+    return list(merged.values())
 
 
 def article_records(root: Path) -> list[dict[str, object]]:
@@ -329,6 +429,7 @@ def build_view(root: Path) -> str:
     project_id = parse_project_id(root)
     rebuilt_at = datetime.now().astimezone().isoformat(timespec="seconds")
     counts, total = source_counts(root)
+    source_candidates, unmapped_source_count = source_topic_candidates(root)
     articles = article_records(root)
     mats = open_mat_items(root)
     gaps = governance_gaps(root)
@@ -347,7 +448,10 @@ def build_view(root: Path) -> str:
         f"| 部分内容可搜索 | {counts.get('部分内容可搜索', 0)} | 图片、嵌入对象或部分结构未进入正文索引 | [[../../02_源资料/源资料与可检索性台账.md]] |",
         f"| 仅文件信息可搜索 | {counts.get('仅文件信息可搜索', 0)} | 文章依赖时进入MAT，不把文件名当作证据 | [[../../02_源资料/源资料与可检索性台账.md]] |",
         f"| 未建立正文索引 | {counts.get('未建立正文索引', 0)} | 需按文章依赖和工具条件决定是否处理 | [[../../02_源资料/源资料与可检索性台账.md]] |",
+        f"| 未纳入七模块候选 | {unmapped_source_count} | 非事实资料、资料角色待确认或主题依据不足的来源不进入模块候选 | [[../../02_源资料/源资料与可检索性台账.md#来源主题与模块候选]] |",
         "", "## 知识库覆盖与缺口", "",
+        "> “尚未定向处理材料”中的来源是来源台账的模块候选，不代表已形成正式Claim；“明确缺少材料或事实”只列已登记的CUS、ANM、文章前事实边界或公共知识缺口。",
+        "",
         "| 知识分区/标准模块 | 已有正式知识与可安全使用范围 | 已覆盖来源 | 尚未定向处理材料 | 明确缺少材料或事实 | 当前文章影响 |",
         "|---|---|---|---|---|---|",
     ]
@@ -356,13 +460,23 @@ def build_view(root: Path) -> str:
         module_articles = related_articles(files, articles)
         module_mats = related_mat(files, mats)
         module_gaps = related_gaps(files, gaps)
+        module_candidates = source_candidates.get(module, []) if partition == "客户知识" else []
         if files:
             knowledge = "；".join(f"{wikilink(root, path)}：{knowledge_summary(path)}" for path in files)
             sources = "；".join(dict.fromkeys(name for path in files for name in source_summary(path)))
         else:
             knowledge = "暂无正式知识；当前没有经核验Claim落入本模块"
             sources = "尚无正式知识对应来源；不代表来源台账中没有相关候选资料"
-        if module_mats:
+        candidate_summary = unprocessed_source_summary(files, module_candidates)
+        if partition == "客户知识":
+            unprocessed_parts = [candidate_summary] if candidate_summary else []
+            if module_mats:
+                unprocessed_parts.extend(
+                    f"{item.get('MAT ID', 'MAT')} {item.get('事项名称', '')}（{item.get('代表文件/资料范围', '详见MAT台账')}）"
+                    for item in module_mats[:4]
+                )
+            unprocessed = "；".join(unprocessed_parts) or "尚无已映射到本模块但未形成正式Claim的来源候选"
+        elif module_mats:
             unprocessed = "；".join(f"{item.get('MAT ID', 'MAT')} {item.get('事项名称', '')}（{item.get('代表文件/资料范围', '详见MAT台账')}）" for item in module_mats[:4])
         elif files:
             unprocessed = "未发现与当前正式知识来源直接关联的开放MAT；其他未命中资料仍按文章需要处理"
@@ -375,7 +489,12 @@ def build_view(root: Path) -> str:
         for article in module_articles:
             if article["excluded"]:
                 explicit.append(f"{article['title']}明确排除：{article['excluded']}")
-        missing = "；".join(explicit[:4]) if explicit else "尚无该模块明确登记的CUS、ANM或文章前事实缺口"
+        if explicit:
+            missing = "；".join(explicit[:4])
+        elif partition == "客户知识":
+            missing = "尚无该模块明确登记的CUS、ANM或文章前事实缺口；没有正式Claim不等于缺少资料"
+        else:
+            missing = "尚无该模块明确登记的CUS、ANM或文章前事实缺口"
         if module_articles:
             impact = "；".join(f"{article['title']}（{STATE_LABELS[str(article['state'])]}）" for article in module_articles)
         elif files:
@@ -408,8 +527,15 @@ def run_self_test() -> int:
         db = root / "02_源资料/source-index.sqlite"
         db.parent.mkdir(parents=True)
         connection = sqlite3.connect(db)
-        connection.execute("CREATE TABLE sources (searchability TEXT)")
-        connection.execute("INSERT INTO sources VALUES ('部分内容可搜索')")
+        connection.execute(
+            "CREATE TABLE sources (source_id TEXT, relative_path TEXT, absolute_path TEXT, searchability TEXT, source_role TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE source_topic_mappings (source_id TEXT, module TEXT, topic TEXT, confidence TEXT, status TEXT)"
+        )
+        connection.execute("INSERT INTO sources VALUES ('SRC-ABCDEF123456', '示例培训资料.pptx', 'C:/source/示例培训资料.pptx', '部分内容可搜索', '客户事实资料')")
+        connection.execute("INSERT INTO sources VALUES ('SRC-NONFACT1234', '文章要求.docx', 'C:/source/文章要求.docx', '部分内容可搜索', '写作运营资料')")
+        connection.execute("INSERT INTO source_topic_mappings VALUES ('SRC-ABCDEF123456', '行业知识与洞察', '示例行业方法', '中', '机器初判')")
         connection.commit()
         connection.close()
         formal = root / "03_正式知识/10_客户知识/50_行业知识与洞察/10_企业提供/示例行业知识.md"
@@ -436,14 +562,29 @@ def run_self_test() -> int:
                 "next_action": "开展定向外部调研", "first_seen": "2026-08-21", "last_seen": "2026-08-21",
                 "related_governance_ref": "无",
             })
+            writer.writerow({
+                "gap_key": "legacy-duplicate-key", "gap_topic": "单光束与双光束的机制及适用边界",
+                "gap_type": "公共知识", "trigger_basis": "首篇普通缺口", "article_ids": "DEMO-ART-20260822-002",
+                "article_count": "1", "status": "观察中", "current_impact": "影响同主题文章",
+                "next_action": "复用同一知识问题并合并文章关联", "first_seen": "2026-08-22", "last_seen": "2026-08-22",
+                "related_governance_ref": "无",
+            })
         output = build_view(root)
-        required = ("示例行业知识", "客户正式知识", "可用", "示例结构（1条Claim）", "示例培训资料.pptx", "示例行业文章（已完成）", "不得外推企业能力", "单光束与双光束的机制及适用边界", "待外部调研", "覆盖数据指纹：")
+        required = ("示例行业知识", "客户正式知识", "可用", "示例结构（1条Claim）", "示例培训资料.pptx", "示例行业文章（已完成）", "不得外推企业能力", "单光束与双光束的机制及适用边界", "待外部调研", "覆盖数据指纹：", "未纳入七模块候选 | 1")
         if any(value not in output for value in required):
             print("coverage self-test failed")
             return 1
         company_row = next(line for line in output.splitlines() if line.startswith("| 客户知识／公司概述"))
         if "示例行业文章" in company_row:
             print("coverage self-test failed: unrelated article repeated")
+            return 1
+        coverage_header = "| 知识分区/标准模块 | 已有正式知识与可安全使用范围 | 已覆盖来源 | 尚未定向处理材料 | 明确缺少材料或事实 | 当前文章影响 |"
+        if output.count(coverage_header) != 1 or "## 来源主题与模块候选" in output:
+            print("coverage self-test failed: non-target coverage structure changed")
+            return 1
+        gap_lines = [line for line in output.splitlines() if "单光束与双光束的机制及适用边界" in line]
+        if len(gap_lines) != 1 or "2" not in gap_lines[0] or "待外部调研" not in gap_lines[0]:
+            print("coverage self-test failed: duplicate gaps were not merged")
             return 1
     print("coverage self-test ok")
     return 0

@@ -21,6 +21,14 @@ from template_contract import (
     complex_material_rows,
     validate_project_templates,
 )
+from mat_lifecycle import (
+    MAT_DEPENDENCY_VALUES,
+    MAT_ID_RE,
+    MAT_LIFECYCLE_COLUMNS,
+    MAT_PUSH_STATUSES,
+    current_table,
+    source_ledger_fields,
+)
 
 
 REQUIRED_FILES = (
@@ -126,6 +134,11 @@ CANONICAL_ARTICLE_FILES = {
     "文章前问题与处理单.md",
 }
 ARTICLE_STATES = ("10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成")
+
+
+def is_transient_article_directory(path: Path) -> bool:
+    """Return whether a bridge staging/retired directory is not a current task."""
+    return path.name.startswith((".retired-", ".revision-"))
 ARTICLE_REQUIRED_BY_STATE = {
     "10_进行中": ("10_文章知识需求.md",),
     "20_等待终稿": (
@@ -350,7 +363,7 @@ RELATED_WEBSITE_TYPES = {
 RELATED_WEBSITE_STATUSES = {
     "可访问", "部分可访问", "暂时无法访问", "关系待确认", "已停用",
 }
-MONTHLY_TEMPLATE_VERSION = "v0.6-20260831"
+MONTHLY_TEMPLATE_VERSION = "v0.6-20260908"
 MONTHLY_SOURCE_HEADER = ("来源类型", "已登记对象", "当前可用/可检索状态", "主要限制", "当前入口")
 MONTHLY_SOURCE_TYPES = (
     "客户提供文件", "客户主官网", "内容运营提交的其他企业相关网站",
@@ -364,6 +377,10 @@ MONTHLY_COVERAGE_STATUSES = {
     "已有来源且已有正式知识", "已有来源，尚未形成正式知识", "来源处理中",
     "尚未发现相关来源", "来源归类待确认",
 }
+CUS_DETECTION_CATEGORIES = (
+    "客户能力", "规格", "认证", "案例", "商业条件", "公开授权",
+)
+CUS_LOW_FAITHFULNESS_THRESHOLD = 80.0
 
 
 def table_headers(text: str) -> list[tuple[str, ...]]:
@@ -571,10 +588,16 @@ def validate_article_governance_checks(
     root: Path,
     errors: list[str],
     warnings: list[str],
+    metrics: list[dict[str, str]] | None = None,
 ) -> None:
     task_root = root / "04_文章任务"
     if not task_root.is_dir():
         return
+    current_metrics = {
+        row.get("article_id", ""): row
+        for row in (metrics or [])
+        if row.get("status") == "current"
+    }
     for path in task_root.rglob("20_文章前知识审核.md"):
         if "90_归档" in path.parts:
             continue
@@ -659,6 +682,26 @@ def validate_article_governance_checks(
             )
             if not signals or signals in {"已检查", "无异常", "无", "不适用"}:
                 errors.append(f"{detector}未写实际检查信号与来源：{path}")
+            if detector == "CUS候选检测":
+                missing_categories = [
+                    category for category in CUS_DETECTION_CATEGORIES
+                    if category not in signals
+                ]
+                if missing_categories:
+                    errors.append(
+                        f"CUS候选检测未覆盖固定类别（{'、'.join(missing_categories)}）：{path}"
+                    )
+                article_id = parse_field(text, "文章ID")
+                metric = current_metrics.get(article_id, {})
+                try:
+                    score = float(metric.get("faithfulness_percent", ""))
+                except (TypeError, ValueError):
+                    score = None
+                if score is not None and score < CUS_LOW_FAITHFULNESS_THRESHOLD:
+                    if "Faithfulness低于80%后复核" not in signals and "Faithfulness低于80%后复核" not in handling:
+                        errors.append(
+                            f"Faithfulness低于{CUS_LOW_FAITHFULNESS_THRESHOLD:.0f}%后必须重新检查CUS六类客户事实：{path}"
+                        )
             if conclusion not in allowed:
                 errors.append(f"{detector}分类结论无效：{conclusion or '空'}（{path}）")
             if not entry or not handling:
@@ -755,7 +798,7 @@ def validate_mat_dependencies(root: Path, errors: list[str]) -> None:
         if not article_dir.is_dir() or article_dir.name == "90_归档":
             continue
         for task_dir in article_dir.iterdir():
-            if not task_dir.is_dir():
+            if not task_dir.is_dir() or is_transient_article_directory(task_dir):
                 continue
             state = next((part for part in task_dir.parts if part in {
                 "10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成"
@@ -780,6 +823,128 @@ def validate_mat_dependencies(root: Path, errors: list[str]) -> None:
                     errors.append(
                         f"文章命中MAT资料但审核记录未登记MAT依赖：{source_id} → {mat_id}（{task_dir}）"
                     )
+
+
+def _open_article_mat_references(root: Path, mat_id: str) -> list[tuple[Path, str]]:
+    matches: list[tuple[Path, str]] = []
+    task_root = root / "04_文章任务"
+    if not task_root.is_dir():
+        return matches
+    for path in task_root.rglob("文章前问题与处理单.md"):
+        if "90_归档" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8-sig")
+        if mat_id not in text:
+            continue
+        state_match = re.search(r"(?m)^-\s*当前状态[：:]\s*(.*?)\s*$", text)
+        matches.append((path, state_match.group(1).strip() if state_match else ""))
+    return matches
+
+
+def validate_mat_lifecycle(root: Path, errors: list[str], warnings: list[str]) -> None:
+    """Cross-check source candidates, formal MATs, article work orders, and todo."""
+    db = root / "02_源资料/source-index.sqlite"
+    mat_path = root / "05_数据与审核/30_异常与待决定/20_源资料处理/01_源资料处理台账.md"
+    source_path = root / "02_源资料/源资料与可检索性台账.md"
+    if not db.is_file() or not mat_path.is_file():
+        return
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sources)")}
+        required = {"mat_candidate", "mat_id", "mat_disposition"}
+        if not required.issubset(columns):
+            if "mat_candidate" in columns:
+                candidate_count = connection.execute(
+                    "SELECT COUNT(*) FROM sources WHERE COALESCE(mat_candidate, '') <> '' AND COALESCE(duplicate_of, '') = ''"
+                ).fetchone()[0]
+                if candidate_count:
+                    errors.append(
+                        f"source-index.sqlite中有{candidate_count}个MAT候选，但缺少正式MAT关联字段；请重新构建来源索引"
+                    )
+            warnings.append("旧版source-index.sqlite缺少MAT正式化字段；重新构建来源索引后才会执行候选-MAT交叉校验")
+            connection.close()
+            return
+        source_rows = connection.execute(
+            "SELECT source_id, duplicate_of, mat_candidate, mat_id, mat_disposition FROM sources"
+        ).fetchall()
+        connection.close()
+    except sqlite3.Error as exc:
+        errors.append(f"无法读取MAT生命周期来源索引：{exc}")
+        return
+
+    table = current_table(mat_path)
+    if table is None:
+        errors.append(f"MAT正式台账缺少“## 当前事项”主表：{mat_path}")
+        return
+    header = list(table["header"])
+    indexes = {name: index for index, name in enumerate(header)}
+    formal: dict[str, dict[str, str]] = {}
+    for row in table["rows"]:
+        if not row or not MAT_ID_RE.fullmatch(row[0].strip()):
+            continue
+        formal[row[0].strip()] = {
+            name: row[index].strip() if index < len(row) else ""
+            for name, index in indexes.items()
+        }
+    candidate_source_ids = [
+        source_id for source_id, duplicate_of, candidate, *_ in source_rows
+        if candidate and not duplicate_of
+    ]
+    if candidate_source_ids and not formal:
+        errors.append(
+            f"来源台账存在{len(candidate_source_ids)}个MAT候选，但MAT当前事项主表为空；必须建立正式MAT或写明无需建立理由"
+        )
+    source_ledger = source_ledger_fields(source_path)
+    for source_id, duplicate_of, candidate, db_mat_id, db_disposition in source_rows:
+        ledger_row = source_ledger.get(source_id, {})
+        ledger_mat_id = ledger_row.get("MAT", "").strip()
+        mat_id = str(db_mat_id or ledger_mat_id or "").strip()
+        if db_mat_id and ledger_mat_id and str(db_mat_id).strip() != ledger_mat_id:
+            errors.append(f"来源{source_id}的source-index.sqlite MAT与来源台账不一致：{db_mat_id} / {ledger_mat_id}")
+        if mat_id and mat_id not in formal:
+            errors.append(f"来源{source_id}引用了不存在的正式MAT：{mat_id}")
+        if candidate and not duplicate_of and not mat_id:
+            disposition = str(db_disposition or ledger_row.get("MAT处置说明", "")).strip()
+            if not disposition.startswith(("无需建立MAT", "不建立MAT", "完全重复", "已复用")):
+                errors.append(f"来源{source_id}有MAT候选但没有正式MAT ID或明确无需建立理由")
+
+    lifecycle_missing = [column for column in MAT_LIFECYCLE_COLUMNS if column not in indexes]
+    has_candidates = any(candidate and not duplicate for _, duplicate, candidate, *_ in source_rows)
+    if lifecycle_missing:
+        if has_candidates:
+            errors.append(f"MAT主表缺少生命周期字段：{', '.join(lifecycle_missing)}；请重新构建来源索引升级台账")
+        else:
+            warnings.append(f"旧版MAT主表缺少生命周期字段：{', '.join(lifecycle_missing)}")
+        return
+
+    todo_text = (root / "01_工作台/20_当前待办.md").read_text(encoding="utf-8-sig") if (root / "01_工作台/20_当前待办.md").is_file() else ""
+    for mat_id, record in formal.items():
+        dependency = record.get("是否有当前文章依赖", "")
+        blocking = record.get("是否阻塞当前文章", "")
+        push = record.get("内容运营推送状态", "")
+        if dependency not in MAT_DEPENDENCY_VALUES:
+            errors.append(f"MAT {mat_id} 的当前文章依赖值无效：{dependency or '空'}")
+        if blocking not in {"否", "是"}:
+            errors.append(f"MAT {mat_id} 的是否阻塞当前文章值无效：{blocking or '空'}")
+        if push not in MAT_PUSH_STATUSES:
+            errors.append(f"MAT {mat_id} 的内容运营推送状态无效：{push or '空'}")
+        if dependency == "否" and blocking == "是":
+            errors.append(f"MAT {mat_id} 标为阻塞但没有当前文章依赖")
+        if dependency == "否" and push != "不需要推送":
+            errors.append(f"MAT {mat_id} 没有当前文章依赖却标记为{push}")
+        if blocking == "是" and push not in {"待推送", "已推送", "已升级"}:
+            errors.append(f"MAT {mat_id} 已阻塞当前文章但没有内容运营推送状态")
+        if push in {"待推送", "已推送", "已升级"}:
+            if dependency != "是" or blocking != "是":
+                errors.append(f"MAT {mat_id}已进入内容运营推送状态，但依赖/阻塞字段不是“是”")
+            references = _open_article_mat_references(root, mat_id)
+            if not references:
+                errors.append(f"MAT {mat_id}已进入内容运营推送状态，但没有开放文章前问题与处理单")
+            if mat_id not in todo_text:
+                errors.append(f"MAT {mat_id}已进入内容运营推送状态，但当前待办没有对应入口")
+        for path, state in _open_article_mat_references(root, mat_id):
+            if state and state != "已关闭" and push == "不需要推送":
+                errors.append(f"开放文章处理单引用MAT {mat_id}，但推送状态仍为“不需要推送”：{path}")
 
 
 def validate_feedback_details(root: Path, errors: list[str]) -> None:
@@ -1138,7 +1303,7 @@ def validate_index(root: Path, errors: list[str], warnings: list[str]) -> None:
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
         }
-        required = {"metadata", "sources", "chunks", "chunks_fts", "relationships"}
+        required = {"metadata", "sources", "chunks", "chunks_fts", "relationships", "source_topic_mappings"}
         missing = required - tables
         if missing:
             errors.append(f"机器索引缺少表：{', '.join(sorted(missing))}")
@@ -1146,8 +1311,8 @@ def validate_index(root: Path, errors: list[str], warnings: list[str]) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(sources)")
         }
         expected_columns = {
-            "media_duration", "possible_subject", "transcript_status",
-            "office_media_count", "office_embedded_count",
+            "media_duration", "transcript_status", "office_media_count", "office_embedded_count",
+            "source_role", "role_basis", "role_confidence", "role_status",
         }
         missing_columns = expected_columns - source_columns
         if missing_columns:
@@ -1155,9 +1320,48 @@ def validate_index(root: Path, errors: list[str], warnings: list[str]) -> None:
         source_count = connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
         if source_count == 0:
             warnings.append("机器索引中没有登记任何源文件")
+        if "source_topic_mappings" in tables:
+            valid_modules = {"公司概述", "产品介绍", "解决方案", "合作案例", "行业知识与洞察", "FAQ", "其他", "待确认"}
+            valid_confidence = {"高", "中", "低"}
+            valid_status = {"机器初判", "已核验", "待确认"}
+            valid_roles = {"客户事实资料", "写作运营资料", "疑似文章或终稿", "待确认"}
+            role_rows = {
+                row[0]: {"role": row[1], "sha256": row[2]}
+                for row in connection.execute("SELECT source_id, source_role, sha256 FROM sources")
+            }
+            for source_id, module, topic, basis, confidence, status in connection.execute(
+                "SELECT source_id, module, topic, basis, confidence, status FROM source_topic_mappings"
+            ):
+                if module not in valid_modules:
+                    errors.append(f"来源主题映射模块值无效：{source_id} / {module}")
+                if confidence not in valid_confidence or status not in valid_status:
+                    errors.append(f"来源主题映射判断状态无效：{source_id} / {confidence} / {status}")
+                if not str(topic).strip() or not str(basis).strip():
+                    errors.append(f"来源主题映射缺少主题或判断依据：{source_id} / {module}")
+                if role_rows.get(source_id, {}).get("role") != "客户事实资料":
+                    errors.append(f"非客户事实资料不得进入七模块候选：{source_id}")
+            mapping_rows = connection.execute(
+                "SELECT source_id, source_sha256 FROM source_topic_mappings"
+            ).fetchall()
+            source_hashes = {source_id: values["sha256"] for source_id, values in role_rows.items()}
+            for source_id, mapping_sha256 in mapping_rows:
+                if source_hashes.get(source_id, "").lower() != str(mapping_sha256).lower():
+                    errors.append(f"来源主题映射与来源SHA-256不一致：{source_id}")
+            for source_id, values in role_rows.items():
+                if values["role"] not in valid_roles:
+                    errors.append(f"来源资料角色值无效：{source_id} / {values['role']}")
         connection.close()
     except sqlite3.Error as exc:
         errors.append(f"机器索引无法读取：{exc}")
+
+    ledger = root / "02_源资料/源资料与可检索性台账.md"
+    if ledger.is_file():
+        headers = table_headers(ledger.read_text(encoding="utf-8-sig"))
+        mapping_header = ("资料ID/资料名称", "资料角色", "标准模块候选", "主题候选", "判断依据", "归类状态")
+        if any("可能主题" in header for header in headers):
+            errors.append(f"来源台账旧“可能主题”列尚未迁移：{ledger}")
+        if headers.count(mapping_header) != 1:
+            errors.append(f"来源台账缺少唯一“来源主题与模块候选”表：{ledger}")
 
 
 def validate_source_exclusions(root: Path, errors: list[str], warnings: list[str]) -> None:
@@ -1420,7 +1624,7 @@ def validate_layout(
     if article_root.is_dir():
         for state_dir in ("10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成"):
             for task_dir in (article_root / state_dir).iterdir() if (article_root / state_dir).is_dir() else ():
-                if not task_dir.is_dir():
+                if not task_dir.is_dir() or is_transient_article_directory(task_dir):
                     continue
                 for child in task_dir.iterdir():
                     if child.is_file() and child.suffix.lower() == ".md" and child.name not in CANONICAL_ARTICLE_FILES:
@@ -1463,7 +1667,11 @@ def article_task_dirs(root: Path) -> list[tuple[str, Path]]:
         state_root = task_root / state
         if not state_root.is_dir():
             continue
-        result.extend((state, path) for path in state_root.iterdir() if path.is_dir())
+        result.extend(
+            (state, path)
+            for path in state_root.iterdir()
+            if path.is_dir() and not is_transient_article_directory(path)
+        )
     return result
 
 
@@ -1979,6 +2187,83 @@ def validate_articles(
             if parse_field(receipt_text, "当前状态") not in {"已导入，观察完成", "已导入，存在待处理事项"}:
                 errors.append(f"已完成文章的50记录状态不是已导入：{article_id}")
 
+REPORT_NO_ITEM_MARKERS = (
+    "无未完成事项", "无待外部调研事项", "无未关闭知识缺口", "无开放处理单",
+)
+REPORT_LEDGER_SPECS = {
+    "MAT": ("05_数据与审核/30_异常与待决定/20_源资料处理/01_源资料处理台账.md", "## 当前事项", "暂不处理", "已处理"),
+    "CUS": ("05_数据与审核/30_异常与待决定/10_待客户补充/01_待客户补充事项.md", "## 当前事项", "无需询问", "已完成"),
+    "ANM": ("05_数据与审核/30_异常与待决定/30_源文与事实异常/01_源文与事实异常台账.md", "## 当前异常", "已解决", "已完成处置（原文未修复）"),
+    "SKFB": ("05_数据与审核/30_异常与待决定/40_Skill运行反馈/01_Skill反馈台账.md", "## 当前反馈", "已关闭", "转为项目问题", "不纳入Skill"),
+}
+
+
+def _open_report_items(root: Path, *, handoff: bool) -> dict[str, list[str]]:
+    """Read current ledger rows so reports cannot claim a clean state from memory."""
+    result: dict[str, list[str]] = {}
+    for kind, spec in REPORT_LEDGER_SPECS.items():
+        path, heading, *terminal = spec
+        table = current_table(root / path, heading)
+        if table is None:
+            result[kind] = []
+            continue
+        headers = list(table["header"])
+        status_name = "当前阶段"
+        status_index = headers.index(status_name) if status_name in headers else -1
+        ids: list[str] = []
+        for row in table["rows"]:
+            if not row or row[0].strip().startswith("["):
+                continue
+            item_id = row[0].strip()
+            status = row[status_index].strip() if 0 <= status_index < len(row) else ""
+            if item_id and status not in terminal:
+                ids.append(item_id)
+        result[kind] = ids
+
+    gap_path = root / "05_数据与审核/20_知识库覆盖与缺口/10_知识缺口记录.csv"
+    gap_ids: list[str] = []
+    if gap_path.is_file():
+        try:
+            with gap_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                for row in csv.DictReader(stream):
+                    if row.get("status", "").strip() in {"观察中", "待外部调研"}:
+                        key = row.get("gap_key", "").strip()
+                        topic = row.get("gap_topic", "").strip()
+                        if key:
+                            gap_ids.append(key)
+                        elif topic:
+                            gap_ids.append(topic)
+        except (OSError, csv.Error):
+            pass
+    result["知识缺口"] = gap_ids
+    return result
+
+
+def _report_section(text: str, heading: str) -> str:
+    match = re.search(
+        rf"(?ms)^###\s+{re.escape(heading)}[^\r\n]*\r?$([\s\S]*?)(?=^###\s+|^##\s+|\Z)",
+        text,
+    )
+    return match.group(1) if match else ""
+
+
+def _check_report_snapshot(path: Path, text: str, open_items: dict[str, list[str]], *, handoff: bool) -> None:
+    headings = {kind: ("知识缺口" if handoff else "知识缺口（仅需当前行动）") if kind == "知识缺口" else kind for kind in (*REPORT_LEDGER_SPECS, "知识缺口")}
+    for kind, item_ids in open_items.items():
+        section = _report_section(text, headings[kind])
+        if not section:
+            raise ValueError(f"报告缺少{kind}汇总小节：{path}")
+        missing = [item_id for item_id in item_ids if item_id not in section]
+        has_no_item = any(marker in section for marker in REPORT_NO_ITEM_MARKERS)
+        if item_ids:
+            if has_no_item:
+                raise ValueError(f"报告{kind}仍写无未完成事项，但当前台账有开放事项：{path}")
+            if missing:
+                raise ValueError(f"报告{kind}未逐项汇总当前开放事项：{', '.join(missing)}（{path}）")
+        elif not has_no_item:
+            raise ValueError(f"报告{kind}没有开放事项时必须明确写无未完成事项：{path}")
+
+
 def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[str]) -> None:
     review_root = root / "05_数据与审核/40_月度与交接"
     if not review_root.is_dir():
@@ -2007,6 +2292,7 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
                     f"记录未逐篇关联开放文章处理单（需文章ID、文章标题和文件名）：{sheet} -> {path}"
                 )
 
+    monthly_open_items = _open_report_items(root, handoff=False)
     for path in review_root.glob("*_月度知识库审核.md"):
         text = path.read_text(encoding="utf-8-sig")
         for heading in (
@@ -2028,6 +2314,8 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
             for heading in ("### 企业来源入口与可用状态", "### 七模块资料与正式知识覆盖"):
                 if heading not in text:
                     errors.append(f"月度审核第二部分缺少固定小节 {heading}：{path}")
+            if "#### 本月SKFB维护复核（只读）" not in text:
+                errors.append(f"月度审核缺少本月SKFB维护复核小节：{path}")
             source_header, source_rows = markdown_table(path, "### 企业来源入口与可用状态")
             if tuple(source_header) != MONTHLY_SOURCE_HEADER:
                 errors.append(f"月度审核第二部分未使用固定企业来源表头：{path}")
@@ -2059,6 +2347,11 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
             if "当前文章影响" in section_two:
                 errors.append(f"月度审核第二部分不应继续以当前文章影响为固定列：{path}")
         check_problem_sheet_links(path, text)
+        try:
+            _check_report_snapshot(path, text, monthly_open_items, handoff=False)
+        except ValueError as exc:
+            errors.append(str(exc))
+    handoff_open_items = _open_report_items(root, handoff=True)
     for path in review_root.glob("*_项目交接审核.md"):
         text = path.read_text(encoding="utf-8-sig")
         conclusion = parse_field(text, "结论")
@@ -2068,6 +2361,10 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
             if label not in text:
                 errors.append(f"项目交接缺少 {label}：{path}")
         check_problem_sheet_links(path, text)
+        try:
+            _check_report_snapshot(path, text, handoff_open_items, handoff=True)
+        except ValueError as exc:
+            errors.append(str(exc))
 
 
 def run_self_test() -> int:
@@ -2174,7 +2471,7 @@ def run_self_test() -> int:
 
 | 检测对象 | 已检查信号与来源 | 分类结论 | 事项与证据入口 | 本篇处理 |
 |---|---|---|---|---|
-| CUS候选检测 | 已检查客户规格、认证及Formal Claim、本地索引、官网 | 未触发 | 无 | 不新增客户事实 |
+| CUS候选检测 | 已检查客户能力、规格、认证、案例、商业条件、公开授权，以及Formal Claim、本地索引和官网 | 未触发 | 无 | 不新增客户事实 |
 | ANM异常检测 | 已检查版本、定位、数值单位、OCR、冲突和外推 | 未触发 | 无 | 按现有核验事实使用 |
 """
         audit.write_text(valid_audit, encoding="utf-8")
@@ -2236,6 +2533,7 @@ def run_self_test() -> int:
         if not all(any(fragment in item for item in invalid_errors) for fragment in expected):
             print(json.dumps({"ok": False, "stage": "invalid-id-only-mat", "errors": invalid_errors}, ensure_ascii=False))
             return 1
+
         broken_table = root / "broken-table.md"
         broken_table.write_text("| A |\n|---|\n| 1 |\n\n| 2 |\n", encoding="utf-8")
         if not table_continuity_errors(broken_table):
@@ -2425,6 +2723,64 @@ def run_self_test() -> int:
         if not any("SHA-256不匹配" in item for item in tamper_errors):
             print(json.dumps({"ok": False, "stage": "tampered-version-archive", "errors": tamper_errors}, ensure_ascii=False))
             return 1
+    with tempfile.TemporaryDirectory(prefix="v06-mat-lifecycle-test-") as temp:
+        root = Path(temp)
+        source_dir = root / "02_源资料"
+        source_dir.mkdir(parents=True)
+        database = source_dir / "source-index.sqlite"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE sources (source_id TEXT, duplicate_of TEXT, mat_candidate TEXT, mat_id TEXT, mat_disposition TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO sources VALUES (?, ?, ?, ?, ?)",
+            ("SRC-MAT-001", "", "建议建立MAT", "DEMO-MAT-001", "已建立正式MAT：DEMO-MAT-001"),
+        )
+        connection.commit()
+        connection.close()
+        (source_dir / "源资料与可检索性台账.md").write_text(
+            "# 源资料与可检索性台账\n\n"
+            "| 资料ID | 原始相对路径 | MAT | MAT处置说明 |\n"
+            "|---|---|---|---|\n"
+            "| SRC-MAT-001 | materials/sample.zip | DEMO-MAT-001 | 已建立正式MAT：DEMO-MAT-001 |\n",
+            encoding="utf-8",
+        )
+        mat_path = root / relative
+        mat_path.parent.mkdir(parents=True)
+        mat_path.write_text(
+            "# 源资料处理台账\n\n## 当前事项\n\n"
+            "| MAT ID | 事项名称 | 代表文件/资料范围 | 资料数量 | 通俗问题 | 当前文章影响 | 当前阶段 | 下一责任人/动作 | 重开条件 | 详情入口 | 最近更新 | 是否有当前文章依赖 | 是否阻塞当前文章 | 内容运营推送状态 |\n"
+            "|---|---|---|---:|---|---|---|---|---|---|---|---|---|---|\n"
+            "| DEMO-MAT-001 | 压缩包资料核验 | sample.zip（materials/sample.zip） | 1 | 需要核验压缩包成员 | 当前文章受影响 | 等待材料或工具 | 内容运营确认可用成员 | 新文章命中或文件变化 | [[#DEMO-MAT-001｜压缩包资料核验]] | 2026-08-26 | 是 | 是 | 待推送 |\n\n"
+            "## 事项详情\n\n### DEMO-MAT-001｜压缩包资料核验\n\n"
+            "- 代表文件/资料范围：sample.zip（materials/sample.zip）\n"
+            "- 资料数量：1\n- 为什么合并为一项：同一处理原因、责任人和关闭条件。\n"
+            "- 下一责任人/动作：内容运营确认可用成员\n- 重开条件：新文章命中或文件变化\n",
+            encoding="utf-8",
+        )
+        todo = root / "01_工作台/20_当前待办.md"
+        todo.parent.mkdir(parents=True)
+        todo.write_text("# 当前待办\n\n- DEMO-MAT-001：等待内容运营确认可用成员。\n", encoding="utf-8")
+        problem = root / "04_文章任务/10_进行中/DEMO-ART-001_测试/文章前问题与处理单.md"
+        problem.parent.mkdir(parents=True)
+        problem.write_text(
+            "# 文章前问题与处理单\n\n- 当前状态：等待人工处理\n"
+            "- 关联MAT：DEMO-MAT-001\n- 当前待办：[[../../../01_工作台/20_当前待办.md]]\n",
+            encoding="utf-8",
+        )
+        lifecycle_errors: list[str] = []
+        lifecycle_warnings: list[str] = []
+        validate_mat_lifecycle(root, lifecycle_errors, lifecycle_warnings)
+        if lifecycle_errors:
+            print(json.dumps({"ok": False, "stage": "valid-mat-push-gate", "errors": lifecycle_errors}, ensure_ascii=False))
+            return 1
+        todo.write_text("# 当前待办\n", encoding="utf-8")
+        invalid_lifecycle: list[str] = []
+        validate_mat_lifecycle(root, invalid_lifecycle, [])
+        if not any("当前待办没有对应入口" in item for item in invalid_lifecycle):
+            print(json.dumps({"ok": False, "stage": "invalid-mat-push-gate", "errors": invalid_lifecycle}, ensure_ascii=False))
+            return 1
+
     with tempfile.TemporaryDirectory(prefix="v06-website-monthly-test-") as temp:
         root = Path(temp)
         info = root / "01_工作台/10_项目基础信息.md"
@@ -2485,7 +2841,11 @@ def run_self_test() -> int:
             "## 三、本月提取与知识沉淀\n\n"
             "## 四、月度文章 Faithfulness\n\n"
             "## 五、问题与闭环\n\n"
-            "### MAT\n\n### CUS\n\n### ANM\n\n### SKFB\n"
+            "### MAT\n\n- 无未完成事项\n\n### CUS\n\n- 无未完成事项\n\n### ANM\n\n- 无未完成事项\n\n### SKFB\n\n- 无未完成事项\n\n### 知识缺口（仅需当前行动）\n\n- 无未完成事项\n\n"
+            "#### 本月SKFB维护复核（只读）\n\n"
+            "| 复核范围 | 本月新增 | 已完成Skill专项自测 | 待原复现项目验证 | 已关闭 | 重新打开/阶段不一致 | 复核依据 |\n"
+            "|---|---:|---:|---:|---:|---|---|\n"
+            "| 以本项目SKFB台账为准 | 0 | 0 | 0 | 0 | 无 | manage_skill_feedback.py --audit |\n"
         )
         review.write_text(monthly, encoding="utf-8")
         monthly_errors: list[str] = []
@@ -2562,9 +2922,10 @@ def main() -> None:
         errors.extend(table_continuity_errors(markdown_path))
     validate_retrieval_records(root, errors)
     errors.extend(f"受管模板：{item}" for item in validate_project_templates(root))
-    validate_article_governance_checks(root, errors, warnings)
+    validate_article_governance_checks(root, errors, warnings, metrics)
     validate_source_references(root, errors)
     validate_mat_dependencies(root, errors)
+    validate_mat_lifecycle(root, errors, warnings)
     validate_article_knowledge_packages(root, errors, warnings)
     validate_articles(root, metrics, errors, warnings)
     validate_article_state_gates(root, errors, completion_gate=args.completion_gate)

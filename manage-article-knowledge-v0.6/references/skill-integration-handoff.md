@@ -6,7 +6,7 @@
 
 本规范的人类可读说明与同目录的`handoff-contract.json`共同构成交接合同；其中JSON是字段、版本、执行器和事件必填项的唯一机器真源。当前合同版本为`MAK-HANDOFF-1.1`。三个Skill每次运行都从当前已安装的`manage-article-knowledge`读取该文件，不在各自目录复制第二份完整合同。
 
-`writing_request`、`writing_ready`、`writing_completed`、`faithfulness_request`、`faithfulness_completed`和`article_completed`都必须携带`handoff_contract_version`。接收方先校验版本和本事件必填字段，再执行任何落盘或状态迁移。缺少版本或版本不在`compatible_versions`中时，返回`handoff_error`，保留当前任务状态，不猜测字段、不自动降级到另一套流程：
+`writing_request`、`writing_ready`、`writing_completed`、`faithfulness_request`、`faithfulness_completed`和`article_completed`都必须携带`handoff_contract_version`。合同的`event_lifecycle`是终止语义真源：前五个事件都不是整条任务的成功终点，只有知识库导入审核结果并返回`article_completed`才算正常完成。接收方先校验版本和本事件必填字段，再执行任何落盘或状态迁移。缺少版本或版本不在`compatible_versions`中时，返回`handoff_error`，保留当前任务状态，不猜测字段、不自动降级到另一套流程：
 
 ```text
 handoff_event: handoff_error
@@ -35,22 +35,24 @@ next_action: 人工下一步，例如安装指定Skill或提供其目录绝对�
   → 知识库Skill返回 writing_ready，并提供当前30文件绝对路径
   → 写作Skill只读取当前30，执行本组原有写作流程
   → 写作Skill把终稿写入配置中的终稿入口，并返回终稿绝对路径
-  → 知识库Skill确定归属、补齐内部40的文章身份并创建50
+  → 知识库Skill确定归属、清理外部交付管理字段，以显式正文边界生成内部40并创建50
   → FaithfulnessSkill审核当前40和30并把三个核心结果写入专属目录
   → 知识库Skill导入结果、更新Claim和治理记录，发出article_completed，任务进入40_已完成
 ```
 
-正常链路中，写作人员和内容运营不需要分别说“先整理知识”“读取30”“现在可以写”“调用Faithfulness”或“导入结果”。这些是三个 Skill 之间的内部交接动作。写作 Skill可以在界面上只向人工报告最终文章；只有项目不明确、身份无法唯一匹配、路径/字段失效或需要业务决定时，才展示中间问题。
+正常链路中，写作人员和内容运营不需要分别说“先整理知识”“读取30”“现在可以写”“调用Faithfulness”或“导入结果”。这些是三个 Skill 之间的内部交接动作。当前Codex编排任务不得在`writing_completed`或`faithfulness_completed`后向人工宣告结束；它必须把事件交给下一接收方并继续，直到`article_completed`或明确的`needs_human/handoff_error`。只有项目不明确、身份无法唯一匹配、路径/字段失效或需要业务决定时，才展示中间问题。
 
-### 0.2 写作方与知识库方的执行边界
+运行中若发现Skill本体、脚本、模板或交接规则疑似缺陷，当前任务按“SKFB旁路”处理：先在项目反馈台账查重并记录复现、影响和临时处置，随后回到原阻塞节点继续；台账记录不会改变事件状态，也不是暂停或成功终点。不得为记录反馈而修改通用Skill或结束当前任务。只有合同规定的`needs_human`/`handoff_error`、真实工具或权限失败、事实冲突或缺少不可替代材料才可暂停；Skill修复必须作为另一个获得明确授权的维护任务执行。
 
-写作 Skill 只执行四类动作：保存本次写作需求记录、提交 `writing_request`、在收到 `writing_ready` 后读取当前 `30_本篇知识库资料.md` 并写作、返回终稿绝对路径。写作 Skill 不创建或更新知识库项目内的 `10/15/20/30/35/40/50`，不创建或修改正式 Claim，不更新知识库目录、运行账本或 Faithfulness 结果。
+### 0.1 写作方与知识库方的执行边界
+
+写作 Skill 只执行四类动作：保存本次写作需求记录、提交 `writing_request`、在收到 `writing_ready` 后读取当前 `30_本篇知识库资料.md` 并完整执行原写作流程、返回终稿绝对路径。它返回`writing_completed`后把控制权交回知识库，不直接执行后续维护。写作 Skill 不创建或更新知识库项目内的 `10/15/20/30/35/40/50`，不创建或修改正式 Claim，不更新知识库目录、运行账本或 Faithfulness 结果。
 
 知识库 Skill 独自执行检索、来源核验、正式 Claim 沉淀、文章前审核、`30/35` 生成与校验、终稿接收、Faithfulness 交接、结果导入和文章状态迁移。`writing_ready` 只有在以下顺序全部完成后才能发出：`15` 检索记录 → 合格正式 Claim 已写入 `03_正式知识` → `20` 文章前知识审核通过 → `30/35` 成对生成且校验通过。`20`未通过时，已沉淀Claim可保留为知识库资产，但不得生成可交付素材包。若任一步未完成，必须保持任务在当前阻塞状态，不得返回 `writing_ready`。
 
 本文件的第 4 节只定义写作 Skill 如何读取 `30`；第 2、3、5、6、7 节描述的是接入合同和知识库内部交接，写作 Skill 不执行其中的知识库维护动作。
 
-### 0.1 写作 Skill 发给知识库 Skill 的前置消息
+### 0.2 写作 Skill 发给知识库 Skill 的前置消息
 
 写作 Skill收到自然语言写作请求后，必须先在项目接入配置确认的写作任务入口中创建或更新本次写作需求记录，再提交以下结构化内容（字段名可保留英文，管理说明使用中文）。这一步是一次性接入改造后的固定运行规则，不要求人工每次重复发送Prompt；需求不得只存在于对话上下文，也不得等文章写完后补记。需求记录应写入项目接入配置确认的写作任务入口或其下属目录，不得写入已安装 Skill 源目录、Skill 的 references/scripts 目录或只读客户资料目录。需求记录可以复用该写作 Skill 原有的周计划、排期表、任务文件、任务日志或任务目录；如果原 Skill 没有可持久化入口，应在一次性接入改造时补上“写作任务入口下的需求记录文件/目录”规则，而不是把记录写进 Skill 安装目录。
 
@@ -101,7 +103,7 @@ resume_condition: 决定后从哪一步自动继续
 
 没有有效的`external_task_key`、`request_record_path`、`request_record_locator`、实际大纲或`outline_status: 已确认`时，写作 Skill不得提交`writing_request`；知识库也不得生成`10/15/20/30/35`。需求记录路径必须实际存在并指向已保存的文件；重复任务键发生标题、基本大纲、限制或原始写作要求等实质变化时，不得静默覆盖既有`10`，必须按文章版本归档合同更新后重新提交。收到`writing_ready`前同样不得开始正式文章生成。收到`needs_human`时只向人工展示该具体问题，不要求人工重复填写已经存在的项目配置。
 
-### 0.2 写作 Skill 返回知识库 Skill 的后置消息
+### 0.3 写作 Skill 返回知识库 Skill 的后置消息
 
 写作完成后，写作 Skill必须把终稿写入`final_delivery_target`，并返回：
 
@@ -111,13 +113,24 @@ handoff_contract_version: 与writing_ready相同的版本
 project_id: 项目ID
 article_id: 若写作Skill保留了知识库提供的ID则填写，否则留空
 article_version: 若写作Skill保留了版本则填写，否则留空
-final_path: 文章正文文件的终稿绝对路径（优先Markdown/TXT/HTML；仅有DOCX时填写DOCX文件）
-final_package_path: 可选，包含DOCX、TDK、图片和QA文件的交付包或ZIP绝对路径
+final_path: 文章交付包内文章正文文件的终稿绝对路径；若写作Skill按原流程生成DOCX交付包，必须填写文章DOCX，不能另建Markdown/TXT/HTML副本
+final_package_path: 可选，包含文章DOCX、TDK、图片和QA文件的交付文件夹或ZIP绝对路径
 title: 终稿标题
 completed_at: 完成时间
 ```
 
 `final_path`是必需字段；文章ID和版本不是写作方的硬性要求。知识库收到后按本文第5节的匹配顺序确定归属，并在内部`40_最终文章.md`中补齐文章ID、版本、完成日期和标题，然后自动进入Faithfulness交接。写作 Skill不得只回复“写好了”而不提供终稿绝对路径，也不得把`35`、正式知识或Faithfulness结果写回自己的文章目录。
+
+### 0.4 同一大纲重做的两种模式
+
+人工要求重做既有文章时，当前Codex必须从合同的`revision_modes`中选择且只能选择一种；不得把“重新整理知识”降级为只改文章，也不得因为最终仍复用旧Claim就声称没有重新检查：
+
+| 人工短提示词 | `revision_mode` | 知识库动作 | 写作动作 |
+|---|---|---|---|
+| `按原大纲重新整理知识并重写这篇文章：[文章ID或明确文章入口]` | `knowledge_refresh_and_rewrite` | 完整归档旧任务、递增版本、保留原大纲；重新执行六层检索、复杂资料处理、旧Claim逐条核验与重新归类，重建`15/20/30/35`并重新通过`writing_ready`门禁 | 收到新`writing_ready`后，使用新30完整执行原写作流程 |
+| `知识不变，只按原大纲重写这篇文章：[文章ID或明确文章入口]` | `article_rewrite_only` | 完整归档旧任务、递增版本；校验并复用当前`15/20/30/35`，清除旧终稿和旧Faithfulness当前状态 | 收到复用素材包的`writing_ready`后完整执行原写作流程 |
+
+两个模式都锁定当前已确认简要大纲。人工不需要填写Claim、目录、版本或脚本参数；知识库从当前任务身份和归档合同自动取得。若人工同时要求改变大纲，该请求不属于这两个快捷模式，必须先作为新的明确修订需求确认，不能把新大纲塞进任一快捷模式继续。重做请求必须携带`revision_mode`、`base_article_id`和`base_article_version`；具体条件与版本格式以当前`handoff-contract.json`为机器真源。既有任务无法唯一定位时返回人话错误并停止，禁止按标题相似度、最新文件或临时修改桥接代码继续。
 
 ## 1. 三方职责
 
@@ -141,7 +154,7 @@ Skill本体只安装一份；每个客户项目分别维护自己的接入配置
 4. Codex把自动识别结果、依据和校验结果写入唯一接入配置。三个入口可读取且识别规则可执行时，将`接入状态`改为`已确认`；
 5. 后续按配置自动运行。路径不存在、格式漂移、一个外部任务匹配多篇文章或终稿无法唯一确定归属时，停止对应对象，不影响其他文章，并将状态改为`异常，待重新确认`；只有这类自动识别失败才需要人工处理具体异常。
 
-新项目在写作项目尚未建立时，可以先完成知识库初始化。接入配置保持`待写作流程建立`，不虚构路径；写作项目出现第一份真实任务文件或终稿规则后再完成一次确认。
+新项目在写作项目尚未建立时，可以先完成知识库初始化。单项目流程的接入配置保持`待写作流程建立`，不虚构路径；写作项目出现第一份真实任务文件或终稿规则后再完成一次确认。批量工作区流程在人工授权后可建立空的默认入口并登记为`部分接入`，这不代表已有可校验样例，样例出现后按同一合同自动校验。
 
 ## 3. 写作任务怎样进入知识库
 
@@ -233,11 +246,15 @@ final_delivery_target: 配置中约定的终稿位置或回传方式
 
 ## 5. 终稿怎样回到知识库
 
+### 5.0 交付包与`final_path`的唯一关系
+
+如果写作 Skill 按原流程生成 DOCX 交付包，`final_path`必须是包内文章 DOCX 的绝对路径；交付文件夹或 ZIP 只能作为可选的`final_package_path`。不得为了交接另建根目录 Markdown/TXT/HTML 正文，也不得把文件夹作为`final_path`。只有原写作流程确实没有 DOCX 时，才使用实际生成的 Markdown/TXT/HTML 正文文件作为`final_path`。版本化重做不得覆盖旧交付包，应使用项目已确认的版本路径规则；未配置时在文件夹和文章正文文件名追加` - v<文章版本>`。
+
 当外部终稿没有文章ID、版本或完成日期时，写作Skill只需返回终稿绝对路径。知识库或
 `scripts/writing_bridge.py finalize`按已确认的任务键/文章ID唯一定位任务，保持原文件不动并生成带完整身份的
 内部`40_最终文章.md`；随后照常创建`50`并交给Faithfulness。找不到唯一任务时直接报告人工确认，不按标题、最新文件或目录顺序猜测。
 
-写作 Skill的终稿可以携带文章ID和文章版本，推荐写入文件元数据；但这不是硬性前提。写作方至少要返回文章正文文件的终稿绝对路径（或已确认的写作任务日志Output path）、完成日期、文章标题和最终正文。若同时生成DOCX/ZIP交付包，可另报`final_package_path`，但不得把文件夹或ZIP替代`final_path`。
+写作 Skill的终稿可以携带文章ID和文章版本，推荐写入文件元数据；但这不是硬性前提。写作方至少要返回文章正文文件的终稿绝对路径（DOCX交付包优先返回包内文章DOCX；只有原流程确实没有DOCX时才返回Markdown/TXT/HTML）、完成日期、文章标题和最终正文。若同时生成DOCX/ZIP交付包，可另报`final_package_path`，但不得把文件夹或ZIP替代`final_path`，也不得额外创建只用于交接的正文副本。
 
 知识库 Skill按配置的终稿入口检查新文件。身份匹配顺序固定为：
 
@@ -252,7 +269,7 @@ final_delivery_target: 配置中约定的终稿位置或回传方式
 
 ## 6. Faithfulness 的输入与输出
 
-知识库 Skill只调用当前知识库合同固定的`deepeval-article-audit`，并提交。调用前由当前Codex检查已安装Skill列表是否存在完全同名的`deepeval-article-audit`：
+知识库 Skill只调用当前知识库合同固定的`deepeval-article-audit`。调用前先用当前写作桥接器把外部终稿清理为内部`40_最终文章.md`：外部文章身份、关键词、TDK、图片清单、交付说明和审核管理文字保留在正文边界之外，图片本体不进入40；只有`<!-- ARTICLE_BODY_START -->`与`<!-- ARTICLE_BODY_END -->`之间的正文文字、列表和正文表格进入审核。正文边界缺失、重复或倒置时不得调用审核。随后由当前Codex检查已安装Skill列表是否存在完全同名的`deepeval-article-audit`：
 
 - 已发现：立即在当前任务中调用`$deepeval-article-audit`，把下面的`faithfulness_request`作为调用参数；不得先向人工报告“等待Faithfulness”。
 - 未发现：保持任务在`30_等待Faithfulness`，记录`faithfulness_skill_not_found`，并向人工显示：
@@ -292,7 +309,7 @@ faithfulness_summary.md
 
 prepared和judgments使用当前导入器支持的schema `1.0`；prepared必须能还原当前文章行、唯一`30`文件和其知识块；judgments必须含相同文章ID、`evaluation_mode`及唯一的文章原子事实`claim_id`，verdict只允许`supported`或`unsupported`。除非确由官方DeepEval运行，评价模式使用“DeepEval Faithfulness 规则复现（Codex 评审，非 DeepEval 官方运行）”。
 
-审核成功后，Faithfulness必须返回`handoff_event: faithfulness_completed`、请求中的同一`handoff_contract_version`以及`result_dir`、`article_id`和`article_version`。该事件只表示审核产物已生成并校验，不表示文章流程完成；知识库收到后必须继续导入并在进入`40_已完成`后返回同版本的`article_completed`。找不到`deepeval-article-audit`时返回`faithfulness_skill_not_found`并保持`30_等待Faithfulness`，不得静默切换为未确认的外部流程。`faithfulness_request`是当前Codex调用审核Skill的内部事件，不是给内容运营执行的任务；只有收到`faithfulness_completed`后才继续导入并返回`article_completed`。
+审核成功后，Faithfulness必须返回`handoff_event: faithfulness_completed`、请求中的同一`handoff_contract_version`以及`result_dir`、`article_id`和`article_version`。该事件只表示审核产物已生成并校验，不表示文章流程完成；当前Codex不得在这里输出最终完成回复，知识库收到后必须继续导入并在进入`40_已完成`后返回同版本的`article_completed`。找不到`deepeval-article-audit`时返回`faithfulness_skill_not_found`并保持`30_等待Faithfulness`，不得静默切换为未确认的外部流程。`faithfulness_request`是当前Codex调用审核Skill的内部事件，不是给内容运营执行的任务；只有收到`faithfulness_completed`后才继续导入并返回`article_completed`。
 
 详细字段、哈希、计数和unsupported归组必须遵守当前受管导入器的校验；本交接文件不能放宽任何导入门禁。
 

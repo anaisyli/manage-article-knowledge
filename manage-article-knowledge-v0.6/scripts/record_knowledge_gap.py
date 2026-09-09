@@ -21,6 +21,22 @@ STATUSES = {"观察中", "待外部调研", "已解决", "已关闭"}
 CHINESE_TEXT_FIELDS = ("topic", "current_impact", "next_action")
 
 
+def normalized_topic(value: str) -> str:
+    """Return a stable comparison key for the same human-readable knowledge question."""
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", value.casefold())
+
+
+def topic_specificity(value: str) -> None:
+    """Reject labels that cannot tell an operator what knowledge is missing."""
+    text = " ".join(value.split())
+    if len(text) < 10:
+        raise SystemExit("--topic 必须写成具体知识问题，至少说明对象和缺少的规则/事实")
+    if re.search(r"(?:通用说明|相关说明|知识说明|内容说明|待补充)$", text):
+        raise SystemExit(
+            "--topic 不能使用笼统的‘通用说明/相关说明’结尾；请写明对象、条件、步骤或适用边界"
+        )
+
+
 def require_human_chinese(value: str, field: str) -> None:
     """管理字段必须包含中文人话，不能把英文命题直接写入人工表。"""
     if not value.strip():
@@ -53,6 +69,37 @@ def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
 
 def normalized_article_ids(value: str) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in value.split(";") if item.strip()))
+
+
+def merge_duplicate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Canonicalize legacy duplicate public-gap rows before the next write."""
+    merged: dict[str, dict[str, str]] = {}
+    status_rank = {"已关闭": 0, "已解决": 1, "观察中": 2, "待外部调研": 3}
+    for row in rows:
+        topic_key = normalized_topic(row.get("gap_topic", "")) or row.get("gap_key", "")
+        current = merged.get(topic_key)
+        if current is None:
+            current = dict(row)
+            merged[topic_key] = current
+            continue
+        ids = normalized_article_ids(current.get("article_ids", "") + ";" + row.get("article_ids", ""))
+        current["article_ids"] = ";".join(ids)
+        current["article_count"] = str(len(ids))
+        if status_rank.get(row.get("status", ""), 0) > status_rank.get(current.get("status", ""), 0):
+            current["status"] = row.get("status", "")
+        if row.get("first_seen", "") and (not current.get("first_seen") or row["first_seen"] < current["first_seen"]):
+            current["first_seen"] = row["first_seen"]
+        if row.get("last_seen", "") > current.get("last_seen", ""):
+            current["last_seen"] = row["last_seen"]
+        refs = list(dict.fromkeys(
+            [item.strip() for item in (current.get("related_governance_ref", "") + ";" + row.get("related_governance_ref", "")).split(";") if item.strip() and item.strip() != "无"]
+        ))
+        current["related_governance_ref"] = ";".join(refs) if refs else "无"
+        if len(row.get("gap_topic", "")) > len(current.get("gap_topic", "")):
+            current["gap_topic"] = row["gap_topic"]
+        if len(ids) >= 2 and current.get("trigger_basis") == "首篇普通缺口":
+            current["trigger_basis"] = "重复文章"
+    return list(merged.values())
 
 
 def lifecycle_status(previous: str, trigger_basis: str, article_count: int) -> str:
@@ -103,17 +150,30 @@ def main() -> None:
     if not args.topic.strip():
         raise SystemExit("--topic must be non-empty")
     require_human_chinese(args.topic, "topic")
+    topic_specificity(args.topic)
     require_human_chinese(args.current_impact, "current_impact")
     if args.next_action.strip():
         require_human_chinese(args.next_action, "next_action")
 
-    rows = read_rows(args.csv)
-    existing = next((row for row in rows if row["gap_key"] == args.gap_key.strip()), None)
+    rows = merge_duplicate_rows(read_rows(args.csv))
+    requested_key = args.gap_key.strip()
+    existing = next((row for row in rows if row["gap_key"] == requested_key), None)
+    merged_key = ""
+    if existing is None:
+        # A writer may invent a new key for the same public problem on another
+        # article. Reuse the first stable row when the human topic is identical.
+        topic_key = normalized_topic(args.topic)
+        existing = next(
+            (row for row in rows if normalized_topic(row.get("gap_topic", "")) == topic_key),
+            None,
+        )
+        if existing is not None:
+            merged_key = existing["gap_key"]
     if existing is None:
         article_ids = [args.article_id.strip()]
         status = args.set_status or lifecycle_status("", args.trigger_basis, len(article_ids))
         row = {
-            "gap_key": args.gap_key.strip(),
+            "gap_key": requested_key,
             "gap_topic": args.topic.strip(),
             "gap_type": "公共知识",
             "trigger_basis": args.trigger_basis,
@@ -136,8 +196,11 @@ def main() -> None:
         if article_count >= 2 and basis == "首篇普通缺口":
             basis = "重复文章"
         status = args.set_status or lifecycle_status(existing["status"], basis, article_count)
+        old_topic = existing.get("gap_topic", "").strip()
+        # Prefer a more descriptive wording while preserving the stable key.
+        preferred_topic = args.topic.strip() if len(args.topic.strip()) > len(old_topic) else old_topic
         existing.update({
-            "gap_topic": args.topic.strip(),
+            "gap_topic": preferred_topic,
             "trigger_basis": basis,
             "article_ids": ";".join(article_ids),
             "article_count": str(article_count),
@@ -150,6 +213,8 @@ def main() -> None:
         row = existing
     write_rows(args.csv, rows)
     print(f"gap_key={row['gap_key']}")
+    if merged_key:
+        print(f"merged_existing_gap_key={merged_key}")
     print(f"article_count={row['article_count']}")
     print(f"status={row['status']}")
 

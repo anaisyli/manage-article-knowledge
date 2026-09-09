@@ -10,8 +10,16 @@ from pathlib import Path
 from typing import Any
 
 
-TEMPLATE_VERSION = "v0.6-20260904.5"
+TEMPLATE_VERSION = "v0.6-20260907.1"
 ARTICLE_AUDIT_TEMPLATE_VERSION = TEMPLATE_VERSION
+ARTICLE_BODY_START = "<!-- ARTICLE_BODY_START -->"
+ARTICLE_BODY_END = "<!-- ARTICLE_BODY_END -->"
+REVISION_MODES = {"new_article", "knowledge_refresh_and_rewrite", "article_rewrite_only"}
+CLAIM_RECHECK_HEADER = (
+    "旧Claim ID", "旧版本归档入口", "重新核对来源与位置", "当前证据结论",
+    "当前归类模块", "处置", "依据",
+)
+REVISION_REVIEW_HEADER = ("复核项", "15记录入口", "审核结论", "阻塞或排除")
 
 COMPLEX_MATERIAL_HEADER = (
     "资料ID", "文件名与稳定路径", "未索引内容/处理原因", "与本篇关系判断",
@@ -25,24 +33,26 @@ COMPLEX_MATERIAL_STATES = {
     "已处理并核对", "已检查不相关", "等待材料或工具", "待知识库专员判断", "不适用",
 }
 BLOCKING_COMPLEX_MATERIAL_STATES = {"等待材料或工具", "待知识库专员判断"}
+CUS_DETECTION_CATEGORIES = ("客户能力", "规格", "认证", "案例", "商业条件", "公开授权")
 
 CONTRACTS: dict[str, dict[str, Any]] = {
     "10_文章知识需求.md": {
         "title": "# 文章知识需求",
         "version_field": "模板版本",
-        "fields": ("文章ID", "当前版本", "模板版本", "交接合同版本", "标题", "关键词", "目标语言", "特殊限制", "大纲状态", "原始写作请求", "产品或内容对象", "选题方向", "原始写作要求", "当前状态", "写作Skill"),
+        "fields": ("文章ID", "当前版本", "模板版本", "交接合同版本", "标题", "关键词", "目标语言", "特殊限制", "大纲状态", "原始写作请求", "产品或内容对象", "选题方向", "原始写作要求", "当前状态", "写作Skill", "任务模式", "基线文章版本", "旧版本归档入口"),
         "headings": ("## 外部写作任务接入", "## 大纲", "## 随文章提交文件分类"),
         "tables": {"## 随文章提交文件分类": ("文件名", "原始路径", "SHA-256", "文件性质", "使用范围", "处理结果")},
     },
     "15_检索与知识准备记录.md": {
         "title": "# 检索与知识准备记录",
         "version_field": "模板版本",
-        "fields": ("文章ID", "文章版本", "模板版本", "最近更新", "MAT依赖处理"),
-        "headings": ("## 固定检索层状态", "## 来源命中记录", "## 候选事实处置明细", "## 大纲逐项检索与候选事实覆盖", "## MAT依赖与资料选择", "## 复杂资料处理与原件核对"),
+        "fields": ("文章ID", "文章版本", "模板版本", "最近更新", "MAT依赖处理", "知识准备模式", "基线文章版本"),
+        "headings": ("## 固定检索层状态", "## 来源命中记录", "## 候选事实处置明细", "## 旧Claim重新核验", "## 大纲逐项检索与候选事实覆盖", "## MAT依赖与资料选择", "## 复杂资料处理与原件核对"),
         "tables": {
             "## 固定检索层状态": ("检索层", "当前状态", "结果或未查原因", "下一步"),
             "## 来源命中记录": ("知识问题", "命中Claim/资料名称与入口", "相关理由", "处理结果"),
             "## 候选事实处置明细": ("候选事实ID", "独立事实摘要", "来源与精确位置", "处置结果", "Formal Claim或排除/治理入口"),
+            "## 旧Claim重新核验": CLAIM_RECHECK_HEADER,
             "## 大纲逐项检索与候选事实覆盖": ("大纲章节", "六层检索范围与结果", "命中来源与精确入口", "候选事实ID", "候选事实数", "已沉淀Claim数", "未采用事实/缺口及原因", "下一步"),
             "## MAT依赖与资料选择": ("MAT ID", "候选SRC ID", "文件名与稳定路径", "关系/处理问题", "决定", "选取或排除范围", "决定依据", "决定方", "当前状态"),
             "## 复杂资料处理与原件核对": COMPLEX_MATERIAL_HEADER,
@@ -51,9 +61,10 @@ CONTRACTS: dict[str, dict[str, Any]] = {
     "20_文章前知识审核.md": {
         "title": "# 文章前知识审核",
         "version_field": "审核模板版本",
-        "fields": ("文章ID", "文章版本", "审核模板版本", "审核日期", "结论", "可用Claim数", "客户来源", "外部来源", "明确排除", "未解决但不阻塞事项", "计划写作素材", "计划写作素材来源索引"),
-        "headings": ("## 大纲知识覆盖检查", "## 知识准备充分性复核", "## 复杂资料与原件核对复核", "## CUS / ANM检测结果"),
+        "fields": ("文章ID", "文章版本", "审核模板版本", "审核日期", "结论", "可用Claim数", "客户来源", "外部来源", "明确排除", "未解决但不阻塞事项", "计划写作素材", "计划写作素材来源索引", "知识准备模式", "基线文章版本"),
+        "headings": ("## 重做检索复核", "## 大纲知识覆盖检查", "## 知识准备充分性复核", "## 复杂资料与原件核对复核", "## CUS / ANM检测结果"),
         "tables": {
+            "## 重做检索复核": REVISION_REVIEW_HEADER,
             "## 大纲知识覆盖检查": ("大纲章节", "知识问题", "覆盖状态", "已有证据/Claim", "缺口或治理事项", "本篇处理"),
             "## 知识准备充分性复核": ("大纲章节", "候选事实数", "已沉淀Claim数", "计划纳入30的事实块数", "覆盖结论", "未采用事实/缺口及入口"),
             "## 复杂资料与原件核对复核": COMPLEX_MATERIAL_REVIEW_HEADER,
@@ -258,7 +269,28 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
             errors.append("## 大纲必须保留非空的简要大纲")
         if parse_field(text, "大纲状态") != "已确认":
             errors.append("必须记录：大纲状态：已确认")
+        mode = parse_field(text, "任务模式")
+        if mode not in REVISION_MODES:
+            errors.append(f"任务模式无效：{mode}")
+        base_version = parse_field(text, "基线文章版本")
+        archive_entry = parse_field(text, "旧版本归档入口")
+        if mode == "new_article":
+            if base_version != "不适用" or archive_entry != "不适用":
+                errors.append("新文章的基线文章版本和旧版本归档入口必须为“不适用”")
+        elif mode in {"knowledge_refresh_and_rewrite", "article_rewrite_only"}:
+            if not re.fullmatch(r"v[1-9]\d*", base_version):
+                errors.append("重做任务的基线文章版本必须使用vN")
+            if not archive_entry or archive_entry == "不适用":
+                errors.append("重做任务必须记录真实旧版本归档入口")
     elif path.name == "15_检索与知识准备记录.md":
+        knowledge_mode = parse_field(text, "知识准备模式")
+        base_version = parse_field(text, "基线文章版本")
+        if knowledge_mode not in {"new_article", "knowledge_refresh_and_rewrite"}:
+            errors.append(f"知识准备模式无效：{knowledge_mode}")
+        elif knowledge_mode == "new_article" and base_version != "不适用":
+            errors.append("新文章知识准备的基线文章版本必须为“不适用”")
+        elif knowledge_mode == "knowledge_refresh_and_rewrite" and not re.fullmatch(r"v[1-9]\d*", base_version):
+            errors.append("知识重整的基线文章版本必须使用vN")
         candidate_details = table_rows(text, "## 候选事实处置明细")
         candidate_ids: set[str] = set()
         candidate_claims: dict[str, str] = {}
@@ -329,6 +361,19 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
                 errors.append(f"{chapter or '未命名章节'}存在未沉淀候选事实，但没有逐项记录未采用原因或缺口入口")
         errors.extend(validate_complex_material_rows(complex_material_rows(text)))
     elif path.name == "20_文章前知识审核.md":
+        knowledge_mode = parse_field(text, "知识准备模式")
+        base_version = parse_field(text, "基线文章版本")
+        if knowledge_mode not in {"new_article", "knowledge_refresh_and_rewrite"}:
+            errors.append(f"知识准备模式无效：{knowledge_mode}")
+        elif knowledge_mode == "new_article" and base_version != "不适用":
+            errors.append("新文章审核的基线文章版本必须为“不适用”")
+        elif knowledge_mode == "knowledge_refresh_and_rewrite" and not re.fullmatch(r"v[1-9]\d*", base_version):
+            errors.append("知识重整审核的基线文章版本必须使用vN")
+        revision_rows = table_rows(text, "## 重做检索复核")
+        required_revision_checks = {"六层重新检索", "旧Claim逐条复核", "Claim重新归类", "30/35重新生成"}
+        actual_revision_checks = {row[0].strip() for row in revision_rows if row}
+        for check in sorted(required_revision_checks - actual_revision_checks):
+            errors.append(f"重做检索复核缺少“{check}”固定行")
         coverage = table_rows(text, "## 大纲知识覆盖检查")
         sufficiency = table_rows(text, "## 知识准备充分性复核")
         complex_review = table_rows(text, "## 复杂资料与原件核对复核")
@@ -408,6 +453,10 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
             if len(row) >= 2 and row[0] in {"CUS候选检测", "ANM异常检测"}:
                 if not row[1] or row[1] in {"已检查", "无异常", "无"}:
                     errors.append(f"{row[0]}必须填写实际检查信号与来源")
+                if row[0] == "CUS候选检测":
+                    missing = [category for category in CUS_DETECTION_CATEGORIES if category not in row[1]]
+                    if missing:
+                        errors.append(f"CUS候选检测缺少固定类别：{'、'.join(missing)}")
     elif path.name == "30_本篇知识库资料.md":
         facts = section_body(text, "## 一、可直接用于正文的事实")
         if facts.strip() not in {"", "无"} and not re.search(r"证据正文", facts):
@@ -418,6 +467,13 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
     elif path.name == "35_写作素材来源索引.md":
         if not table_rows(text, "## 写作素材到正式知识映射"):
             errors.append("写作素材到正式知识映射必须至少有一条映射记录")
+    elif path.name == "40_最终文章.md":
+        if text.count(ARTICLE_BODY_START) != 1 or text.count(ARTICLE_BODY_END) != 1:
+            errors.append("最终文章必须且只能包含一组显式正文边界")
+        elif text.index(ARTICLE_BODY_START) >= text.index(ARTICLE_BODY_END):
+            errors.append("最终文章正文边界顺序无效")
+        elif not text.split(ARTICLE_BODY_START, 1)[1].split(ARTICLE_BODY_END, 1)[0].strip():
+            errors.append("最终文章正文边界内不得为空")
     elif (contract_name or path.name) == "50_文章知识使用与Faithfulness记录.md":
         status = parse_field(text, "当前状态")
         if status and not status.startswith("等待") and "等待结果" in text:
@@ -435,7 +491,8 @@ def validate_task_templates(task_dir: Path) -> list[str]:
     retrieval = task_dir / "15_检索与知识准备记录.md"
     audit = task_dir / "20_文章前知识审核.md"
     if request.is_file():
-        requested = outline_labels(request.read_text(encoding="utf-8-sig"))
+        request_text = request.read_text(encoding="utf-8-sig")
+        requested = outline_labels(request_text)
         expected = ["标题", "主问题", *requested]
         checks = (
             (retrieval, "## 大纲逐项检索与候选事实覆盖", "15_检索与知识准备记录.md"),
@@ -491,6 +548,52 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                     continue
                 if review_by_source[source_id][2].strip() != row[8].strip():
                     errors.append(f"15与20的复杂资料最终状态不一致：{source_id}")
+        mode = parse_field(request_text, "任务模式") or "new_article"
+        if mode == "knowledge_refresh_and_rewrite":
+            base_version = parse_field(request_text, "基线文章版本")
+            archive_entry = parse_field(request_text, "旧版本归档入口")
+            for path, filename in ((retrieval, "15_检索与知识准备记录.md"), (audit, "20_文章前知识审核.md")):
+                if not path.is_file():
+                    continue
+                content = path.read_text(encoding="utf-8-sig")
+                if parse_field(content, "知识准备模式") != mode:
+                    errors.append(f"{filename}：知识准备模式必须为{mode}")
+                if parse_field(content, "基线文章版本") != base_version:
+                    errors.append(f"{filename}：基线文章版本必须与10一致")
+            if retrieval.is_file():
+                retrieval_text = retrieval.read_text(encoding="utf-8-sig")
+                if table_header(retrieval_text, "## 旧Claim重新核验") != CLAIM_RECHECK_HEADER:
+                    errors.append("15_检索与知识准备记录.md：旧Claim重新核验固定表头不符")
+                claim_rows = table_rows(retrieval_text, "## 旧Claim重新核验")
+                if not claim_rows:
+                    errors.append("15_检索与知识准备记录.md：旧Claim重新核验必须至少有一行真实记录")
+                old_claims: set[str] = set()
+                if archive_entry and archive_entry != "不适用":
+                    archive = task_dir.parents[2] / Path(archive_entry)
+                    old_source_index = archive / "35_写作素材来源索引.md"
+                    if not old_source_index.is_file():
+                        errors.append("15_检索与知识准备记录.md：旧版本归档缺少35，无法证明旧Claim已重新核验")
+                    else:
+                        old_claims = set(re.findall(r"\bCLM-[A-Za-z0-9-]+\b", old_source_index.read_text(encoding="utf-8-sig")))
+                recorded_claims = {row[0].strip() for row in claim_rows if row and row[0].strip() != "无"}
+                missing_claims = sorted(old_claims - recorded_claims)
+                if missing_claims:
+                    errors.append("15_检索与知识准备记录.md：旧Claim重新核验遗漏：" + "、".join(missing_claims))
+                for row in claim_rows:
+                    if len(row) < len(CLAIM_RECHECK_HEADER):
+                        errors.append("15_检索与知识准备记录.md：旧Claim重新核验存在列数不足的数据行")
+                        continue
+                    if row[0].strip() != "无" and any(not cell.strip() for cell in row[:len(CLAIM_RECHECK_HEADER)]):
+                        errors.append(f"15_检索与知识准备记录.md：{row[0] or '未编号旧Claim'}重新核验记录不完整")
+            if audit.is_file():
+                audit_text = audit.read_text(encoding="utf-8-sig")
+                if table_header(audit_text, "## 重做检索复核") != REVISION_REVIEW_HEADER:
+                    errors.append("20_文章前知识审核.md：重做检索复核固定表头不符")
+                rows = table_rows(audit_text, "## 重做检索复核")
+                required_checks = {"六层重新检索", "旧Claim逐条复核", "Claim重新归类", "30/35重新生成"}
+                actual_checks = {row[0].strip() for row in rows if row}
+                for check in sorted(required_checks - actual_checks):
+                    errors.append(f"20_文章前知识审核.md：重做检索复核缺少“{check}”")
         material = task_dir / "30_本篇知识库资料.md"
         if material.is_file():
             outline_rows = table_rows(
@@ -526,6 +629,10 @@ def self_test() -> None:
                 value = TEMPLATE_VERSION if field == contract["version_field"] else "测试值"
                 if field == "大纲状态":
                     value = "已确认"
+                elif field in {"任务模式", "知识准备模式"}:
+                    value = "new_article"
+                elif field in {"基线文章版本", "旧版本归档入口"}:
+                    value = "不适用"
                 lines.append(f"- {field}：{value}")
             for heading in contract["headings"]:
                 lines.extend(["", heading, ""])
@@ -538,6 +645,10 @@ def self_test() -> None:
                         values = ["标题", "标题成立需要哪些事实", "已覆盖", "CLM-DEMO-001", "无", "使用"]
                     elif heading == "## 候选事实处置明细":
                         values = ["CF-001", "测试独立事实", "测试来源第1段", "已沉淀Formal Claim", "CLM-DEMO-001"]
+                    elif heading == "## 旧Claim重新核验":
+                        values = ["无", "不适用", "不适用", "不适用", "不适用", "不适用", "新文章无旧Claim"]
+                    elif heading == "## 重做检索复核":
+                        values = ["六层重新检索", "不适用", "新文章不适用", "无"]
                     elif heading == "## 大纲逐项检索与候选事实覆盖":
                         values = ["标题", "已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研", "测试来源第1段", "CF-001", "1", "1", "无", "纳入30"]
                     elif heading == "## 知识准备充分性复核":
@@ -547,7 +658,7 @@ def self_test() -> None:
                     elif heading == "## 复杂资料与原件核对复核":
                         values = ["无", "15：复杂资料处理与原件核对", "不适用", "无复杂资料不影响Claim", "本篇无可能相关复杂资料，复核通过"]
                     elif heading == "## CUS / ANM检测结果":
-                        values = ["CUS候选检测", "已核对客户事实、正式Claim和来源范围", "未触发", "无", "无需处理"]
+                        values = ["CUS候选检测", "已核对客户能力、规格、认证、案例、商业条件、公开授权，以及Formal Claim和来源范围", "未触发", "无", "无需处理"]
                     lines.append("| " + " | ".join(values) + " |")
                     if heading == "## CUS / ANM检测结果":
                         lines.append("| ANM异常检测 | 已核对版本、定位、提取、数值、单位和外推信号 | 未触发 | 无 | 无需处理 |")
@@ -559,8 +670,14 @@ def self_test() -> None:
                     elif heading == "## 知识准备充分性复核":
                         lines.append("| 主问题 | 1 | 1 | 1 | 充分 | 无 |")
                         lines.append("| 测试主题与主要问题 | 1 | 1 | 1 | 充分 | 无 |")
+                    elif heading == "## 重做检索复核":
+                        lines.append("| 旧Claim逐条复核 | 不适用 | 新文章不适用 | 无 |")
+                        lines.append("| Claim重新归类 | 不适用 | 新文章不适用 | 无 |")
+                        lines.append("| 30/35重新生成 | 不适用 | 新文章不适用 | 无 |")
                 elif heading == "## 大纲":
                     lines.append("- 测试主题与主要问题")
+                elif heading == "## 最终正文":
+                    lines.extend([ARTICLE_BODY_START, "测试正文。", ARTICLE_BODY_END])
             path = root / name
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             assert not validate_file(path), (name, validate_file(path))

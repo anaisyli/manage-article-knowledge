@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import sys
 from datetime import datetime
@@ -15,6 +16,10 @@ from check_integration import faithfulness_result_dir, project_id_for_root
 from handoff_contract import HandoffContractError, load_contract, validate_event, validate_version
 from template_contract import TEMPLATE_VERSION
 from update_integration_status import update as update_integration_status
+
+
+class FaithfulnessSkillUnavailable(SystemExit):
+    """The final was accepted, but the configured audit executor is unavailable."""
 
 
 def read_text(path: Path) -> str:
@@ -43,6 +48,49 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def declared_skill_name(skill_root: Path) -> str:
+    skill_file = skill_root / "SKILL.md"
+    if not skill_file.is_file():
+        return ""
+    match = re.search(r"^name:\s*([^\r\n]+)$", read_text(skill_file), re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def resolve_faithfulness_skill(explicit: Path | None = None) -> Path | None:
+    name = "deepeval-article-audit"
+    if explicit:
+        root = explicit.expanduser().resolve()
+        if declared_skill_name(root) != name:
+            raise ValueError(f"指定目录不是{name} Skill：{root}")
+        return root
+    candidates: list[Path] = []
+    configured_home = os.environ.get("CODEX_HOME", "").strip()
+    if configured_home:
+        candidates.append(Path(configured_home) / "skills" / name)
+    home = Path.home()
+    candidates.extend((home / ".codex" / "skills" / name, home / ".agents" / "skills" / name))
+    for root in candidates:
+        if declared_skill_name(root) == name:
+            return root.resolve()
+    return None
+
+
+def faithfulness_handoff_lines(skill_root: Path | None) -> list[str]:
+    if skill_root:
+        return [
+            "handoff_event=faithfulness_request",
+            f"faithfulness_skill_path={skill_root}",
+            "next_action=invoke_installed_skill_now",
+        ]
+    return [
+        "handoff_event=handoff_error",
+        "error_code=faithfulness_skill_not_found",
+        "blocked_step=faithfulness_request",
+        "human_message=当前未安装 deepeval-article-audit Skill，无法继续本篇文章的 Faithfulness 审核。",
+        "next_action=请安装该 Skill，或提供其所在目录的绝对路径；任务已保留在30_等待Faithfulness，当前没有审核结论。",
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--article", type=Path, required=True)
@@ -52,6 +100,11 @@ def main() -> None:
     parser.add_argument("--result-dir", type=Path)
     parser.add_argument("--integration-config", type=Path)
     parser.add_argument("--handoff-contract-version", required=True)
+    parser.add_argument(
+        "--faithfulness-skill-path",
+        type=Path,
+        help="仅在Skill未安装到标准目录时显式提供；不会写入通用合同",
+    )
     args = parser.parse_args()
 
     try:
@@ -122,6 +175,10 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
     result_root = args.result_dir.resolve().parents[2]
     faithfulness_skill = str(contract["faithfulness_executor"]["skill_name"])
+    try:
+        faithfulness_skill_root = resolve_faithfulness_skill(args.faithfulness_skill_path)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     request_payload = {
         "handoff_event": "faithfulness_request",
         "handoff_contract_version": contract_version,
@@ -236,19 +293,36 @@ def main() -> None:
     print("status=等待Faithfulness结果")
     print(f"task={transitioned}")
     print(f"receipt={transitioned / args.receipt.name}")
-    print("handoff_event=faithfulness_request")
     print(f"faithfulness_skill={faithfulness_skill}")
-    print("next_action=invoke_installed_skill_or_show_install_prompt")
+    for line in faithfulness_handoff_lines(faithfulness_skill_root):
+        print(line)
     print(f"article_file={transitioned / args.article.name}")
     print(f"knowledge_file={transitioned / args.knowledge[0].name}")
     print(f"project_id={project_id}")
     print(f"result_root={result_root}")
     print(f"result_dir={args.result_dir.resolve()}")
+    if not faithfulness_skill_root:
+        update_integration_status(
+            project_root,
+            "faithfulness_import_failure",
+            article_id=article_id,
+            article_version=article_version,
+            error="faithfulness_skill_not_found",
+            detail="任务保留在30_等待Faithfulness；等待安装或指定审核Skill目录",
+        )
+        raise FaithfulnessSkillUnavailable(
+            "当前未安装 deepeval-article-audit Skill，无法继续本篇文章的Faithfulness审核；"
+            "请安装该Skill或使用--faithfulness-skill-path指定目录。"
+        )
 
 
 if __name__ == "__main__":
     try:
         main()
+    except FaithfulnessSkillUnavailable:
+        # The final article has already been accepted and the task is safely
+        # waiting for the missing audit Skill; do not relabel it as a final failure.
+        raise
     except SystemExit as exc:
         # Best-effort failure telemetry; never hide the original CLI error.
         try:

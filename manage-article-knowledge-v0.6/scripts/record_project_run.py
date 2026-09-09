@@ -79,9 +79,12 @@ def infer_project_id(project_root: Path) -> str:
     return project_root.name.split("_", 1)[0]
 
 
-def current_skill() -> dict:
-    skill_file = Path(__file__).resolve().parent.parent / "SKILL.md"
+def current_skill(skill_file: Path | None = None) -> dict:
+    skill_file = skill_file or Path(__file__).resolve().parent.parent / "SKILL.md"
+    skill_text = skill_file.read_text(encoding="utf-8-sig", errors="replace") if skill_file.is_file() else ""
     version_match = re.search(r"-v(\d+(?:\.\d+)*)$", skill_file.parent.name)
+    if not version_match:
+        version_match = re.search(r"(?im)^# .*?\bv(\d+(?:\.\d+)*)\b", skill_text)
     return {
         "name": "manage-article-knowledge",
         "version": f"v{version_match.group(1)}" if version_match else None,

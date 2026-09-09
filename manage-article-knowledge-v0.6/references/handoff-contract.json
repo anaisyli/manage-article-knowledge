@@ -8,6 +8,39 @@
     "skill_name": "deepeval-article-audit",
     "mode": "manage-article-knowledge-v0.6"
   },
+  "event_lifecycle": {
+    "non_terminal_events": [
+      "writing_request",
+      "writing_ready",
+      "writing_completed",
+      "faithfulness_request",
+      "faithfulness_completed"
+    ],
+    "success_terminal_event": "article_completed",
+    "pause_events": [
+      "handoff_error",
+      "needs_human"
+    ]
+  },
+  "revision_modes": {
+    "new_article": {
+      "knowledge_refresh_required": true,
+      "reuse_current_knowledge_package": false,
+      "requires_base_article": false
+    },
+    "knowledge_refresh_and_rewrite": {
+      "knowledge_refresh_required": true,
+      "reuse_current_knowledge_package": false,
+      "requires_base_article": true,
+      "base_article_version_pattern": "^v[1-9]\\d*$"
+    },
+    "article_rewrite_only": {
+      "knowledge_refresh_required": false,
+      "reuse_current_knowledge_package": true,
+      "requires_base_article": true,
+      "base_article_version_pattern": "^v[1-9]\\d*$"
+    }
+  },
   "events": {
     "writing_request": {
       "sender": "writing_skill",
@@ -31,6 +64,11 @@
         "original_writing_requirements",
         "current_status",
         "writing_skill"
+      ],
+      "optional_fields": [
+        "revision_mode",
+        "base_article_id",
+        "base_article_version"
       ]
     },
     "writing_ready": {

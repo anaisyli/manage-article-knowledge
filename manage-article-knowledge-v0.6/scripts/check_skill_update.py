@@ -36,10 +36,13 @@ def parse_field(text: str, label: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def current_skill() -> tuple[str, str]:
-    version_match = re.search(r"-v(\d+(?:\.\d+)*)$", SKILL_PATH.parent.name)
+def current_skill(skill_path: Path = SKILL_PATH) -> tuple[str, str]:
+    text = read_text(skill_path)
+    version_match = re.search(r"-v(\d+(?:\.\d+)*)$", skill_path.parent.name)
+    if not version_match:
+        version_match = re.search(r"(?im)^# .*?\bv(\d+(?:\.\d+)*)\b", text)
     version = f"v{version_match.group(1)}" if version_match else "unknown"
-    return version, sha256_file(SKILL_PATH)
+    return version, sha256_file(skill_path)
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -183,6 +186,15 @@ def check_project(project: Path) -> dict[str, object]:
 
 def run_self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="v05-skill-update-test-") as temp:
+        direct_skill = Path(temp) / "manage-article-knowledge" / "SKILL.md"
+        direct_skill.parent.mkdir(parents=True)
+        direct_skill.write_text(
+            "---\nname: manage-article-knowledge\n---\n\n# 企业文章知识库管理 v0.6\n",
+            encoding="utf-8",
+        )
+        if current_skill(direct_skill)[0] != "v0.6":
+            print(json.dumps({"ok": False, "stage": "direct-root-version"}, ensure_ascii=False))
+            return 1
         project = Path(temp) / "DEMO-001_测试知识库_v0.6"
         version_entry = project / VERSION_ENTRY_RELATIVE
         feedback = project / FEEDBACK_RELATIVE
