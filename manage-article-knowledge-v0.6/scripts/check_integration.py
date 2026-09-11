@@ -10,6 +10,8 @@ import tempfile
 import csv
 from pathlib import Path
 
+from update_integration_status import update as update_integration_status
+
 
 CONFIG_RELATIVE = Path("01_工作台/40_写作与Faithfulness接入配置.md")
 ALLOWED_STATES = {"待写作流程建立", "部分接入", "已确认", "异常，待重新确认"}
@@ -294,6 +296,13 @@ def self_test() -> None:
         result = validate(config)
         if result["status"] != "valid":
             raise SystemExit(f"self-test failed: {result}")
+        config.write_text(read_text(config).replace("- 接入状态：已确认", "- 接入状态：异常，待重新确认"), encoding="utf-8")
+        result = validate(config)
+        if result["status"] != "valid":
+            raise SystemExit(f"self-test failed: legacy abnormal state should validate: {result}")
+        update_integration_status(config.parents[1], "integration_check_success", at="2026-09-03T10:00:00+08:00")
+        if "- 接入状态：已确认" not in read_text(config):
+            raise SystemExit("self-test failed: successful check should restore valid state")
     print("self-test=passed")
 
 
@@ -315,6 +324,8 @@ def main() -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result["status"] != "valid":
         raise SystemExit(1)
+    if args.project and result["status"] == "valid":
+        update_integration_status(args.project.resolve(), "integration_check_success")
 
 
 if __name__ == "__main__":

@@ -95,7 +95,7 @@ def make_record(
 def append_record(project_root: Path, record: dict) -> Path:
     project_root = project_root.expanduser().resolve()
     if not project_root.is_dir():
-        raise FileNotFoundError(f"项目根目录不存在：{project_root}")
+        raise FileNotFoundError(f"Obsidian项目路径不存在：{project_root}")
     ledger = project_root / LEDGER_RELATIVE
     line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     with locked_append(ledger) as handle:

@@ -18,6 +18,7 @@
 | 接入确认 | 分两阶段确认：先完成原有五项建库信息，再单独接入写作任务、终稿和Faithfulness三个接口。 |
 | 自动匹配 | 必须依赖文章ID、文章版本、外部任务唯一键、已确认精确路径和文件SHA-256；不按标题相似度、最新修改时间或目录顺序猜测。 |
 | 自动化边界 | 自动化只表示Skill被调用或被调度器唤醒后连续执行，不表示Skill是常驻后台目录监控服务。 |
+| 项目目录兼容 | 新建项目使用`[项目ID]_[企业中文名称]知识库`；既有`_v0.6`目录原地兼容。Skill版本由项目内部版本入口、结构和schema判断，不因升级重命名项目目录。 |
 
 ## 二、基线与继承证明
 
@@ -143,6 +144,17 @@
 | SK-V06-083 | 批量项目卡片仍可能把缺少写作任务或终稿候选概括成“写作任务/终稿：未发现”，导致人工看不到实际的待建立路径或已有终稿候选 | 固定卡片展示：写作任务首次接入默认按重建，主字段显示`待建立入口（确认后自动创建）`和拟建立路径，旧目录只作备注；终稿有候选时直接列出完整绝对路径供选择，无候选时才显示同一待建立状态；不再用“写作任务/终稿：未发现”替代字段 | `SKILL.md`、`workspace-onboarding.md` |
 | SK-V06-084 | 批量建库授权后仍需手动启动第二阶段，缺失写作入口也未同步建立；多终稿候选容易被自动选错 | 新增批量接入执行器：一次授权同时允许建立缺失写作任务/终稿默认目录并登记配置；无样例入口保持`部分接入`，多终稿候选必须人工选择且只阻塞对应项目 | `onboard_workspace.py`、`discover_workspace.py`、`SKILL.md`、`workspace-onboarding.md` |
 | SK-V06-085 | 来源扫描会标记“建议建立MAT”，但正式MAT主表、来源台账、文章处理单、当前待办和月度/交接之间没有统一的强制闭环，可能留下候选存在而MAT台账为空，或文章已阻塞却未推送的状态 | 来源索引完成后按相同处理原因自动建立或复用正式MAT并回写SQLite与来源台账；无需建立时必须保留中文处置理由。正式MAT默认不推送，只有当前文章依赖、确实阻塞且无法唯一处理时才进入待推送/已推送/已升级；校验器交叉核对正式MAT、来源引用、开放处理单和当前待办，月度审核与交接分别读取当前行动项和全部未关闭事项 | `mat_lifecycle.py`、`build_source_index.py`、`validate_v06_project.py`、`initialize_project.py`、`SKILL.md`、`source-index-and-materials.md`、`article-knowledge-workflow.md`、`human-readable-control-artifacts.md`、`monthly-and-handoff.md`、`operator-guide.md`、`project-structure-and-templates.md`、`runtime-checklist.md` |
+| SK-V06-086 | 来源台账的“可能主题”不能区分资料角色和七大模块候选，覆盖页无法区分有候选来源与确实缺少材料 | 技术登记表移除“可能主题”，来源索引在同一台账追加“来源主题与模块候选”表；先区分客户事实资料、写作运营资料、疑似文章或终稿、待确认，再按确定性信号生成可多选的七模块候选。覆盖页仅在原有“尚未定向处理材料”和“明确缺少材料或事实”两列消费结果，并增加“未纳入七模块候选”统计行；其他表格结构和内容保持不变 | `source_topic_mapping.py`、`build_source_index.py`、`build_coverage_view.py`、`initialize_project.py`、`validate_v06_project.py`、`SKILL.md`、`source-index-and-materials.md`、`project-structure-and-templates.md` |
+| SK-V06-087 | CUS检测和月度/交接报告依赖人工记忆，可能漏检客户专属事实或把开放事项写成“无未完成事项” | 每篇文章前审核固定检查客户能力、规格、认证、案例、商业条件和公开授权；Faithfulness低于80%时自动在审核记录标记六类复核。项目校验器读取当前MAT/CUS/ANM、知识缺口和来源MAT候选，逐项核对月报与交接小节；开放事项不得写空结论，MAT候选必须有正式MAT或明确无需建立理由 | `template_contract.py`、`writing_bridge.py`、`import_faithfulness.py`、`validate_v06_project.py`、`governance-detection-and-lifecycle.md`、`monthly-and-handoff.md` |
+| SK-V06-088 | 批量建库脚本只创建骨架和接入配置，却返回“已初始化”，执行Agent可能在官网画像和来源索引前提前收尾；画像恢复后又缺少统一状态回写入口 | `onboard_workspace.py`固定返回未完成和必须继续标记；新增`record_website_profile.py`，将官网画像成功、失败和来源索引后的状态收口作为确定性事务，同步项目基础信息、当前待办、版本入口和运行账本；官网失败继续本地建库，恢复后自动清除过期失败状态 | `onboard_workspace.py`、`record_website_profile.py`、`website-profile-state.md`、`SKILL.md`、`runtime-checklist.md`、`workspace-onboarding.md`、`initialize_project.py` |
+| SK-V06-089 | 公共知识缺口登记或Faithfulness导入后只更新机器台账，`01_知识库覆盖与缺口.md`可能继续显示旧内容 | 抽出统一原子覆盖页重建函数；直接登记公共缺口、Faithfulness导入完成和文章任务推进共用该函数，确保覆盖页随当前知识缺口与任务状态同步刷新；覆盖页重建失败时不报告Faithfulness成功事件 | `record_knowledge_gap.py`、`import_faithfulness.py`、`advance_ready_tasks.py`、`build_coverage_view.py` |
+| SK-V06-090 | 中文来源Claim只保存中文原文，英文`30`可能在每次生成时重新翻译，造成同一证据出现多个英文版本 | 中文最小原文证据形成正式Claim时固定保存经核验英文严格翻译；英文`30`必须完整复用该译文，校验器同时拦截中文Claim缺译文和英文`30`临时重译。英文来源无需重复译文，中文文章仍可使用中文原文 | `SKILL.md`、`article-knowledge-workflow.md`、`project-structure-and-templates.md`、`runtime-checklist.md`、`validate_v06_project.py` |
+| SK-V06-091 | 新Codex任务只收到项目名称时无法稳定定位既有知识库，交接和补充操作可能依赖上一任务的目录记忆，或把无访问权限误报为项目不存在 | 既有项目操作统一先取得Obsidian定位：单项目填写实际项目路径，按名称或多项目操作填写统一根目录；定位后从项目配置读取原始资料和Faithfulness等路径。交接包Prompt和三类补充Prompt同步增加定位字段，并区分项目不存在与路径不可访问 | `SKILL.md`、`operator-guide.md`、`monthly-and-handoff.md`、`runtime-checklist.md` |
+| SK-V06-092 | `项目根目录`新增为外部运营目录后，脚本示例仍用`<项目根路径>`或`<Obsidian项目根路径>`表示知识库目录，容易把外部目录误传给知识库脚本 | 所有知识库脚本示例统一使用`<Obsidian项目路径>`；`项目根目录`只表示外部运营项目文件夹；相关脚本的路径不存在和命名警告明确指出Obsidian知识库路径 | `SKILL.md`、运行清单、官网画像规则、月度与交接规则、项目模板、运营手册、相关脚本 |
+| SK-V06-093 | 交接包脚本未读取v0.6标准字段`项目中文名称`，清单可能回退显示知识库目录名 | 企业名称优先读取`项目中文名称`，并继续兼容旧项目的`企业名称`和`项目名称`；自测覆盖两份人工清单和两份JSON机器清单 | `package_handoff.py` |
+| SK-V06-094 | 写作桥接器和标准模板把`大纲状态`保存在文章需求顶层字段，项目校验器却只在`## 大纲`小节内读取，导致已有非空且已确认大纲的任务被误判为不合规，并使月度项目校验失败 | 项目校验统一优先读取标准顶层`大纲状态`，同时兼容旧文件放在大纲小节内的状态；自测样例改用与正式模板及桥接器一致的顶层字段位置 | `validate_v06_project.py` |
+| SK-V06-095 | 所有`_failure`事件都会把接入状态改为异常，导致月度审核失败和已导入Faithfulness结果的重复提交污染三个入口状态 | 只把写作任务、终稿和Faithfulness的真实接口失败标为异常；月度审核失败只记运行异常；同一Audit且输入身份一致时幂等成功；有效接入检查会按路径、规则和样例恢复历史假异常 | `update_integration_status.py`、`check_integration.py`、`import_faithfulness.py`、`SKILL.md`、`runtime-checklist.md`、`faithfulness-result-contract.md` |
+| SK-V06-096 | 交付方和接收方都使用泛称“项目交接审核”，旧脚本也没有强制两阶段审核落盘，导致交接包中审核来源和接收结果容易混淆 | 交付方`package_handoff.py`固定生成`YYYY-MM-DD_交付前项目交接审核.md`；接收方`handoff_migration.py --mode verify`固定生成`YYYY-MM-DD_接收后项目交接审核.md`。两份审核分别写入对应知识库、不得覆盖；`verify`有问题时仍生成接收后审核并报告不能交接，目标不可写时报告未落盘。 | `handoff_review.py`、`package_handoff.py`、`handoff_migration.py`、`SKILL.md`、`monthly-and-handoff.md`、`runtime-checklist.md`、`operator-guide.md` |
 
 ## 五、文件与目录落点
 
@@ -299,9 +311,13 @@
 | 2026-09-08 | SKFB维护窗口与月度只读复核、桥接临时目录回归 | 通过；文章运行只登记SKFB并继续原任务，Skill维护窗口负责专项审计和阶段推进，月度审核汇总维护证据；月度模板升级为`v0.6-20260908`；桥接清理临时目录失败不再使已提交任务失败，项目校验忽略`.retired-*`和`.revision-*`；知识库与已安装Skill逐文件哈希一致。 |
 | 2026-09-09 | 批量建库授权与首轮接入隔离模拟回归 | 通过；无终稿候选自动建立默认入口，单候选直接登记，多候选明确保持“待人工选择”且不阻塞其它项目；未带`--confirm-batch`不写入；`check_integration.py`、`writing_bridge.py`和`validate_v06_project.py`自测通过。 |
 | 2026-09-09 | `SK-V06-085` MAT正式化、推送与交叉校验回归 | 通过；来源索引自测验证扫描候选自动生成稳定正式MAT且重复扫描不重复建项；项目校验自测验证正式MAT与来源关联一致，进入内容运营推送状态时必须同时存在开放文章前处理单和当前待办，缺失任一入口会被拦截；全部现有脚本`--self-test`通过。 |
-
-| SK-V06-086 | 来源台账的“可能主题”不能区分资料角色和七大模块候选，覆盖页无法区分有候选来源与确实缺少材料 | 技术登记表移除“可能主题”，来源索引在同一台账追加“来源主题与模块候选”表；先区分客户事实资料、写作运营资料、疑似文章或终稿、待确认，再按确定性信号生成可多选的七模块候选。覆盖页仅在原有“尚未定向处理材料”和“明确缺少材料或事实”两列消费结果，并增加“未纳入七模块候选”统计行；其他表格结构和内容保持不变 | `source_topic_mapping.py`、`build_source_index.py`、`build_coverage_view.py`、`initialize_project.py`、`validate_v06_project.py`、`SKILL.md`、`source-index-and-materials.md`、`project-structure-and-templates.md` |
-| SK-V06-087 | CUS检测和月度/交接报告依赖人工记忆，可能漏检客户专属事实或把开放事项写成“无未完成事项” | 每篇文章前审核固定检查客户能力、规格、认证、案例、商业条件和公开授权；Faithfulness低于80%时自动在审核记录标记六类复核。项目校验器读取当前MAT/CUS/ANM、知识缺口和来源MAT候选，逐项核对月报与交接小节；开放事项不得写空结论，MAT候选必须有正式MAT或明确无需建立理由 | `template_contract.py`、`writing_bridge.py`、`import_faithfulness.py`、`validate_v06_project.py`、`governance-detection-and-lifecycle.md`、`monthly-and-handoff.md` |
+| 2026-09-10 | `SK-V06-090` 中文Claim双语证据与英文`30`复用回归 | 通过；英文来源无需重复译文，中文最小原文证据缺少有效英文严格翻译会被拦截，英文`30`即使同步更新SHA-256也不能使用临时重译；覆盖页自测继续通过。Skill Creator快速校验因当前Python环境缺少PyYAML未能启动。 |
+| 2026-09-10 | `SK-V06-091` 既有项目定位与交接Prompt回归 | 通过；单项目与按名称/多项目两种定位入口已写入主Skill、运行清单和交接规则；运营手册正文与附录中的交接、补充文件、补充网站和更新主官网Prompt同步；`validate_v06_project.py`、`package_handoff.py`和`handoff_migration.py`自测通过。 |
+| 2026-09-10 | `SK-V06-092` 项目路径术语回归 | 通过；知识库脚本示例统一使用`<Obsidian项目路径>`，外部运营目录继续只称`项目根目录`；三个交接相关脚本自测和四个受影响脚本语法检查通过。Skill Creator快速校验因当前Python环境缺少PyYAML未能启动。 |
+| 2026-09-10 | `SK-V06-093` 交接包企业名称字段回归 | 通过；交接包优先读取v0.6标准字段`项目中文名称`，兼容旧字段，并验证总清单、项目清单及两份机器清单名称一致。 |
+| 2026-09-10 | `SK-V06-094` 大纲状态位置兼容回归 | 通过；`validate_v06_project.py`、`writing_bridge.py`和`template_contract.py`自测通过；P-005三篇标准桥接任务不再被误判，大纲相关错误由3项降为0，项目校验结果为0项错误、8项警告。Skill Creator快速校验因当前Python环境缺少PyYAML未能启动。 |
+| 2026-09-10 | `SK-V06-095` 接入状态误报与重复Audit幂等回归 | 待本次脚本自测、重复导入专项验证和P-005只读项目校验完成后补充。 |
+| 2026-09-11 | `SK-V06-096` 两阶段项目交接审核回归 | 已补齐交付方和接收方的固定审核文件名、脚本落盘门禁和Prompt说明；`package_handoff.py --self-test`、`handoff_migration.py --self-test`、`validate_v06_project.py --self-test`、AST检查和`git diff --check`通过；Skill Creator快速校验因当前Python环境缺少PyYAML未能启动。 |
 
 ## 十二、已知限制
 

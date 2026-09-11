@@ -14,6 +14,8 @@ import tempfile
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
+
+from todo_sync import refresh_project_todo
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -707,6 +709,9 @@ def main() -> None:
     db_path = args.db.resolve()
     ledger_path = args.ledger.resolve()
     description_path = args.description.resolve()
+    expected_description = db_path.parent / "源资料搜索索引说明.md"
+    if description_path != expected_description:
+        raise SystemExit(f"--description 必须是标准路径：{expected_description}；禁止生成 source-index说明.md")
     exclusions_path = (args.exclusions or (db_path.parent / "source-index-exclusions.json")).resolve()
     default_version_history = (
         db_path.parent.parent
@@ -1122,6 +1127,7 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
+    refresh_project_todo(db_path.parents[1], at=built_at)
     print(f"indexed_files={len(rows)}")
     print(f"database={db_path}")
     print(f"ledger={ledger_path}")

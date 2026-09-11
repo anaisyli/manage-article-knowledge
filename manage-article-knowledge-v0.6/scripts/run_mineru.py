@@ -745,7 +745,7 @@ def run_extract(args: argparse.Namespace, api: MinerUApi | None = None) -> int:
     expiry = expiry_status(mark_reminder=True)
     try:
         if not project_root.is_dir():
-            raise MinerUError(f"项目根目录不存在：{project_root}", stage)
+            raise MinerUError(f"Obsidian项目路径不存在：{project_root}", stage)
         if not input_file.is_file():
             raise MinerUError(f"输入文件不存在：{input_file}", stage)
         if api is None:

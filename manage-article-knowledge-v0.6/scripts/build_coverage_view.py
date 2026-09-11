@@ -519,6 +519,21 @@ def build_view(root: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def rebuild_view(root: Path) -> Path:
+    """Atomically write the current human-readable coverage view."""
+    root = root.resolve()
+    output = (root / OUTPUT_RELATIVE).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    text = build_view(root)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=output.parent, delete=False, suffix=".tmp"
+    ) as handle:
+        handle.write(text)
+        temporary = Path(handle.name)
+    temporary.replace(output)
+    return output
+
+
 def run_self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="v05-coverage-test-") as temp:
         root = Path(temp) / "DEMO_示例知识库_v0.6"
@@ -603,13 +618,16 @@ def main() -> None:
     root = args.project.resolve()
     if not root.is_dir():
         raise SystemExit(f"Project not found: {root}")
-    output = (args.output or (root / OUTPUT_RELATIVE)).resolve()
-    text = build_view(root)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False, suffix=".tmp") as handle:
-        handle.write(text)
-        temporary = Path(handle.name)
-    temporary.replace(output)
+    if args.output:
+        output = args.output.resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        text = build_view(root)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False, suffix=".tmp") as handle:
+            handle.write(text)
+            temporary = Path(handle.name)
+        temporary.replace(output)
+    else:
+        output = rebuild_view(root)
     print(f"output={output}")
     print(f"project={root}")
 

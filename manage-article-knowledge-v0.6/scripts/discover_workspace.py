@@ -38,7 +38,8 @@ TEXT_EXTENSIONS = {".md", ".txt", ".json", ".csv", ".html", ".htm"}
 SOURCE_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md"}
 OUTPUT_EXTENSIONS = {".docx", ".md", ".html", ".zip"}
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
-V06_PROJECT_NAME_RE = re.compile(r"知识库[_ -]?v?0\.6$", re.IGNORECASE)
+# Existing vaults may use the historical `_v0.6` suffix. New vaults omit it.
+V06_PROJECT_NAME_RE = re.compile(r"知识库(?:[_ -]?v?0\.6)?$", re.IGNORECASE)
 NON_CLIENT_HOSTS = {
     "chatgpt.com", "www.chatgpt.com", "github.com", "www.github.com",
     "deepeval.com", "www.deepeval.com", "docs.ragas.io", "doi.org",
@@ -84,8 +85,8 @@ def name_matches(name: str, terms: tuple[str, ...]) -> bool:
     return any(term.casefold() in lowered for term in terms)
 
 
-def is_v06_project_name(name: str) -> bool:
-    """Keep an existing v0.6 vault from being mistaken for source material."""
+def is_knowledge_base_project_name(name: str) -> bool:
+    """Keep an existing vault from being mistaken for source material."""
     return bool(V06_PROJECT_NAME_RE.search(name.strip()))
 
 
@@ -116,7 +117,7 @@ def collect_evidence(project: Path, max_depth: int = 2, max_files: int = 2500) -
             dirs[:] = [name for name in dirs if not ignored_name(name)]
             if relative_depth >= max_depth:
                 dirs[:] = []
-            if name_matches(current_path.name, SOURCE_NAMES) and not is_v06_project_name(current_path.name):
+            if name_matches(current_path.name, SOURCE_NAMES) and not is_knowledge_base_project_name(current_path.name):
                 source_dirs.append(str(current_path))
             if name_matches(current_path.name, TASK_NAMES):
                 task_dirs.append(str(current_path))

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Initialize confirmed workspace projects and finish their first integration pass.
+"""Create confirmed project skeletons and configure their external interfaces.
 
 The discovery report is deliberately read-only.  This command is the write step
 and therefore requires an explicit batch authorization flag.  It never moves or
-overwrites an external writing or final-draft file.
+overwrites an external writing or final-draft file. A successful result is not a
+completed initialization: Codex must continue with website profiling, source
+indexing, coverage rebuilding, and project validation in the same run.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from pathlib import Path
 
 
 CONFIG_RELATIVE = Path("01_工作台/40_写作与Faithfulness接入配置.md")
-PROJECT_NAME_SUFFIX = "知识库_v0.6"
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +78,19 @@ def parse_overrides(values: list[str]) -> dict[str, dict[str, str]]:
 def safe_name(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|]", "-", value).strip(" .")
     return value or "未命名项目"
+
+
+def resolve_existing_obsidian_project(obsidian_root: Path, candidate_id: str, project_name: str) -> tuple[Path, str | None]:
+    """Resolve the standard path while preserving a historical v0.6 path."""
+    stem = f"{candidate_id}_{project_name}知识库"
+    standard = obsidian_root / stem
+    legacy = obsidian_root / f"{stem}_v0.6"
+    existing = [path for path in (standard, legacy) if path.is_dir()]
+    if len(existing) > 1:
+        return standard, f"同时发现新旧知识库目录，无法安全选择：{standard}；{legacy}"
+    if existing:
+        return existing[0], None
+    return standard, None
 
 
 def replace_field(text: str, label: str, value: str) -> str:
@@ -142,7 +156,7 @@ def initialize(project: dict[str, object], report: dict[str, object], overrides:
     project_root = Path(str(project["candidate_path"])).resolve()
     project_name = safe_name(overrides.get("project_name") or str((assessment.get("project_name") or {}).get("value") or project_root.name))
     obsidian_root = Path(str(report["obsidian_root"])).resolve()
-    obsidian_project = obsidian_root / f"{candidate_id}_{project_name}{PROJECT_NAME_SUFFIX}"
+    obsidian_project, naming_error = resolve_existing_obsidian_project(obsidian_root, candidate_id, project_name)
     task_value, task_candidates = entry_path(assessment, "writing_task_entry")
     final_value, final_candidates = entry_path(assessment, "final_entry")
     default_task = Path(str(project.get("suggested_external_paths", {}).get("writing_task") or project_root / "写作任务")).resolve()
@@ -163,6 +177,17 @@ def initialize(project: dict[str, object], report: dict[str, object], overrides:
         final_path = str(default_final)
 
     result: dict[str, object] = {"project": candidate_id, "status": "待处理", "obsidian_project": str(obsidian_project)}
+    if naming_error:
+        result.update({"status": "失败", "reason": naming_error})
+        return result
+    if obsidian_project.is_dir() and not dry_run:
+        result.update({
+            "status": "已存在，未重复初始化",
+            "initialization_complete": False,
+            "must_continue": True,
+            "next_step": "existing_project_startup_check",
+        })
+        return result
     if final_error:
         result["final_status"] = "待人工选择"
         result["reason"] = final_error
@@ -175,7 +200,8 @@ def initialize(project: dict[str, object], report: dict[str, object], overrides:
         init_script = Path(__file__).with_name("initialize_project.py")
         command = [
             sys.executable, str(init_script), "--project", str(obsidian_project),
-            "--project-name", project_name, "--source-root", source,
+            "--project-name", project_name, "--workspace-project-root", str(project_root),
+            "--source-root", source,
             "--website", website, "--content-owner", str(report["default_content_owner"]),
         ]
         completed = subprocess.run(
@@ -198,7 +224,11 @@ def initialize(project: dict[str, object], report: dict[str, object], overrides:
         text = replace_field(text, "首次确认日期", timestamp)
         text = replace_confirmation_rows(text, str(task_path), final_path, str(faithfulness_root), timestamp)
         config.write_text(text, encoding="utf-8")
-    result["status"] = "已初始化并自动接入" if not final_error else "已初始化，终稿待人工选择"
+    result["status"] = "骨架与接入已建立，初始化未完成" if not final_error else "骨架已建立，终稿待人工选择，初始化未完成"
+    result["initialization_complete"] = False
+    result["must_continue"] = True
+    result["next_step"] = "website_profile_then_source_index_and_validation"
+    result["website"] = website
     result["writing_task_entry"] = str(task_path)
     result["final_entry"] = final_path or "待人工选择"
     return result

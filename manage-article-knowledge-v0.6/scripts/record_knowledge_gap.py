@@ -10,6 +10,8 @@ from datetime import date
 from pathlib import Path
 import re
 
+from build_coverage_view import rebuild_view
+
 
 FIELDS = (
     "gap_key", "gap_topic", "gap_type", "trigger_basis", "article_ids",
@@ -212,6 +214,12 @@ def main() -> None:
         })
         row = existing
     write_rows(args.csv, rows)
+    # The CSV is the machine ledger, but the Markdown page is the operator's
+    # current view. Keep both current whenever a gap is registered directly.
+    try:
+        rebuild_view(args.csv.resolve().parents[2])
+    except Exception as exc:
+        raise SystemExit(f"知识缺口已写入，但覆盖页重建失败：{exc}") from exc
     print(f"gap_key={row['gap_key']}")
     if merged_key:
         print(f"merged_existing_gap_key={merged_key}")

@@ -10,23 +10,14 @@ from datetime import date
 from pathlib import Path
 
 from article_state import parse_field, task_ready_for_delivery, transition_task
-from build_coverage_view import OUTPUT_RELATIVE, build_view
+from build_coverage_view import OUTPUT_RELATIVE, rebuild_view
 from handoff_contract import current_version
 from template_contract import ARTICLE_AUDIT_TEMPLATE_VERSION, TEMPLATE_VERSION
 
 
 def rebuild_coverage(project: Path) -> Path:
     """Refresh coverage after article state changes, using the same atomic write contract."""
-    output = project / OUTPUT_RELATIVE
-    output.parent.mkdir(parents=True, exist_ok=True)
-    text = build_view(project)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=output.parent, delete=False, suffix=".tmp"
-    ) as handle:
-        handle.write(text)
-        temporary = Path(handle.name)
-    temporary.replace(output)
-    return output
+    return rebuild_view(project)
 
 
 def advance_project(project: Path, *, updated: str | None = None) -> list[Path]:
@@ -149,7 +140,7 @@ def self_test() -> int:
                 "## 复杂资料与原件核对复核\n\n| 资料ID | 15处理记录入口 | 最终状态 | 对当前事实/Claim影响 | 本篇审核结论 |\n"
                 "|---|---|---|---|---|\n| 无 | [[15_检索与知识准备记录.md#复杂资料处理与原件核对]] | 不适用 | 无复杂资料不影响Claim | 本篇无可能相关复杂资料，复核通过 |\n\n"
                 "## CUS / ANM检测结果\n\n| 检测对象 | 已检查信号与来源 | 分类结论 | 事项与证据入口 | 本篇处理 |\n"
-                "|---|---|---|---|---|\n| CUS候选检测 | 已核对正式Claim与来源 | 未触发 | [[demo.md]] | 无需处理 |\n"
+                "|---|---|---|---|---|\n| CUS候选检测 | 已核对客户能力、规格、认证、案例、商业条件、公开授权，以及Formal Claim和来源范围 | 未触发 | [[demo.md]] | 无需处理 |\n"
                 "| ANM异常检测 | 已核对版本、定位与数值 | 未触发 | [[demo.md]] | 无需处理 |\n"
             ),
             "30_本篇知识库资料.md": material_text,
