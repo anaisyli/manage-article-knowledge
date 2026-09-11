@@ -124,6 +124,49 @@ def validate_event(event: str, payload: Mapping[str, Any], contract: Mapping[str
             version_pattern = str(mode_contract.get("base_article_version_pattern") or r"^v[1-9]\d*$")
             if not re.fullmatch(version_pattern, base_article_version):
                 raise HandoffContractError("base_article_version must use vN")
+    if event == "article_completed":
+        issuer = str(events[event].get("issuer") or "").strip()
+        if issuer != "import_faithfulness.py":
+            raise HandoffContractError(
+                "article_completed issuer must be import_faithfulness.py"
+            )
+        if str(payload.get("issuer") or "").strip() != issuer:
+            raise HandoffContractError(
+                "article_completed payload issuer must be import_faithfulness.py"
+            )
+        task_dir = str(payload.get("task_dir") or "").replace("\\", "/")
+        if "/04_文章任务/40_已完成/" not in task_dir:
+            raise HandoffContractError(
+                "article_completed task_dir must be under 04_文章任务/40_已完成"
+            )
+
+
+def validate_completion_receipt(
+    payload: Mapping[str, Any], contract: Mapping[str, Any] | None = None
+) -> Path:
+    """Validate an article_completed event against the current completed task files."""
+    contract = contract or load_contract()
+    validate_event("article_completed", payload, contract)
+    task_dir = Path(str(payload["task_dir"])).resolve()
+    if not task_dir.is_dir() or task_dir.parent.name != "40_已完成":
+        raise HandoffContractError(
+            "completion receipt task_dir does not exist under 40_已完成"
+        )
+    receipt = task_dir / "50_文章知识使用与Faithfulness记录.md"
+    if not receipt.is_file():
+        raise HandoffContractError("completion receipt is missing current 50 record")
+    text = receipt.read_text(encoding="utf-8-sig")
+    expected = {
+        f"- 文章ID：{payload['article_id']}",
+        f"- 文章版本：{payload['article_version']}",
+        f"- Faithfulness导入日期：{payload['faithfulness_imported_at']}",
+        f"- 导入ID：{payload['audit_id']}",
+    }
+    missing = sorted(item for item in expected if item not in text)
+    if missing or "- Faithfulness导入日期：未导入" in text:
+        details = "; ".join(missing) or "Faithfulness remains unimported"
+        raise HandoffContractError(f"completion receipt does not match current 50: {details}")
+    return task_dir
 
 
 def self_test() -> None:
@@ -137,6 +180,27 @@ def self_test() -> None:
         "article_version": "v1",
     }
     validate_event("faithfulness_completed", payload, contract)
+    completed_payload = {
+        "handoff_event": "article_completed",
+        "handoff_contract_version": version,
+        "issuer": "import_faithfulness.py",
+        "article_id": "ARTICLE",
+        "article_version": "v1",
+        "task_dir": "C:/knowledge/PROJECT/04_文章任务/40_已完成/ARTICLE_Title",
+        "audit_id": "AUDIT-001",
+        "faithfulness_imported_at": "2026-09-11T12:00:00+08:00",
+    }
+    validate_event("article_completed", completed_payload, contract)
+    invalid_completed = dict(
+        completed_payload,
+        task_dir="C:/knowledge/PROJECT/04_文章任务/30_等待Faithfulness/ARTICLE_Title",
+    )
+    try:
+        validate_event("article_completed", invalid_completed, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("article_completed outside 40_已完成 was accepted")
     revision_payload = {
         "handoff_event": "writing_request",
         "handoff_contract_version": version,
@@ -204,6 +268,33 @@ def self_test() -> None:
     else:
         raise AssertionError("handoff_error without human guidance was accepted")
     with tempfile.TemporaryDirectory() as directory:
+        completed_dir = (
+            Path(directory)
+            / "PROJECT/04_文章任务/40_已完成/ARTICLE_Title"
+        )
+        completed_dir.mkdir(parents=True)
+        completed_dir.joinpath("50_文章知识使用与Faithfulness记录.md").write_text(
+            "\n".join(
+                [
+                    "# 文章知识使用与Faithfulness记录",
+                    "",
+                    "- 文章ID：ARTICLE",
+                    "- 文章版本：v1",
+                    "- Faithfulness导入日期：2026-09-11T12:00:00+08:00",
+                    "- 导入ID：AUDIT-001",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        completion_fixture = dict(completed_payload, task_dir=str(completed_dir))
+        validate_completion_receipt(completion_fixture, contract)
+        wrong_version = dict(completion_fixture, article_version="v2")
+        try:
+            validate_completion_receipt(wrong_version, contract)
+        except HandoffContractError:
+            pass
+        else:
+            raise AssertionError("completion receipt with wrong current version was accepted")
         broken = Path(directory) / "contract.json"
         broken.write_text("{}", encoding="utf-8")
         try:
@@ -221,6 +312,9 @@ def main() -> None:
     parser.add_argument("--print-version", action="store_true")
     parser.add_argument("--event")
     parser.add_argument("--payload", type=Path)
+    parser.add_argument("--verify-completion", action="store_true")
+    parser.add_argument("--expected-article-id")
+    parser.add_argument("--expected-article-version")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -233,6 +327,19 @@ def main() -> None:
     if not args.event or not args.payload:
         parser.error("provide --print-version, --self-test, or both --event and --payload")
     payload = json.loads(args.payload.read_text(encoding="utf-8"))
+    if args.verify_completion:
+        if not args.expected_article_id or not args.expected_article_version:
+            parser.error(
+                "--verify-completion requires --expected-article-id and "
+                "--expected-article-version"
+            )
+        if str(payload.get("article_id")) != args.expected_article_id:
+            raise HandoffContractError("completion article_id does not match current chain")
+        if str(payload.get("article_version")) != args.expected_article_version:
+            raise HandoffContractError("completion article_version does not match current chain")
+        task_dir = validate_completion_receipt(payload, contract)
+        print(f"handoff_event=article_completed\ncompletion_verified=true\ntask_dir={task_dir}")
+        return
     validate_event(args.event, payload, contract)
     print(f"handoff_event={args.event}\nvalidation=passed")
 

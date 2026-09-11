@@ -4,7 +4,7 @@
 
 ## 交接合同版本
 
-本规范的人类可读说明与同目录的`handoff-contract.json`共同构成交接合同；其中JSON是字段、版本、执行器和事件必填项的唯一机器真源。当前合同版本为`MAK-HANDOFF-1.1`。三个Skill每次运行都从当前已安装的`manage-article-knowledge`读取该文件，不在各自目录复制第二份完整合同。
+本规范的人类可读说明与同目录的`handoff-contract.json`共同构成交接合同；其中JSON是字段、版本、执行器和事件必填项的唯一机器真源。当前合同版本为`MAK-HANDOFF-1.2`。三个Skill每次运行都从当前已安装的`manage-article-knowledge`读取该文件，不在各自目录复制第二份完整合同。`MAK-HANDOFF-1.1`仅为已开始链路保留输入兼容；新任务和新完成回执使用当前版本。
 
 `writing_request`、`writing_ready`、`writing_completed`、`faithfulness_request`、`faithfulness_completed`和`article_completed`都必须携带`handoff_contract_version`。合同的`event_lifecycle`是终止语义真源：前五个事件都不是整条任务的成功终点，只有知识库导入审核结果并返回`article_completed`才算正常完成。接收方先校验版本和本事件必填字段，再执行任何落盘或状态迁移。缺少版本或版本不在`compatible_versions`中时，返回`handoff_error`，保留当前任务状态，不猜测字段、不自动降级到另一套流程：
 
@@ -139,6 +139,7 @@ completed_at: 完成时间
 | 写作 Skill | 产生每周文章任务；读取本篇 `30`；按运营要求生成终稿；在能做到时带回文章ID和版本，至少返回配置中约定的终稿位置 | 不修改正式知识、`35`、Faithfulness结果或知识治理台账 |
 | 知识库 Skill | 将外部任务转换为`10`；执行既有知识准备；生成`30/35`；接收终稿；创建`50`；导入审核结果和Claim支撑记录 | 不写文章，不执行Faithfulness语义判断，不接管各组写作规则 |
 | Faithfulness Skill | 只用当前`40`和实际交给写作者的当前`30`独立审核；输出兼容结果 | 不读取`35`、完整知识库或原始资料来扩大审核上下文，不回写知识库项目 |
+| 当前Codex/写作编排 | 让同一文章链路在三方之间连续运行；只接受知识库导入器签发且通过终点核验的`article_completed`作为成功终点 | 不把`writing_completed`、`faithfulness_completed`、旧版本完成记录或自然语言“已完成”当成当前文章完成凭证 |
 
 ## 2. 每个项目只有一份接入配置
 
@@ -321,7 +322,7 @@ prepared和judgments使用当前导入器支持的schema `1.0`；prepared必须�
 2. Faithfulness Skill生成并校验三个核心结果后返回`handoff_event: faithfulness_completed`。这只是中间交接事件，不是整条文章流程的结束；
 3. 知识库收到`faithfulness_completed`后立即运行`import_faithfulness.py`，先完成预检，再按既有治理规则生成处置JSON并登记必要的gap/CUS/MAT/ANM入口；
 4. 更新`50`、文章Faithfulness明细、Claim文章支撑记录、知识缺口和项目级支撑总表；
-5. 运行项目校验，并在同一可恢复事务中将任务推进到`40_已完成`，同步当前待办和运行账本；成功后返回`handoff_event: article_completed`。失败、结果不完整、导入失败或迁移失败时，任务仍保持`30_等待Faithfulness`并写明不匹配项，不得提前宣告流程完成。
+5. 运行项目校验，并在同一可恢复事务中将任务推进到`40_已完成`，同步当前待办和运行账本；成功后只能由`import_faithfulness.py`签发`handoff_event: article_completed`。失败、结果不完整、导入失败或迁移失败时，任务仍保持`30_等待Faithfulness`并写明不匹配项，不得提前宣告流程完成。
 
 状态语义固定如下：
 
@@ -336,10 +337,15 @@ prepared和judgments使用当前导入器支持的schema `1.0`；prepared必须�
 ```text
 handoff_event: article_completed
 handoff_contract_version: 与本次链路相同的版本
+issuer: import_faithfulness.py
 article_id: 当前文章ID
 article_version: 当前文章版本
 task_dir: 当前40_已完成任务目录绝对路径
+audit_id: 当前版本已成功导入的审核ID
+faithfulness_imported_at: 当前版本Faithfulness导入时间
 ```
+
+`import_faithfulness.py`成功导入或确认幂等成功时，会在当前审核版本目录生成唯一`article_completed.json`并返回其`completion_receipt`路径。当前Codex或写作编排必须直接使用该文件运行`scripts/handoff_contract.py --event article_completed --payload <completion_receipt> --verify-completion --expected-article-id <当前链路文章ID> --expected-article-version <当前链路文章版本>`，不得自行拼接完成回执。校验器会先拒绝与当前链路身份不一致的回执，再确认`task_dir`真实存在并位于`04_文章任务/40_已完成`，并检查该目录内`50_文章知识使用与Faithfulness记录.md`的文章版本、导入日期和审核ID。只有输出`completion_verified=true`才可向人工报告完成。任一项不成立时，该回执无效，任务仍处于中间状态；不得引用旧版本`40_已完成`目录、历史归档记录或自然语言总结补足。写作 Skill和Faithfulness Skill不得自行构造`article_completed`。
 
 `Claim文章支撑记录`是审核后的证据映射，不代表写作模型内部实际调用了某条Claim。
 

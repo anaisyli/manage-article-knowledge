@@ -19,6 +19,7 @@ from template_contract import TEMPLATE_VERSION, validate_file
 from article_state import transition_task, validate_transition_inputs
 from check_integration import project_id_for_root
 from update_integration_status import update as update_integration_status
+from build_coverage_view import rebuild_view
 
 
 METRIC_FIELDS = (
@@ -35,6 +36,34 @@ SUPPORT_FIELDS = (
     "evidence_source_file", "evidence_line_start", "evidence_line_end",
     "evidence_quote", "reason",
 )
+
+
+def write_completion_receipt(
+    result_dir: Path,
+    *,
+    contract_version: str,
+    article_id: str,
+    article_version: str,
+    task_dir: str,
+    audit_id: str,
+    imported_at: str,
+) -> Path:
+    receipt = result_dir / "article_completed.json"
+    payload = {
+        "handoff_event": "article_completed",
+        "handoff_contract_version": contract_version,
+        "issuer": "import_faithfulness.py",
+        "article_id": article_id,
+        "article_version": article_version,
+        "task_dir": task_dir,
+        "audit_id": audit_id,
+        "faithfulness_imported_at": imported_at,
+    }
+    receipt.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return receipt
 DISPOSITION_CATEGORIES = {
     "existing_gap", "new_public_gap", "cus", "mat", "anm",
     "package_omission", "writing_only",
@@ -562,6 +591,52 @@ def load_csv(path: Path, fields: tuple[str, ...]) -> list[dict[str, str]]:
         return list(reader)
 
 
+def audit_matches_existing(
+    existing: dict[str, str],
+    *,
+    article_id: str,
+    article_version: str,
+    article_hash: str,
+    knowledge_hashes: list[str],
+) -> bool:
+    try:
+        existing_knowledge_hashes = json.loads(existing.get("knowledge_sha256", ""))
+    except (TypeError, json.JSONDecodeError):
+        existing_knowledge_hashes = None
+    return (
+        existing.get("article_id", "") == article_id
+        and existing.get("article_version", "") == article_version
+        and existing.get("article_sha256", "").strip().lower() == article_hash.lower()
+        and existing_knowledge_hashes == knowledge_hashes
+    )
+
+
+def self_test() -> None:
+    row = {
+        "article_id": "A-001",
+        "article_version": "1",
+        "article_sha256": "ABC123",
+        "knowledge_sha256": json.dumps(["K1", "K2"]),
+    }
+    if not audit_matches_existing(
+        row,
+        article_id="A-001",
+        article_version="1",
+        article_hash="abc123",
+        knowledge_hashes=["K1", "K2"],
+    ):
+        raise SystemExit("self-test failed: identical audit input")
+    if audit_matches_existing(
+        row,
+        article_id="A-001",
+        article_version="2",
+        article_hash="abc123",
+        knowledge_hashes=["K1", "K2"],
+    ):
+        raise SystemExit("self-test failed: conflicting audit input")
+    print("self-test=passed")
+
+
 def write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -930,6 +1005,9 @@ def write_support_summary(
 
 
 def main() -> None:
+    if "--self-test" in sys.argv:
+        self_test()
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result-dir", type=Path)
     parser.add_argument("--prepared", type=Path)
@@ -1105,7 +1183,10 @@ def main() -> None:
     article_hash = sha256_file(args.article)
     recorded_article_hash = str(prepared.get("article_sha256", "")).strip().lower()
     if recorded_article_hash and recorded_article_hash != article_hash:
-        raise SystemExit("Prepared article SHA-256 does not match the current final article")
+        # Markdown editors can rewrite serialization without changing parsed
+        # article content; reject only a semantic content change.
+        if prepared.get("article_lines") != extract_article_lines(args.article):
+            raise SystemExit("Prepared article content does not match the current final article")
     knowledge_hashes = [sha256_file(path) for path in args.knowledge]
     recorded_knowledge_hashes = prepared.get("knowledge_sha256")
     if recorded_knowledge_hashes and recorded_knowledge_hashes != knowledge_hashes:
@@ -1169,8 +1250,49 @@ def main() -> None:
         )
 
     metrics_rows = load_csv(args.metrics_csv, METRIC_FIELDS)
-    if any(row["audit_id"] == audit_id for row in metrics_rows):
-        raise SystemExit(f"Audit already imported: {audit_id}")
+    existing_audits = [row for row in metrics_rows if row.get("audit_id") == audit_id]
+    if existing_audits:
+        for existing in existing_audits:
+            if audit_matches_existing(
+                existing,
+                article_id=article_id,
+                article_version=args.article_version,
+                article_hash=article_hash,
+                knowledge_hashes=knowledge_hashes,
+            ):
+                completed_article = existing.get("article_file", "")
+                completed_task = str(Path(completed_article).parent) if completed_article else ""
+                if not completed_task or Path(completed_task).parent.name != "40_已完成":
+                    raise SystemExit(
+                        "Audit记录存在，但当前完成任务目录无效；拒绝签发article_completed"
+                    )
+                completion_receipt = None
+                if managed_contract:
+                    completion_receipt = write_completion_receipt(
+                        (args.result_dir or args.summary.parent).resolve(),
+                        contract_version=contract_version,
+                        article_id=article_id,
+                        article_version=args.article_version,
+                        task_dir=completed_task,
+                        audit_id=audit_id,
+                        imported_at=existing.get("imported_at", ""),
+                    )
+                print(f"audit_id={audit_id}")
+                print("idempotent=true")
+                print("message=该Faithfulness Audit已成功导入，无需重复处理")
+                if managed_contract:
+                    print("handoff_event=article_completed")
+                    print(f"handoff_contract_version={contract_version}")
+                    print("issuer=import_faithfulness.py")
+                print(f"article_id={article_id}")
+                print(f"article_version={args.article_version}")
+                print(f"task_dir={completed_task}")
+                if managed_contract:
+                    print(f"faithfulness_imported_at={existing.get('imported_at', '')}")
+                if completion_receipt:
+                    print(f"completion_receipt={completion_receipt}")
+                return
+        raise SystemExit(f"Audit ID已存在但输入身份不一致，拒绝重复导入：{audit_id}")
     source_task = args.article.parent.resolve()
     if source_task.parent.name != "30_等待Faithfulness":
         raise SystemExit(f"Faithfulness导入任务必须位于30_等待Faithfulness：{source_task}")
@@ -1429,6 +1551,10 @@ def main() -> None:
         updated=imported_at[:10],
         link_file="50_文章知识使用与Faithfulness记录.md",
     )
+    try:
+        rebuild_view(project_root)
+    except Exception as exc:
+        raise SystemExit(f"Faithfulness已导入，但知识库覆盖页重建失败：{exc}") from exc
     update_integration_status(
         project_root,
         "faithfulness_import_success",
@@ -1436,6 +1562,17 @@ def main() -> None:
         article_version=args.article_version,
         detail=f"导入ID：{audit_id}",
     )
+    completion_receipt = None
+    if managed_contract:
+        completion_receipt = write_completion_receipt(
+            result_directory,
+            contract_version=contract_version,
+            article_id=article_id,
+            article_version=args.article_version,
+            task_dir=str(completed_task),
+            audit_id=audit_id,
+            imported_at=imported_at,
+        )
     print(f"audit_id={audit_id}")
     print(f"article_id={article_id}")
     print(f"faithfulness={score_text}")
@@ -1445,8 +1582,13 @@ def main() -> None:
     print("handoff_event=article_completed")
     if contract_version:
         print(f"handoff_contract_version={contract_version}")
+        print("issuer=import_faithfulness.py")
     print(f"article_version={args.article_version}")
     print(f"task_dir={completed_task}")
+    if managed_contract:
+        print(f"faithfulness_imported_at={imported_at}")
+    if completion_receipt:
+        print(f"completion_receipt={completion_receipt}")
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True)
     parser.add_argument("--project-name", required=True)
+    parser.add_argument("--workspace-project-root", type=Path)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--website", required=True)
     parser.add_argument("--content-owner", required=True)
@@ -104,6 +105,7 @@ def main() -> None:
 
     project = args.project.resolve()
     source_root = args.source_root.resolve()
+    workspace_project_root = str(args.workspace_project_root.resolve()) if args.workspace_project_root else "待确认"
     skill_path = Path(__file__).resolve().parent.parent / "SKILL.md"
     skill_sha256 = sha256_file(skill_path)
     initialized_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -137,6 +139,7 @@ def main() -> None:
             "- 公开限制：待补充\n"
             "- 竞品信息限制：禁止搜索、保存或沉淀具体竞品品牌、型号、特殊产品、参数、价格、案例、排名和比较结论；仅允许保留去品牌化通用行业知识、一般原理、方法说明和公开标准\n"
             "- 竞品限制继承规则：文章只能继承或进一步收紧，不得放宽\n"
+            f"- 项目根目录：{workspace_project_root}\n"
             f"- 客户原始资料路径：{source_root}\n"
             f"- Obsidian项目路径：{project}\n"
             "- 第三方技术解析授权：继承团队默认授权 / 项目明确禁止\n"
@@ -242,15 +245,15 @@ def main() -> None:
             "# 当前待办\n\n"
             f"- 项目ID：{project_id}\n"
             f"- 更新日期：{initialized_at[:10]}\n"
-            "- 当前节点：官网画像与项目基础信息\n"
-            "- 当前状态：官网已知时先完成官网画像，再执行来源索引\n"
+            "- 当前节点：初始化、官网画像与来源索引\n"
+            "- 当前状态：官网已知时先尝试官网画像；官网失败记录并继续来源索引，恢复后自动重试\n"
             "- 版本入口：[[30_版本与变更入口.md]]\n"
             "- 正式知识目录：[[../03_正式知识/00_正式知识目录.md]]\n"
             "- 源资料台账：[[../02_源资料/源资料与可检索性台账.md]]\n"
             "- 数据说明：[[../05_数据与审核/01_数据说明.md]]\n\n"
             "| 对象ID | 人能看懂的事项 | 当前阶段 | 是否阻塞 | 下一步由谁做 | 直达链接 | 更新/重开条件 | 最近更新 |\n"
             "|---|---|---|---|---|---|---|---|\n"
-            f"| {project_id} | 完成官网画像、项目基础信息并建立来源索引 | 官网画像与项目基础信息 | 是 | Codex先回写官网画像；内容运营负责人补齐人工字段 | [[10_项目基础信息.md]] | 官网状态、路径、负责人或公开限制变化时重开 | {initialized_at[:10]} |\n"
+            f"| {project_id} | 完成初始化、官网画像、项目基础信息并建立来源索引 | 初始化、官网画像与来源索引 | 否 | Codex先尝试官网画像；失败则继续本地建库并记录待重试；内容运营负责人补齐人工字段 | [[10_项目基础信息.md]] | 官网恢复、路径、负责人或公开限制变化时重开 | {initialized_at[:10]} |\n"
         ),
         "01_工作台/30_版本与变更入口.md": (
             "# 版本与变更入口\n\n"

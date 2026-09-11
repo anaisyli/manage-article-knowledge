@@ -1,7 +1,8 @@
 {
   "contract_id": "manage-article-knowledge-handoff",
-  "handoff_contract_version": "MAK-HANDOFF-1.1",
+  "handoff_contract_version": "MAK-HANDOFF-1.2",
   "compatible_versions": [
+    "MAK-HANDOFF-1.2",
     "MAK-HANDOFF-1.1"
   ],
   "faithfulness_executor": {
@@ -126,12 +127,16 @@
     "article_completed": {
       "sender": "manage-article-knowledge",
       "receiver": "writing_orchestration",
+      "issuer": "import_faithfulness.py",
       "required_fields": [
         "handoff_event",
         "handoff_contract_version",
+        "issuer",
         "article_id",
         "article_version",
-        "task_dir"
+        "task_dir",
+        "audit_id",
+        "faithfulness_imported_at"
       ]
     },
     "handoff_error": {

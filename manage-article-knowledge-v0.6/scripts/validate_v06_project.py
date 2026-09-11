@@ -90,7 +90,7 @@ CLAIM_MODULE_PATHS = (
     (Path("20_外部公共知识/50_行业知识与洞察"), "外部公共知识"),
 )
 UTF8_BOM = b"\xef\xbb\xbf"
-PROJECT_ROOT_PATTERN = re.compile(r"^[^\\/:*?\"<>|]+_[^\\/:*?\"<>|]+知识库_v0\.6$")
+PROJECT_ROOT_PATTERN = re.compile(r"^[^\\/:*?\"<>|]+_[^\\/:*?\"<>|]+知识库(?:_v0\.6)?$")
 SKFB_TERMINAL_STAGES = {"已关闭", "转为项目问题", "不纳入Skill"}
 SKFB_NEGATIVE_VALIDATION_RE = re.compile(
     r"(?m)^-\s*(?:原复现项目验证|项目验证)[：:].*(?:未运行|未验证|尚未|待执行|待验证|不通过|失败)"
@@ -215,9 +215,71 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def parsed_article_lines(path: Path) -> list[dict[str, str]]:
+    """Return the article representation used by the Faithfulness audit.
+
+    This intentionally ignores Markdown serialization details such as line
+    endings and optional table edge pipes, while retaining visible text and
+    table cell content.
+    """
+    text = path.read_text(encoding="utf-8-sig")
+    lines = text.splitlines()
+    start = 0
+    end = len(lines)
+    markers = [i for i, line in enumerate(lines) if line.strip() == "<!-- ARTICLE_BODY_START -->"]
+    ends = [i for i, line in enumerate(lines) if line.strip() == "<!-- ARTICLE_BODY_END -->"]
+    if len(markers) == 1 and len(ends) == 1 and markers[0] < ends[0]:
+        start, end = markers[0] + 1, ends[0]
+    result: list[dict[str, str]] = []
+    for index in range(start, end):
+        raw = lines[index]
+        stripped = raw.strip()
+        if not stripped or re.match(r"^\s*#{1,6}\s+", raw):
+            continue
+        if re.fullmatch(r"\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*", raw):
+            continue
+        if stripped.startswith("|"):
+            visible = " | ".join(cell.strip() for cell in stripped.strip("|").split("|") if cell.strip())
+        else:
+            visible = re.sub(r"\s+", " ", stripped)
+        if visible:
+            result.append({"line": str(index + 1), "text": visible})
+    return result
+
+
 def parse_field(text: str, field: str) -> str:
     match = re.search(rf"^\s*[-*]\s*{re.escape(field)}[：:]\s*(.*?)\s*$", text, re.MULTILINE)
     return match.group(1).strip() if match else ""
+
+
+def markdown_section(text: str, heading: str) -> str:
+    """Return one level-three Markdown section without later peer sections."""
+    match = re.search(
+        rf"^###\s+{re.escape(heading)}\s*$([\s\S]*?)(?=^#{{1,3}}\s+|\Z)",
+        text,
+        re.MULTILINE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def normalized_evidence_text(text: str) -> str:
+    """Normalize Markdown quote markers and whitespace for exact evidence reuse checks."""
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*>\s?", "", line).strip()
+        if line:
+            lines.append(line)
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def contains_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", text))
+
+
+def is_english_target(value: str) -> bool:
+    return bool(re.search(r"(?:英文|英语|\bEnglish\b)", value, re.IGNORECASE)) or bool(
+        re.fullmatch(r"en(?:[-_][A-Za-z]{2})?", value.strip(), re.IGNORECASE)
+    )
 
 
 def writing_material_evidence_scope(lines: list[str]) -> tuple[list[bool], int]:
@@ -1144,8 +1206,27 @@ def validate_claims(root: Path, errors: list[str], warnings: list[str]) -> None:
                     errors.append(f"外部公共知识Claim必须使用CLM-EXT命名空间：{claim_id}（{path}）")
                 if module != "外部公共知识" and claim_id.startswith("CLM-EXT-"):
                     errors.append(f"客户知识Claim不能使用CLM-EXT命名空间：{claim_id}（{path}）")
-            if "### 最小原文证据" not in block or not re.search(r"^\s*>\s*\S", block, re.MULTILINE):
+            original_evidence = markdown_section(block, "最小原文证据")
+            original_text = normalized_evidence_text(original_evidence)
+            if not original_evidence or not re.search(r"^\s*>\s*\S", original_evidence, re.MULTILINE):
                 errors.append(f"Claim {claim_id} 未发现引用块形式的最小原文证据：{path}")
+            elif contains_chinese(original_text):
+                translation = markdown_section(block, "经核验英文严格翻译")
+                translation_text = normalized_evidence_text(translation)
+                placeholders = {
+                    "faithful english translation", "verified english translation",
+                    "translation", "todo", "tbd", "n/a",
+                }
+                if (
+                    not translation
+                    or not re.search(r"^\s*>\s*\S", translation, re.MULTILINE)
+                    or contains_chinese(translation_text)
+                    or not re.search(r"[A-Za-z]", translation_text)
+                    or translation_text.casefold().strip("[].。") in placeholders
+                ):
+                    errors.append(
+                        f"Claim {claim_id} 的中文最小原文证据缺少有效的经核验英文严格翻译：{path}"
+                    )
 
     external_groups: dict[str, list[tuple[int, str, Path]]] = {}
     for claim_id, path in claim_ids.items():
@@ -1167,17 +1248,19 @@ def validate_claims(root: Path, errors: list[str], warnings: list[str]) -> None:
             )
 
 
-def formal_claim_index(root: Path) -> dict[str, Path]:
-    """Return the current Formal Claim IDs and their concrete files."""
+def formal_claim_index(root: Path) -> dict[str, tuple[Path, str]]:
+    """Return current Formal Claim IDs with their files and complete Claim blocks."""
     marker = re.compile(r"^\s*[-*]\s*Claim ID[：:]\s*([A-Za-z0-9_.-]+)\s*$", re.MULTILINE)
-    index: dict[str, Path] = {}
+    index: dict[str, tuple[Path, str]] = {}
     formal_root = root / "03_正式知识"
     if not formal_root.is_dir():
         return index
     for path in formal_root.rglob("*.md"):
         text = path.read_text(encoding="utf-8-sig")
-        for match in marker.finditer(text):
-            index.setdefault(match.group(1), path)
+        matches = list(marker.finditer(text))
+        for position, match in enumerate(matches):
+            end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
+            index.setdefault(match.group(1), (path, text[match.start():end]))
     return index
 
 
@@ -1503,6 +1586,27 @@ def validate_project_profile(root: Path, errors: list[str], warnings: list[str])
             errors.append(f"暂时无法访问站点缺少重试条件：{website_id}")
 
 
+def validate_maintenance_state(root: Path, errors: list[str]) -> None:
+    """Reject stale project todo state and non-canonical index descriptions."""
+    alias = root / "02_源资料/source-index说明.md"
+    if alias.exists():
+        errors.append(f"发现非标准索引说明文件，必须统一为源资料搜索索引说明.md：{alias}")
+    info_path = root / "01_工作台/10_项目基础信息.md"
+    todo_path = root / "01_工作台/20_当前待办.md"
+    if not info_path.is_file() or not todo_path.is_file():
+        return
+    info = info_path.read_text(encoding="utf-8-sig")
+    todo = todo_path.read_text(encoding="utf-8-sig")
+    project_id = parse_field(info, "项目ID")
+    profile_status = parse_field(info, "画像状态")
+    source_complete = (root / "02_源资料/source-index.sqlite").is_file()
+    project_row = next((line for line in todo.splitlines() if project_id and line.startswith(f"| {project_id} |")), "")
+    if profile_status == "已完成" and source_complete and project_row:
+        errors.append(f"官网画像和来源索引均已完成，但当前待办仍保留项目初始化事项：{todo_path}")
+    if profile_status in {"待执行", "待重新画像", "官网不可访问，待重试"} and not project_row:
+        errors.append(f"官网画像尚未完成，但当前待办没有项目级重试事项：{todo_path}")
+
+
 def validate_competitor_policy(root: Path, errors: list[str], warnings: list[str]) -> None:
     """Check that the project/article templates carry the non-relaxable competitor boundary."""
     project_info = root / "01_工作台/10_项目基础信息.md"
@@ -1572,7 +1676,7 @@ def validate_layout(
 ) -> None:
     """Report naming and layout drift without renaming an existing project."""
     if not PROJECT_ROOT_PATTERN.fullmatch(root.name):
-        warnings.append(f"项目根目录不符合统一命名 [项目ID]_[企业中文名称]知识库_v0.6：{root}")
+        warnings.append(f"Obsidian知识库项目目录不符合统一命名 [项目ID]_[企业中文名称]知识库（历史项目可保留_v0.6）：{root}")
     for relative in REQUIRED_LAYOUT_DIRECTORIES:
         if not (root / relative).is_dir():
             warnings.append(f"缺少标准项目目录：{root / relative}")
@@ -1602,6 +1706,8 @@ def validate_layout(
         for heading in ("## 官网初步画像", RELATED_WEBSITE_SECTION, "## 人工接触节点", "## 七个业务模块入口"):
             if heading not in text:
                 warnings.append(f"项目基础信息缺少标准小节 {heading}：{info}")
+        if not parse_field(text, "项目根目录"):
+            warnings.append(f"项目基础信息缺少项目根目录：{info}")
         if "目标市场与语言：" not in text:
             warnings.append(f"项目基础信息应使用统一字段“目标市场与语言”：{info}")
 
@@ -1763,7 +1869,7 @@ def validate_article_state_gates(
                 re.MULTILINE,
             )
             outline_body = outline_match.group(1).strip() if outline_match else ""
-            outline_status = parse_field(outline_body, "大纲状态")
+            outline_status = parse_field(request_text, "大纲状态") or parse_field(outline_body, "大纲状态")
             outline_content = re.sub(r"^\s*-\s*大纲状态[：:].*$", "", outline_body, flags=re.MULTILINE).strip()
             if not outline_match or outline_status != "已确认" or not outline_content or outline_content in {"待定", "待知识准备后按原写作流程确定"}:
                 errors.append(f"交付前文章知识需求的大纲必须非空且标记“已确认”：{request_path}")
@@ -1849,6 +1955,7 @@ def validate_article_knowledge_packages(
             continue
         material_text = material_path.read_text(encoding="utf-8-sig")
         audit_path = material_path.with_name("35_写作素材来源索引.md")
+        english_target = is_english_target(parse_field(material_text, "目标语言"))
         if parse_field(material_text, "资料视图") != "写作素材包":
             warnings.append(f"文章仍使用旧审计混合资料包，建议后续重建30/35文件对：{material_path}")
             continue
@@ -2005,6 +2112,23 @@ def validate_article_knowledge_packages(
                 if not all(evidence_scope[start - 1:end]):
                     errors.append(f"35映射必须完全位于30的证据正文内（{start}-{end}）：{audit_path}")
                     continue
+                if english_target and claim_id in claim_index:
+                    _, claim_block = claim_index[claim_id]
+                    original_text = normalized_evidence_text(
+                        markdown_section(claim_block, "最小原文证据")
+                    )
+                    if contains_chinese(original_text):
+                        translation_text = normalized_evidence_text(
+                            markdown_section(claim_block, "经核验英文严格翻译")
+                        )
+                        mapped_text = normalized_evidence_text(
+                            "\n".join(material_lines[start - 1:end])
+                        )
+                        if not translation_text or translation_text not in mapped_text:
+                            errors.append(
+                                f"英文30未完整复用Claim {claim_id} 已保存的经核验英文严格翻译"
+                                f"（{start}-{end}）：{audit_path}"
+                            )
                 mapping_ranges.append((start, end))
             for index, in_evidence in enumerate(evidence_scope, 1):
                 if not in_evidence or not material_lines[index - 1].strip():
@@ -2177,11 +2301,26 @@ def validate_articles(
         if Path(metric["article_file"]).resolve() != article.resolve():
             errors.append(f"Faithfulness记录的文章路径不匹配：{article_id}")
         elif sha256_file(article) != metric["article_sha256"]:
-            message = f"文章正文已修改，Faithfulness已失效：{article_id}"
-            if state == "40_已完成":
-                errors.append(message)
+            semantic_changed = True
+            prepared_path = Path(metric.get("prepared_file", ""))
+            if prepared_path.is_file():
+                try:
+                    prepared = json.loads(prepared_path.read_text(encoding="utf-8-sig"))
+                    expected = [
+                        {"line": str(item.get("line")), "text": str(item.get("text", ""))}
+                        for item in prepared.get("article_lines", [])
+                    ]
+                    semantic_changed = expected != parsed_article_lines(article)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    semantic_changed = True
+            if semantic_changed:
+                message = f"文章正文内容已修改，Faithfulness已失效：{article_id}"
+                if state == "40_已完成":
+                    errors.append(message)
+                else:
+                    warnings.append(message)
             else:
-                warnings.append(message)
+                warnings.append(f"文章Markdown格式或编码已变化，但正文内容未变：{article_id}")
         if state == "40_已完成" and receipt.is_file():
             receipt_text = receipt.read_text(encoding="utf-8-sig")
             if parse_field(receipt_text, "当前状态") not in {"已导入，观察完成", "已导入，存在待处理事项"}:
@@ -2415,6 +2554,26 @@ def run_self_test() -> int:
 ### 最小原文证据
 
 > Customer source text.
+
+- Claim ID：CLM-DEMO-SELECT-005
+- Claim：客户事实。
+- 适用范围：项目级
+- 来源类型：客户源文件
+- 来源链接：客户原始资料
+- 精确位置：第2页
+- 日期或版本：2026-08-26
+- 归类模块：产品介绍
+- 归类依据：本条主要说明客户产品本身的已核验属性，不涉及交付流程或服务方法。
+- 使用边界：仅限客户资料明确范围
+- 状态：可用
+
+### 最小原文证据
+
+> 已核验的客户事实。
+
+### 经核验英文严格翻译
+
+> Verified customer fact.
 """,
             encoding="utf-8",
         )
@@ -2425,6 +2584,21 @@ def run_self_test() -> int:
         if claim_errors:
             print(json.dumps({"ok": False, "stage": "valid-claim-evidence-and-namespaces", "errors": claim_errors}, ensure_ascii=False))
             return 1
+
+        valid_customer_text = customer.read_text(encoding="utf-8")
+        customer.write_text(valid_customer_text.replace(
+            "\n### 经核验英文严格翻译\n\n> Verified customer fact.\n", "\n", 1
+        ), encoding="utf-8")
+        missing_translation_errors: list[str] = []
+        validate_claims(root, missing_translation_errors, [])
+        if not any("经核验英文严格翻译" in item for item in missing_translation_errors):
+            print(json.dumps({
+                "ok": False,
+                "stage": "missing-chinese-claim-translation",
+                "errors": missing_translation_errors,
+            }, ensure_ascii=False))
+            return 1
+        customer.write_text(valid_customer_text, encoding="utf-8")
 
         external.write_text(external.read_text(encoding="utf-8").replace(
             "CLM-EXT-DEMO-SELECT-001", "CLM-EXT-DEMO-SELECT-003", 1
@@ -2574,13 +2748,15 @@ def run_self_test() -> int:
         formal_demo = root / "03_正式知识/demo.md"
         formal_demo.parent.mkdir(parents=True, exist_ok=True)
         formal_demo.write_text(
-            "# Demo正式知识\n\n- Claim ID：CLM-DEMO-001\n- Claim标题：Demo fact\n",
+            "# Demo正式知识\n\n- Claim ID：CLM-DEMO-001\n- Claim标题：Demo fact\n\n"
+            "### 最小原文证据\n\n> 已核验事实。\n\n"
+            "### 经核验英文严格翻译\n\n> Verified fact.\n",
             encoding="utf-8",
         )
         (valid_task / "10_文章知识需求.md").write_text(
             f"# 文章知识需求\n\n- 文章ID：{article_id}\n- 当前版本：v1\n"
-            "- 文章标题：测试文章\n- 目标语言：中文\n- 关键词：测试\n\n"
-            "## 大纲\n\n- 大纲状态：已确认\n\n测试文章的基本组织方向。\n",
+            "- 文章标题：测试文章\n- 目标语言：中文\n- 关键词：测试\n- 大纲状态：已确认\n\n"
+            "## 大纲\n\n测试文章的基本组织方向。\n",
             encoding="utf-8",
         )
         (valid_task / "15_检索与知识准备记录.md").write_text(
@@ -2636,6 +2812,30 @@ def run_self_test() -> int:
             return 1
         audit_path = valid_task / "35_写作素材来源索引.md"
         valid_audit_text = audit_path.read_text(encoding="utf-8")
+        valid_material_text = material_path.read_text(encoding="utf-8")
+        material_path.write_text(
+            valid_material_text.replace("> Verified fact.", "> Newly translated wording.", 1),
+            encoding="utf-8",
+        )
+        audit_path.write_text(
+            re.sub(
+                r"(?m)^- 写作素材SHA-256：.*$",
+                f"- 写作素材SHA-256：{sha256_file(material_path)}",
+                valid_audit_text,
+            ),
+            encoding="utf-8",
+        )
+        retranslation_errors: list[str] = []
+        validate_article_knowledge_packages(root, retranslation_errors, [])
+        if not any("英文30未完整复用Claim" in item for item in retranslation_errors):
+            print(json.dumps({
+                "ok": False,
+                "stage": "retranslated-english-30",
+                "errors": retranslation_errors,
+            }, ensure_ascii=False))
+            return 1
+        material_path.write_text(valid_material_text, encoding="utf-8")
+        audit_path.write_text(valid_audit_text, encoding="utf-8")
         audit_path.write_text(valid_audit_text.replace("| 23 | 23 |", "| 18 | 18 |"), encoding="utf-8")
         boundary_errors: list[str] = []
         validate_article_knowledge_packages(root, boundary_errors, [])
@@ -2908,6 +3108,7 @@ def main() -> None:
     validate_source_exclusions(root, errors, warnings)
     validate_version_entry(root, errors, warnings)
     validate_project_profile(root, errors, warnings)
+    validate_maintenance_state(root, errors)
     validate_competitor_policy(root, errors, warnings)
     validate_layout(root, errors, warnings, strict_coverage=args.completion_gate)
     validate_version_archives(root, errors)

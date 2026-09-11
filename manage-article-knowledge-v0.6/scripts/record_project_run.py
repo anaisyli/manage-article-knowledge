@@ -213,7 +213,7 @@ def locked_ledger(ledger_path: Path, timeout_seconds: float = 15.0) -> Iterator[
 def append_record(project_root: Path, record: dict) -> Path:
     project_root = project_root.expanduser().resolve()
     if not project_root.is_dir():
-        raise FileNotFoundError(f"项目根目录不存在：{project_root}")
+        raise FileNotFoundError(f"Obsidian项目路径不存在：{project_root}")
     validate_record(record)
     ledger = project_root / LEDGER_RELATIVE
     ledger.parent.mkdir(parents=True, exist_ok=True)

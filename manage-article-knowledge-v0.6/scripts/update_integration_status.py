@@ -39,6 +39,12 @@ EVENTS = {
     "monthly_review_success": "月度审核完成",
     "monthly_review_failure": "月度审核失败",
     "interface_reconfirmed": "接入接口重新确认",
+    "integration_check_success": "接入检查通过",
+}
+INTERFACE_FAILURE_EVENTS = {
+    "writing_task_failure",
+    "final_received_failure",
+    "faithfulness_import_failure",
 }
 
 
@@ -231,13 +237,14 @@ def update(
             error_value += f"｜{context}"
         text, found = _replace_summary_field(text, "最近一次异常", error_value)
         changed = changed or found
-        text, found = _replace_field(text, "接入状态", "异常，待重新确认")
-        changed = changed or found
+        if event in INTERFACE_FAILURE_EVENTS:
+            text, found = _replace_field(text, "接入状态", "异常，待重新确认")
+            changed = changed or found
     if event == "monthly_automation_configured":
         trigger_value = trigger.strip() or f"Codex总控自动化（配置时间：{timestamp}）"
         text, found = _replace_summary_field(text, "月度审核触发器", trigger_value)
         changed = changed or found
-    if event == "interface_reconfirmed":
+    if event in {"interface_reconfirmed", "integration_check_success"}:
         text, found = _replace_field(text, "接入状态", _infer_state(text))
         changed = changed or found
     if changed:
@@ -274,6 +281,10 @@ def self_test() -> None:
         content = read_text(config)
         if "月度审核触发器：Codex总控自动化" not in content:
             raise SystemExit("self-test failed: trigger event")
+        update(project, "monthly_review_failure", error="月报校验失败", at="2026-09-03T10:01:30+08:00")
+        content = read_text(config)
+        if "接入状态：部分接入" not in content or "月报校验失败" not in content:
+            raise SystemExit("self-test failed: monthly failure must not change integration state")
         update(project, "faithfulness_import_failure", error="哈希不匹配", at="2026-09-03T10:02:00+08:00")
         content = read_text(config)
         if "接入状态：异常，待重新确认" not in content or "哈希不匹配" not in content:
