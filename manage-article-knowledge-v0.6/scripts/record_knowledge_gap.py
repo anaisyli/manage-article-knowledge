@@ -15,11 +15,13 @@ from build_coverage_view import rebuild_view
 
 FIELDS = (
     "gap_key", "gap_topic", "gap_type", "trigger_basis", "article_ids",
-    "article_count", "status", "current_impact", "next_action", "first_seen",
+    "article_count", "current_article_ids", "current_article_count",
+    "status", "current_impact", "next_action", "first_seen",
     "last_seen", "related_governance_ref",
 )
-DIRECT_RESEARCH_BASES = {"核心章节首次", "高风险事实首次", "重复文章"}
-STATUSES = {"观察中", "待外部调研", "已解决", "已关闭"}
+LEGACY_FIELDS = tuple(field for field in FIELDS if field not in {"current_article_ids", "current_article_count"})
+DIRECT_RESEARCH_BASES = {"核心章节首次", "高风险事实首次"}
+STATUSES = {"观察中", "待外部调研", "部分解决", "已解决", "已关闭"}
 CHINESE_TEXT_FIELDS = ("topic", "current_impact", "next_action")
 
 
@@ -52,9 +54,15 @@ def read_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != FIELDS:
+        fieldnames = tuple(reader.fieldnames or ())
+        if fieldnames not in {FIELDS, LEGACY_FIELDS}:
             raise ValueError(f"知识缺口CSV字段不符合v0.6：{path}")
-        return [{field: row.get(field, "") for field in FIELDS} for row in reader]
+        rows = [{field: row.get(field, "") for field in FIELDS} for row in reader]
+        if fieldnames == LEGACY_FIELDS:
+            for row in rows:
+                row["current_article_ids"] = row["article_ids"]
+                row["current_article_count"] = row["article_count"]
+        return rows
 
 
 def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
@@ -76,7 +84,7 @@ def normalized_article_ids(value: str) -> list[str]:
 def merge_duplicate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """Canonicalize legacy duplicate public-gap rows before the next write."""
     merged: dict[str, dict[str, str]] = {}
-    status_rank = {"已关闭": 0, "已解决": 1, "观察中": 2, "待外部调研": 3}
+    status_rank = {"已关闭": 0, "已解决": 1, "观察中": 2, "部分解决": 3, "待外部调研": 4}
     for row in rows:
         topic_key = normalized_topic(row.get("gap_topic", "")) or row.get("gap_key", "")
         current = merged.get(topic_key)
@@ -87,6 +95,11 @@ def merge_duplicate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         ids = normalized_article_ids(current.get("article_ids", "") + ";" + row.get("article_ids", ""))
         current["article_ids"] = ";".join(ids)
         current["article_count"] = str(len(ids))
+        current_ids = normalized_article_ids(
+            current.get("current_article_ids", "") + ";" + row.get("current_article_ids", "")
+        )
+        current["current_article_ids"] = ";".join(current_ids)
+        current["current_article_count"] = str(len(current_ids))
         if status_rank.get(row.get("status", ""), 0) > status_rank.get(current.get("status", ""), 0):
             current["status"] = row.get("status", "")
         if row.get("first_seen", "") and (not current.get("first_seen") or row["first_seen"] < current["first_seen"]):
@@ -99,20 +112,24 @@ def merge_duplicate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         current["related_governance_ref"] = ";".join(refs) if refs else "无"
         if len(row.get("gap_topic", "")) > len(current.get("gap_topic", "")):
             current["gap_topic"] = row["gap_topic"]
-        if len(ids) >= 2 and current.get("trigger_basis") == "首篇普通缺口":
+        if len(current_ids) >= 2 and current.get("trigger_basis") == "首篇普通缺口":
             current["trigger_basis"] = "重复文章"
     return list(merged.values())
 
 
 def lifecycle_status(previous: str, trigger_basis: str, article_count: int) -> str:
+    if previous == "部分解决":
+        return "部分解决"
     if trigger_basis in DIRECT_RESEARCH_BASES or article_count >= 2:
         return "待外部调研"
     if previous in {"已解决", "已关闭"}:
-        return "观察中"
+        raise ValueError("已解决/已关闭缺口不能隐式追加未覆盖主张；请先核对解决范围，明确重开原问题或建立新缺口")
     return previous if previous in {"观察中", "待外部调研"} else "观察中"
 
 
 def default_next_action(status: str) -> str:
+    if status == "部分解决":
+        return "核对现有RES和正式Claim的支持范围，对剩余稳定问题开展定向外部调研"
     if status == "待外部调研":
         return "按本篇已批准范围开展定向外部调研；若禁止新调研则保留状态并缩小或排除无支持内容"
     if status == "已解决":
@@ -138,10 +155,18 @@ def main() -> None:
     parser.add_argument("--next-action", default="")
     parser.add_argument("--related-governance-ref", default="无")
     parser.add_argument("--set-status", choices=tuple(sorted(STATUSES)))
+    parser.add_argument("--reopen-reason", default="", help="已解决/已关闭原问题重新出现时的具体范围与证据缺口")
+    parser.add_argument("--resolution-scope", default="", help="已解决/部分解决时逐项写明已有证据覆盖范围及剩余边界")
     args = parser.parse_args()
 
-    if args.set_status == "已解决" and "RES-" not in (args.related_governance_ref or ""):
-        raise SystemExit("--set-status 已解决 必须同时提供包含 RES- 的 --related-governance-ref")
+    if args.set_status in {"已解决", "部分解决"} and "RES-" not in (args.related_governance_ref or ""):
+        prior = next((row for row in read_rows(args.csv) if row["gap_key"] == args.gap_key), None)
+        if not prior or "RES-" not in prior.get("related_governance_ref", ""):
+            raise SystemExit("--set-status 已解决/部分解决 必须关联已核验的 RES- 调研记录")
+    if args.set_status in {"已解决", "部分解决"}:
+        if len(args.resolution_scope.strip()) < 12:
+            raise SystemExit("--set-status 已解决/部分解决 必须提供具体 --resolution-scope")
+        require_human_chinese(args.resolution_scope, "resolution_scope")
 
     try:
         date.fromisoformat(args.article_date)
@@ -181,23 +206,43 @@ def main() -> None:
             "trigger_basis": args.trigger_basis,
             "article_ids": ";".join(article_ids),
             "article_count": str(len(article_ids)),
+            "current_article_ids": ";".join(article_ids),
+            "current_article_count": str(len(article_ids)),
             "status": status,
             "current_impact": args.current_impact.strip(),
             "next_action": args.next_action.strip() or default_next_action(status),
             "first_seen": args.article_date,
             "last_seen": args.article_date,
-            "related_governance_ref": args.related_governance_ref.strip() or "无",
+            "related_governance_ref": ";".join(filter(None, (
+                args.related_governance_ref.strip(),
+                f"解决范围：{args.resolution_scope.strip()}" if args.resolution_scope.strip() else "",
+            ))) or "无",
         }
         rows.append(row)
     else:
+        if existing["status"] in {"已解决", "已关闭"} and args.set_status not in {"已解决", "已关闭"}:
+            if not args.reopen_reason.strip() or len(args.reopen_reason.strip()) < 12:
+                raise SystemExit("重开已解决/已关闭缺口必须提供具体 --reopen-reason；新知识问题应使用新gap_key")
+            require_human_chinese(args.reopen_reason, "reopen_reason")
+        if existing["status"] == "已关闭" and args.set_status == "已解决":
+            raise SystemExit("已关闭缺口不能直接标为已解决；先明确重开依据")
+        if existing["status"] == "已解决" and args.set_status == "已解决" and args.article_id.strip() not in normalized_article_ids(existing["article_ids"]):
+            raise SystemExit("不能把新文章的未覆盖主张追加到已解决缺口；已覆盖内容不应登记缺口")
         article_ids = normalized_article_ids(existing["article_ids"])
         if args.article_id.strip() not in article_ids:
             article_ids.append(args.article_id.strip())
         article_count = len(article_ids)
+        current_article_ids = normalized_article_ids(existing.get("current_article_ids", ""))
+        if args.article_id.strip() not in current_article_ids:
+            current_article_ids.append(args.article_id.strip())
+        current_article_count = len(current_article_ids)
         basis = args.trigger_basis
-        if article_count >= 2 and basis == "首篇普通缺口":
+        if current_article_count >= 2 and basis == "首篇普通缺口":
             basis = "重复文章"
-        status = args.set_status or lifecycle_status(existing["status"], basis, article_count)
+        try:
+            status = args.set_status or lifecycle_status(existing["status"], basis, current_article_count)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         old_topic = existing.get("gap_topic", "").strip()
         # Prefer a more descriptive wording while preserving the stable key.
         preferred_topic = args.topic.strip() if len(args.topic.strip()) > len(old_topic) else old_topic
@@ -206,11 +251,18 @@ def main() -> None:
             "trigger_basis": basis,
             "article_ids": ";".join(article_ids),
             "article_count": str(article_count),
+            "current_article_ids": ";".join(current_article_ids),
+            "current_article_count": str(current_article_count),
             "status": status,
             "current_impact": args.current_impact.strip(),
             "next_action": args.next_action.strip() or default_next_action(status),
             "last_seen": args.article_date,
-            "related_governance_ref": args.related_governance_ref.strip() or existing["related_governance_ref"] or "无",
+            "related_governance_ref": ";".join(filter(None, (
+                existing["related_governance_ref"] if existing["related_governance_ref"] != "无" else "",
+                args.related_governance_ref.strip() if args.related_governance_ref.strip() not in existing["related_governance_ref"] else "",
+                f"重开依据：{args.reopen_reason.strip()}" if args.reopen_reason.strip() else "",
+                f"解决范围：{args.resolution_scope.strip()}" if args.resolution_scope.strip() else "",
+            ))) or "无",
         })
         row = existing
     write_rows(args.csv, rows)
@@ -224,6 +276,7 @@ def main() -> None:
     if merged_key:
         print(f"merged_existing_gap_key={merged_key}")
     print(f"article_count={row['article_count']}")
+    print(f"current_article_count={row['current_article_count']}")
     print(f"status={row['status']}")
 
 

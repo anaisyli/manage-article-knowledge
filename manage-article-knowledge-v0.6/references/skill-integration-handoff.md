@@ -4,9 +4,9 @@
 
 ## 交接合同版本
 
-本规范的人类可读说明与同目录的`handoff-contract.json`共同构成交接合同；其中JSON是字段、版本、执行器和事件必填项的唯一机器真源。当前合同版本为`MAK-HANDOFF-1.2`。三个Skill每次运行都从当前已安装的`manage-article-knowledge`读取该文件，不在各自目录复制第二份完整合同。`MAK-HANDOFF-1.1`仅为已开始链路保留输入兼容；新任务和新完成回执使用当前版本。
+本规范的人类可读说明与同目录的`handoff-contract.json`共同构成交接合同；其中JSON是字段、版本、执行器和事件必填项的唯一机器真源。当前合同版本为`MAK-HANDOFF-1.3`。三个Skill每次运行都从当前已安装的`manage-article-knowledge`读取该文件，不在各自目录复制第二份完整合同。`MAK-HANDOFF-1.1`和`MAK-HANDOFF-1.2`仅为已开始链路保留输入兼容；新任务和新完成回执使用当前版本。
 
-`writing_request`、`writing_ready`、`writing_completed`、`faithfulness_request`、`faithfulness_completed`和`article_completed`都必须携带`handoff_contract_version`。合同的`event_lifecycle`是终止语义真源：前五个事件都不是整条任务的成功终点，只有知识库导入审核结果并返回`article_completed`才算正常完成。接收方先校验版本和本事件必填字段，再执行任何落盘或状态迁移。缺少版本或版本不在`compatible_versions`中时，返回`handoff_error`，保留当前任务状态，不猜测字段、不自动降级到另一套流程：
+`writing_request`、`writing_ready`、`writing_completed`、`writing_retry_required`、`faithfulness_request`、`faithfulness_completed`和`article_completed`都必须携带`handoff_contract_version`。合同的`event_lifecycle`是终止语义真源：除`article_completed`外，这些事件都不是整条任务的成功终点；只有知识库导入审核结果并返回`article_completed`才算正常完成。接收方先校验版本和本事件必填字段，再执行任何落盘或状态迁移。缺少版本或版本不在`compatible_versions`中时，返回`handoff_error`，保留当前任务状态，不猜测字段、不自动降级到另一套流程：
 
 ```text
 handoff_event: handoff_error
@@ -121,16 +121,20 @@ completed_at: 完成时间
 
 `final_path`是必需字段；文章ID和版本不是写作方的硬性要求。知识库收到后按本文第5节的匹配顺序确定归属，并在内部`40_最终文章.md`中补齐文章ID、版本、完成日期和标题，然后自动进入Faithfulness交接。写作 Skill不得只回复“写好了”而不提供终稿绝对路径，也不得把`35`、正式知识或Faithfulness结果写回自己的文章目录。
 
+`final_path`为DOCX时，知识库桥接器读取Word段落样式并把明确的`Title`、`Heading 1-6`、`outlineLvl`及已登记`Section Label/Section Title/Subheading`类样式转换为Markdown标题，保留来源样式标记；普通段落不按粗体、字号、短句或空行外观推断标题。Faithfulness把这些结构标题硬排除并以灰色展示。写作Skill不需要生成额外Markdown副本，也不得为了审核手工改写标题为正文。
+
 ### 0.4 同一大纲重做的两种模式
 
 人工要求重做既有文章时，当前Codex必须从合同的`revision_modes`中选择且只能选择一种；不得把“重新整理知识”降级为只改文章，也不得因为最终仍复用旧Claim就声称没有重新检查：
 
 | 人工短提示词 | `revision_mode` | 知识库动作 | 写作动作 |
 |---|---|---|---|
-| `按原大纲重新整理知识并重写这篇文章：[文章ID或明确文章入口]` | `knowledge_refresh_and_rewrite` | 完整归档旧任务、递增版本、保留原大纲；重新执行六层检索、复杂资料处理、旧Claim逐条核验与重新归类，重建`15/20/30/35`并重新通过`writing_ready`门禁 | 收到新`writing_ready`后，使用新30完整执行原写作流程 |
+| `按原大纲重新整理知识并重写这篇文章：[文章ID或明确文章入口]` | `knowledge_refresh_and_rewrite` | 完整归档旧任务、递增版本、保留原大纲；重新执行六层检索、复杂资料处理、旧Claim逐条核验与重新归类，并从归档`50`继承旧Faithfulness缺口。重复、核心或高风险公共缺口达到门槛时先完成正式外部调研，再重建`15/20/30/35`并通过`writing_ready`门禁；没有更合适的新事实时记录“重新核验后继续沿用现有Claim”，不暂停 | 收到新`writing_ready`后，使用新30完整执行原写作流程 |
 | `知识不变，只按原大纲重写这篇文章：[文章ID或明确文章入口]` | `article_rewrite_only` | 完整归档旧任务、递增版本；校验并复用当前`15/20/30/35`，清除旧终稿和旧Faithfulness当前状态 | 收到复用素材包的`writing_ready`后完整执行原写作流程 |
 
-两个模式都锁定当前已确认简要大纲。人工不需要填写Claim、目录、版本或脚本参数；知识库从当前任务身份和归档合同自动取得。若人工同时要求改变大纲，该请求不属于这两个快捷模式，必须先作为新的明确修订需求确认，不能把新大纲塞进任一快捷模式继续。重做请求必须携带`revision_mode`、`base_article_id`和`base_article_version`；具体条件与版本格式以当前`handoff-contract.json`为机器真源。既有任务无法唯一定位时返回人话错误并停止，禁止按标题相似度、最新文件或临时修改桥接代码继续。
+两个模式都锁定当前已确认简要大纲。人工不需要填写Claim、目录、版本或脚本参数；知识库从当前任务身份和归档合同自动取得。若人工同时要求改变大纲，该请求不属于这两个快捷模式，必须先作为新的明确修订需求确认，不能把新大纲塞进任一快捷模式继续。**桥接器发现重做提交的大纲与基线不同，必须暂停当前文章并记录`writing_task_outline_confirmation_required`（大纲变更待确认）；这属于文章级需求校验，不是写作任务入口失效，不得把接入配置改为`异常，待重新确认`。确认或修正后，同一外部任务按原大纲成功读取时记录文章级恢复；不自动改大纲、不自动建版本，也不影响其他文章。**重做请求必须携带`revision_mode`、`base_article_id`和`base_article_version`；具体条件与版本格式以当前`handoff-contract.json`为机器真源。既有任务无法唯一定位时返回人话错误并停止，禁止按标题相似度、最新文件或临时修改桥接代码继续。
+
+`knowledge_refresh_and_rewrite`进入`10_进行中`后，`advance_ready_tasks.py`先调用知识重整收口器。模板表头、汇总数字、旧Claim处置枚举、缺失复核行等可由现有记录唯一确定的问题必须自动修复后复验；输出`research_required=<GAP-ID>`表示内部下一阶段，不是`needs_human`或`handoff_error`。当前Codex必须按[外部调研执行与沉淀合同](external-research-contract.md)继续，完成RES证据、正式公共Claim和缺口状态更新后重跑推进脚本。只有外部访问/工具/权限失败、事实冲突、缺少不可替代材料或无法从现有证据唯一决定的语义问题才允许停下。
 
 ## 1. 三方职责
 
@@ -138,7 +142,7 @@ completed_at: 完成时间
 |---|---|---|
 | 写作 Skill | 产生每周文章任务；读取本篇 `30`；按运营要求生成终稿；在能做到时带回文章ID和版本，至少返回配置中约定的终稿位置 | 不修改正式知识、`35`、Faithfulness结果或知识治理台账 |
 | 知识库 Skill | 将外部任务转换为`10`；执行既有知识准备；生成`30/35`；接收终稿；创建`50`；导入审核结果和Claim支撑记录 | 不写文章，不执行Faithfulness语义判断，不接管各组写作规则 |
-| Faithfulness Skill | 只用当前`40`和实际交给写作者的当前`30`独立审核；输出兼容结果 | 不读取`35`、完整知识库或原始资料来扩大审核上下文，不回写知识库项目 |
+| Faithfulness Skill | 只用当前`40`和实际交给写作者的当前`30`执行双轮全文主张识别与三态审核；确定性排除结构标题，并按当前规则决定同质枚举的集合值边界；输出机器兼容结果和不含兼容百分比的人读报告 | 不读取`35`、完整知识库或原始资料来扩大审核上下文，不回写知识库项目 |
 | 当前Codex/写作编排 | 让同一文章链路在三方之间连续运行；只接受知识库导入器签发且通过终点核验的`article_completed`作为成功终点 | 不把`writing_completed`、`faithfulness_completed`、旧版本完成记录或自然语言“已完成”当成当前文章完成凭证 |
 
 ## 2. 每个项目只有一份接入配置
@@ -300,36 +304,40 @@ result_dir: [审核总目录]/[项目ID]/[文章ID]/v[文章版本]/（由Faithf
 
 Faithfulness Skill只从`30`第一至第三节中明确标记的“证据正文”提取证据。`35`只在结果回到知识库后用于Formal Claim确定性映射，不属于审核上下文。
 
-Faithfulness Skill收到`result_root`和交接中的`project_id`后，自动创建缺失的项目、文章和版本目录。人工不需要预先建立这些子目录，也不需要确认版本目录规则。结果目录必须精确对应一个文章版本，并包含且只包含一套可导入核心结果：
+Faithfulness Skill收到`result_root`和交接中的`project_id`后，自动创建缺失的项目、文章和版本目录。人工不需要预先建立这些子目录，也不需要确认版本目录规则。结果目录必须精确对应一个文章版本，并包含且只包含一套可导入核心结果；协议2.0还必须包含独立盲审文件：
 
 ```text
 [文章ID]-prepared.json
 [文章ID]-judgments.json
 faithfulness_summary.md
+[文章ID]-adversarial-review.json
 ```
 
-prepared和judgments使用当前导入器支持的schema `1.0`；prepared必须能还原当前文章行、唯一`30`文件和其知识块；judgments必须含相同文章ID、`evaluation_mode`及唯一的文章原子事实`claim_id`，verdict只允许`supported`或`unsupported`。除非确由官方DeepEval运行，评价模式使用“DeepEval Faithfulness 规则复现（Codex 评审，非 DeepEval 官方运行）”。
+prepared继续使用schema `1.0`；协议2.0的judgments使用schema `1.1`，旧协议1.0的judgments仍按兼容规则读取。prepared必须能还原当前文章行、唯一`30`文件和其知识块；协议2.0 judgments必须含相同文章ID、`evaluation_mode`、`evaluation_protocol_version: 2.0`、`reconciliation.gate_version: 1.0`及唯一的文章原子事实`claim_id`，并与独立adversarial review逐条一致。协议2.0的adversarial review使用schema `1.0`，必须覆盖每条最终Claim并声明已完成双轮自动收敛；缺失、损坏、身份不一致、Claim行不全或语义状态不一致均拒绝导入。除非确由官方DeepEval运行，评价模式使用“DeepEval Faithfulness 规则复现（Codex 评审，非 DeepEval 官方运行）”。
 
 审核成功后，Faithfulness必须返回`handoff_event: faithfulness_completed`、请求中的同一`handoff_contract_version`以及`result_dir`、`article_id`和`article_version`。该事件只表示审核产物已生成并校验，不表示文章流程完成；当前Codex不得在这里输出最终完成回复，知识库收到后必须继续导入并在进入`40_已完成`后返回同版本的`article_completed`。找不到`deepeval-article-audit`时返回`faithfulness_skill_not_found`并保持`30_等待Faithfulness`，不得静默切换为未确认的外部流程。`faithfulness_request`是当前Codex调用审核Skill的内部事件，不是给内容运营执行的任务；只有收到`faithfulness_completed`后才继续导入并返回`article_completed`。
 
-详细字段、哈希、计数和unsupported归组必须遵守当前受管导入器的校验；本交接文件不能放宽任何导入门禁。
+详细字段、哈希、三态计数和黄色/红色归组必须遵守当前受管导入器的校验；机器字段`unsupported`继续用于兼容，但本交接文件不能把黄色解释为支持或把黄色当成红色，也不能放宽任何导入门禁。
 
 ## 7. 结果怎样自动收尾
 
 知识库 Skill只检查`50`登记的当前文章版本专属目录，不递归扫描宽泛审核根目录。结果齐全后：
 
-1. 校验文章ID、版本、当前`40`、当前`30`、prepared、judgments和summary；
-2. Faithfulness Skill生成并校验三个核心结果后返回`handoff_event: faithfulness_completed`。这只是中间交接事件，不是整条文章流程的结束；
+1. 校验文章ID、版本、当前`40`、当前`30`、prepared、judgments、summary，以及协议2.0要求的adversarial review；
+2. Faithfulness Skill按当前协议生成并校验结果后返回`handoff_event: faithfulness_completed`：协议1.0为三个核心文件，协议2.0还必须有独立adversarial review。这只是中间交接事件，不是整条文章流程的结束；
 3. 知识库收到`faithfulness_completed`后立即运行`import_faithfulness.py`，先完成预检，再按既有治理规则生成处置JSON并登记必要的gap/CUS/MAT/ANM入口；
 4. 更新`50`、文章Faithfulness明细、Claim文章支撑记录、知识缺口和项目级支撑总表；
 5. 运行项目校验，并在同一可恢复事务中将任务推进到`40_已完成`，同步当前待办和运行账本；成功后只能由`import_faithfulness.py`签发`handoff_event: article_completed`。失败、结果不完整、导入失败或迁移失败时，任务仍保持`30_等待Faithfulness`并写明不匹配项，不得提前宣告流程完成。
+
+重做模式下，如果知识库规范化后的新正文与基线版本正文完全相同，知识库返回`writing_retry_required`，说明原因并把控制权交回写作 Skill；这是自动重试，不是人工阻塞，也不进入Faithfulness。只有正文发生变化，或属于非重做的新文章，才继续Faithfulness。
 
 状态语义固定如下：
 
 | 事件 | 含义 | 是否整条流程结束 |
 |---|---|---|
 | `writing_completed` | 写作 Skill 已交付终稿 | 否 |
-| `faithfulness_completed` | Faithfulness 已生成并校验三个核心结果 | 否 |
+| `writing_retry_required` | 知识库发现重做终稿与基线正文完全相同，要求写作 Skill重新执行原写作流程 | 否 |
+| `faithfulness_completed` | Faithfulness 已生成并校验当前协议要求的结果文件 | 否 |
 | `article_completed` | 知识库已导入结果、更新治理记录并进入`40_已完成` | 是 |
 
 最终完成回执固定为：

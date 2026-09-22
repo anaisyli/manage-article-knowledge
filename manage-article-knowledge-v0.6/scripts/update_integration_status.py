@@ -26,12 +26,16 @@ SUMMARY_FIELDS = (
     "月度审核触发器",
     "最近一次接入事件",
     "最近一次异常",
+    "最近一次文章级问题",
+    "最近一次文章级恢复",
 )
 EVENTS = {
     "check": "接入检查",
     "writing_task_success": "成功读取写作任务",
     "writing_task_failure": "读取写作任务失败",
+    "writing_task_outline_confirmation_required": "大纲变更待确认",
     "final_received_success": "成功接收终稿",
+    "writing_retry_required": "重写终稿退回写作流程",
     "final_received_failure": "接收终稿失败",
     "faithfulness_import_success": "成功导入Faithfulness结果",
     "faithfulness_import_failure": "导入Faithfulness结果失败",
@@ -46,6 +50,7 @@ INTERFACE_FAILURE_EVENTS = {
     "final_received_failure",
     "faithfulness_import_failure",
 }
+ARTICLE_LEVEL_EVENTS = {"writing_task_outline_confirmation_required"}
 
 
 def read_text(path: Path) -> str:
@@ -122,6 +127,14 @@ def _replace_summary_field(text: str, label: str, value: str) -> tuple[str, bool
     if not found:
         return text, False
     return text[:start] + updated + text[end:], True
+
+
+def _summary_value(text: str, label: str) -> str:
+    bounds = _summary_slice(text)
+    if bounds is None:
+        return ""
+    start, end = bounds
+    return field(text[start:end], label)
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -229,6 +242,22 @@ def update(
     if success_field:
         text, found = _replace_summary_field(text, success_field, event_value)
         changed = changed or found
+        # A corrected resubmission clears the article-level recovery trail,
+        # without pretending that an earlier article-level question was an
+        # integration outage.  Match by the stable external task key when it
+        # is available; a missing key is never allowed to close another task.
+        prior_issue = _summary_value(text, "最近一次文章级问题")
+        if external_task_key and f"任务键：{external_task_key.strip()}" in prior_issue:
+            text, found = _replace_summary_field(text, "最近一次文章级恢复", event_value)
+            changed = changed or found
+    if event in ARTICLE_LEVEL_EVENTS:
+        issue_value = f"{timestamp}｜{EVENTS[event]}"
+        if error:
+            issue_value += f"｜{error.strip().replace(chr(10), ' ')}"
+        if context:
+            issue_value += f"｜{context}"
+        text, found = _replace_summary_field(text, "最近一次文章级问题", issue_value)
+        changed = changed or found
     if event.endswith("_failure"):
         error_value = f"{timestamp}｜{EVENTS[event]}"
         if error:
@@ -289,6 +318,34 @@ def self_test() -> None:
         content = read_text(config)
         if "接入状态：异常，待重新确认" not in content or "哈希不匹配" not in content:
             raise SystemExit("self-test failed: failure event")
+        update(project, "interface_reconfirmed", at="2026-09-03T10:02:30+08:00")
+        update(
+            project,
+            "writing_task_outline_confirmation_required",
+            external_task_key="DEMO-001",
+            article_id="A-1",
+            article_version="v2",
+            error="提交大纲与基线不同",
+            at="2026-09-03T10:03:00+08:00",
+        )
+        content = read_text(config)
+        if (
+            "最近一次文章级问题：2026-09-03T10:03:00+08:00" not in content
+            or "大纲变更待确认" not in content
+            or "接入状态：异常，待重新确认" in content
+        ):
+            raise SystemExit("self-test failed: article-level outline issue")
+        update(
+            project,
+            "writing_task_success",
+            external_task_key="DEMO-001",
+            article_id="A-1",
+            article_version="v2",
+            at="2026-09-03T10:04:00+08:00",
+        )
+        content = read_text(config)
+        if "最近一次文章级恢复：2026-09-03T10:04:00+08:00" not in content:
+            raise SystemExit("self-test failed: article-level recovery")
     print("self-test=passed")
 
 

@@ -48,75 +48,82 @@ def parse_field(text: str, label: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _article_package_ready(task_dir: Path) -> bool:
-    """Require a coherent 30/35 pair before an in-progress task can advance."""
+def article_package_errors(task_dir: Path) -> list[str]:
+    """Return all actionable 30/35 package errors in one pass."""
+    task_dir = task_dir.resolve()
+    errors: list[str] = []
     material = task_dir / "30_本篇知识库资料.md"
-    audit = task_dir / "35_写作素材来源索引.md"
-    if not material.is_file() or not audit.is_file():
-        return False
-    # The delivery gate must use the same complete contracts as project validation;
-    # presence of files alone is not evidence that the package was reviewed.
-    if validate_task_templates(task_dir):
-        return False
+    source_index = task_dir / "35_写作素材来源索引.md"
+    prewrite = task_dir / "20_文章前知识审核.md"
+    for path in (material, source_index, prewrite):
+        if not path.is_file():
+            errors.append(f"缺少文件：{path.name}")
+    if errors:
+        return errors
+
+    errors.extend(validate_task_templates(task_dir))
     material_text = material.read_text(encoding="utf-8-sig")
     material_lines = material_text.splitlines()
     evidence_scope = _evidence_scope(material_lines)
     evidence_lines = {index for index, selected in enumerate(evidence_scope, 1) if selected}
     if not evidence_lines:
-        return False
-    audit_text = audit.read_text(encoding="utf-8-sig")
-    metadata = {
-        "文章ID": None,
-        "文章版本": None,
-        "资料视图": "写作素材包",
-        "资料版本": None,
-        "生成日期": None,
-        "目标语言": None,
-        "对应大纲": None,
-        "使用对象": None,
-    }
-    if any(not parse_field(material_text, field) for field in metadata):
-        return False
-    if any(
-        not re.search(rf"^##\s+{re.escape(heading)}\s*$", material_text, re.MULTILINE)
-        for heading in (
-            "一、可直接用于正文的事实",
-            "二、可直接采用的英文表达",
-            "三、可使用的数据表",
-            "四、按大纲使用",
-            "五、仅供生成控制（不得写入正文）",
-            "六、缺少资料的章节及建议处理方式",
-        )
-    ):
-        return False
-    for field in ("文章ID", "文章版本", "索引版本", "生成日期", "对应写作素材", "写作素材SHA-256", "用途"):
-        if not parse_field(audit_text, field):
-            return False
-    if parse_field(material_text, "文章ID") != parse_field(audit_text, "文章ID"):
-        return False
-    recorded_hash = parse_field(audit_text, "写作素材SHA-256").lower()
-    actual_hash = hashlib.sha256(material.read_bytes()).hexdigest()
-    if recorded_hash != actual_hash:
-        return False
+        errors.append("30没有可供Faithfulness核验的证据正文")
 
-    project_root = project_root_for_task(task_dir)
+    for field in (
+        "文章ID", "文章版本", "资料视图", "资料版本", "生成日期",
+        "目标语言", "对应大纲", "使用对象",
+    ):
+        if not parse_field(material_text, field):
+            errors.append(f"30缺少字段：{field}")
+    for heading in (
+        "一、可直接用于正文的事实", "二、可直接采用的英文表达",
+        "三、可使用的数据表", "四、按大纲使用",
+        "五、仅供生成控制（不得写入正文）", "六、缺少资料的章节及建议处理方式",
+    ):
+        if not re.search(rf"^##\s+{re.escape(heading)}\s*$", material_text, re.MULTILINE):
+            errors.append(f"30缺少章节：{heading}")
+
+    source_text = source_index.read_text(encoding="utf-8-sig")
+    for field in (
+        "文章ID", "文章版本", "索引版本", "生成日期",
+        "对应写作素材", "写作素材SHA-256", "用途",
+    ):
+        if not parse_field(source_text, field):
+            errors.append(f"35缺少字段：{field}")
+    material_id = parse_field(material_text, "文章ID")
+    source_id = parse_field(source_text, "文章ID")
+    if material_id and source_id and material_id != source_id:
+        errors.append(f"30与35文章ID不一致：30={material_id}，35={source_id}")
+    recorded_hash = parse_field(source_text, "写作素材SHA-256").lower()
+    actual_hash = hashlib.sha256(material.read_bytes()).hexdigest()
+    if recorded_hash and recorded_hash != actual_hash:
+        errors.append(f"35记录的30哈希不匹配：记录={recorded_hash}，实际={actual_hash}")
+
+    try:
+        project_root = project_root_for_task(task_dir)
+    except ValueError as exc:
+        errors.append(str(exc))
+        return list(dict.fromkeys(errors))
+    formal_root = project_root / "03_正式知识"
     claim_marker = re.compile(r"^\s*[-*]\s*Claim ID[：:]\s*([A-Za-z0-9_.-]+)\s*$", re.MULTILINE)
     claim_ids = {
         match.group(1)
-        for path in (project_root / "03_正式知识").rglob("*.md")
-        if path.is_file()
+        for path in formal_root.rglob("*.md") if path.is_file()
         for match in claim_marker.finditer(path.read_text(encoding="utf-8-sig"))
-    }
-    mapping_heading = re.search(r"^##\s+写作素材到正式知识映射\s*$", audit_text, re.MULTILINE)
+    } if formal_root.is_dir() else set()
+
+    mapping_heading = re.search(r"^##\s+写作素材到正式知识映射\s*$", source_text, re.MULTILINE)
     mapping_count = 0
     mapped_evidence_lines: set[int] = set()
     mapped_claim_ids: set[str] = set()
-    if mapping_heading:
-        mapping_body = audit_text[mapping_heading.end():]
+    if not mapping_heading:
+        errors.append("35缺少“写作素材到正式知识映射”章节")
+    else:
+        mapping_body = source_text[mapping_heading.end():]
         next_heading = re.search(r"^##\s+", mapping_body, re.MULTILINE)
         if next_heading:
             mapping_body = mapping_body[:next_heading.start()]
-        for line in mapping_body.splitlines():
+        for row_number, line in enumerate(mapping_body.splitlines(), 1):
             if not line.strip().startswith("|"):
                 continue
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
@@ -124,31 +131,54 @@ def _article_package_ready(task_dir: Path) -> bool:
                 continue
             mapping_count += 1
             start, end = int(cells[0]), int(cells[1])
-            if start < 1 or end < start or end > len(material_lines):
-                return False
-            if not all(evidence_scope[start - 1:end]):
-                return False
-            mapped_evidence_lines.update(range(start, end + 1))
+            label = f"35映射第{row_number}条（30行{start}-{end}）"
+            valid_range = 1 <= start <= end <= len(material_lines)
+            if not valid_range:
+                errors.append(f"{label}超出30实际行数1-{len(material_lines)}")
+            elif not all(evidence_scope[start - 1:end]):
+                errors.append(f"{label}包含非证据正文行")
+            else:
+                mapped_evidence_lines.update(range(start, end + 1))
             claim_id = cells[3]
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", claim_id) or claim_id not in claim_ids:
-                return False
-            mapped_claim_ids.add(claim_id)
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", claim_id):
+                errors.append(f"{label}的Claim ID格式无效：{claim_id or '空'}")
+            elif claim_id not in claim_ids:
+                errors.append(f"{label}引用的正式Claim不存在：{claim_id}")
+            else:
+                mapped_claim_ids.add(claim_id)
             formal_ref = cells[5]
             if formal_ref.startswith("[[") and formal_ref.endswith("]]" ):
                 formal_ref = formal_ref[2:-2]
             formal_ref = formal_ref.split("|", 1)[0].strip()
             if not formal_ref.lower().endswith(".md"):
-                return False
-            formal_path = (audit.parent / formal_ref).resolve() if formal_ref.startswith(".") else (project_root / formal_ref).resolve()
-            if not formal_path.is_file():
-                return False
-    prewrite = task_dir / "20_文章前知识审核.md"
-    if not prewrite.is_file():
-        return False
+                errors.append(f"{label}缺少有效正式知识Markdown路径")
+            else:
+                formal_path = (
+                    (source_index.parent / formal_ref).resolve()
+                    if formal_ref.startswith(".") else (project_root / formal_ref).resolve()
+                )
+                if not formal_path.is_file():
+                    errors.append(f"{label}引用的正式知识文件不存在：{formal_ref}")
+    if mapping_count == 0:
+        errors.append("35至少需要一条有效的证据正文到正式Claim映射")
+    missing_evidence = sorted(evidence_lines - mapped_evidence_lines)
+    if missing_evidence:
+        preview = "、".join(str(line) for line in missing_evidence[:12])
+        suffix = "等" if len(missing_evidence) > 12 else ""
+        errors.append(f"30存在未被35映射的证据正文行：{preview}{suffix}")
+
     declared_claims = parse_field(prewrite.read_text(encoding="utf-8-sig"), "可用Claim数")
-    if not declared_claims.isdigit() or int(declared_claims) != len(mapped_claim_ids):
-        return False
-    return mapping_count > 0 and evidence_lines <= mapped_evidence_lines
+    if not declared_claims.isdigit():
+        errors.append(f"20的可用Claim数必须是整数：{declared_claims or '空'}")
+    elif int(declared_claims) != len(mapped_claim_ids):
+        errors.append(
+            f"20与35的可用Claim数不一致：20={declared_claims}，35唯一正式Claim={len(mapped_claim_ids)}"
+        )
+    return list(dict.fromkeys(errors))
+
+
+def _article_package_ready(task_dir: Path) -> bool:
+    return not article_package_errors(task_dir)
 
 
 def article_package_ready(task_dir: Path) -> bool:
@@ -161,6 +191,22 @@ def project_root_for_task(task_dir: Path) -> Path:
     if task_dir.parent.name not in ARTICLE_STATES or task_dir.parent.parent.name != "04_文章任务":
         raise ValueError(f"Article task is not under a canonical state directory: {task_dir}")
     return task_dir.parents[2]
+
+
+def standard_faithfulness_record_path(article: Path) -> Path:
+    """Return the only valid v0.6 Faithfulness record path for an article."""
+    return article.resolve().parent / "50_文章知识使用与Faithfulness记录.md"
+
+
+def require_standard_faithfulness_record_path(article: Path, receipt: Path) -> Path:
+    """Reject a caller-selected receipt path before any workflow mutation."""
+    expected = standard_faithfulness_record_path(article)
+    if receipt.resolve() != expected:
+        raise ValueError(
+            "--receipt必须是当前文章任务目录中的标准50记录："
+            f"{expected}"
+        )
+    return expected
 
 
 def _todo_row(

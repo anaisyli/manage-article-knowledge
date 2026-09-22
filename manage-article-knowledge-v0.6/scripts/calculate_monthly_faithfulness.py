@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calculate the monthly arithmetic mean of current per-article Faithfulness scores."""
+"""Summarize monthly knowledge-attachment support without applying a target score."""
 
 from __future__ import annotations
 
@@ -63,6 +63,18 @@ def hashes_are_current(row: dict[str, str]) -> tuple[bool, str]:
     return True, ""
 
 
+def integer_or_none(row: dict[str, str], field: str) -> int | None:
+    value = row.get(field, "").strip()
+    try:
+        return int(value) if value != "" else None
+    except ValueError:
+        return None
+
+
+def display_count(value: int | None) -> str:
+    return str(value) if value is not None else "N/A（旧协议未记录）"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics-csv", type=Path, required=True)
@@ -118,7 +130,15 @@ def main() -> None:
     valid_count = len(valid)
     completeness = valid_count * 100 / expected_count if expected_count else 100.0
     average = mean(scores) if scores else None
-    unsupported_total = sum(int(item[1]["unsupported_claims"]) for item in valid)
+    supported_total = sum(int(item[1]["supported_claims"]) for item in valid)
+    unknown_values = [integer_or_none(item[1], "unknown_claims") for item in valid]
+    contradicted_values = [integer_or_none(item[1], "contradicted_claims") for item in valid]
+    unknown_total = sum(value for value in unknown_values if value is not None) if all(
+        value is not None for value in unknown_values
+    ) else None
+    contradicted_total = sum(value for value in contradicted_values if value is not None) if all(
+        value is not None for value in contradicted_values
+    ) else None
     mapped_total = sum(int(item[1]["mapped_formal_claims"]) for item in valid)
     unmapped_total = sum(int(item[1]["unmapped_supported_claims"]) for item in valid)
 
@@ -129,13 +149,14 @@ def main() -> None:
         f"- 已完成有效审核：{valid_count}",
         f"- 缺失或已失效审核：{len(incomplete)}",
         f"- 审核完整率：{completeness:.2f}%",
-        f"- 月平均Faithfulness：{'暂无结果' if average is None else f'{average:.2f}%'}",
-        f"- 最高值：{'暂无结果' if not scores else f'{max(scores):.2f}%'}",
-        f"- 最低值：{'暂无结果' if not scores else f'{min(scores):.2f}%'}",
-        f"- 未支持事实主张总数：{unsupported_total}",
+        f"- 月平均知识附件明确支撑率：{'暂无结果' if average is None else f'{average:.2f}%'}",
+        f"- 明确支持主张总数：{supported_total}",
+        f"- 尚未确认主张总数：{display_count(unknown_total)}",
+        f"- 明确冲突主张总数：{display_count(contradicted_total)}",
         f"- 正式Claim映射数：{mapped_total}",
-        f"- 无法映射的支持主张数：{unmapped_total}",
-        "- 当前标准：试运行，暂不判定达标",
+        f"- 未映射的明确支持主张数：{unmapped_total}",
+        "- 指标说明：本指标没有目标值，不判定达标，不表示文章质量、发布资格或是否需要重写。",
+        "- 行动依据：只按具体尚未确认/明确冲突主张的语义归组和事实类型处理，不因单篇或月平均高低触发行动。",
         "",
         "### 各文章结果",
         "",
@@ -143,9 +164,12 @@ def main() -> None:
     if not valid and not incomplete:
         lines.append("- 本月无应审核文章")
     for article_id, row, score in valid:
+        unknown = integer_or_none(row, "unknown_claims")
+        contradicted = integer_or_none(row, "contradicted_claims")
         lines.append(
-            f"- {article_id}：{score:.2f}%"
-            f"（{row['supported_claims']}/{row['total_claims']}，未支持{row['unsupported_claims']}条）"
+            f"- {article_id}：知识附件明确支撑率 {score:.2f}%；"
+            f"明确支持 {row['supported_claims']}；尚未确认 {display_count(unknown)}；"
+            f"明确冲突 {display_count(contradicted)}；全部可验证主张 {row['total_claims']}"
         )
     for article_id, reason in incomplete:
         lines.append(f"- {article_id}：未纳入月平均；{reason}")

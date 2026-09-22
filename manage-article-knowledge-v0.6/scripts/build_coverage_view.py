@@ -16,8 +16,12 @@ OUTPUT_RELATIVE = Path("05_数据与审核/20_知识库覆盖与缺口/01_知识
 GAP_RELATIVE = Path("05_数据与审核/20_知识库覆盖与缺口/10_知识缺口记录.csv")
 GAP_FIELDS = (
     "gap_key", "gap_topic", "gap_type", "trigger_basis", "article_ids",
-    "article_count", "status", "current_impact", "next_action", "first_seen",
+    "article_count", "current_article_ids", "current_article_count",
+    "status", "current_impact", "next_action", "first_seen",
     "last_seen", "related_governance_ref",
+)
+LEGACY_GAP_FIELDS = tuple(
+    field for field in GAP_FIELDS if field not in {"current_article_ids", "current_article_count"}
 )
 MODULES = (
     ("客户知识", "公司概述", Path("03_正式知识/10_客户知识/10_公司概述")),
@@ -206,7 +210,7 @@ def claim_ids(text: str) -> set[str]:
 
 
 def source_ids(text: str) -> set[str]:
-    return set(re.findall(r"\bSRC-[A-Fa-f0-9]{8,}\b", text))
+    return set(re.findall(r"\bSRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b", text))
 
 
 def claim_entries(text: str) -> list[tuple[str, str]]:
@@ -339,9 +343,14 @@ def knowledge_gaps(root: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != GAP_FIELDS:
+        fieldnames = tuple(reader.fieldnames or ())
+        if fieldnames not in {GAP_FIELDS, LEGACY_GAP_FIELDS}:
             return []
         rows = [{field: row.get(field, "") for field in GAP_FIELDS} for row in reader]
+        if fieldnames == LEGACY_GAP_FIELDS:
+            for row in rows:
+                row["current_article_ids"] = row["article_ids"]
+                row["current_article_count"] = row["article_count"]
 
     # Older runs could create a fresh GAP key for every article even when the
     # human knowledge question was identical.  Keep the machine ledger intact
@@ -349,7 +358,7 @@ def knowledge_gaps(root: Path) -> list[dict[str, str]]:
     merged: dict[str, dict[str, str]] = {}
     # An open gap must remain visible when legacy duplicate rows disagree;
     # resolved/closed rows must not hide a still-actionable occurrence.
-    status_rank = {"已关闭": 0, "已解决": 1, "观察中": 2, "待外部调研": 3}
+    status_rank = {"已关闭": 0, "已解决": 1, "观察中": 2, "部分解决": 3, "待外部调研": 4}
     for row in rows:
         topic_key = re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", row.get("gap_topic", "").casefold())
         key = topic_key or row.get("gap_key", "")
@@ -363,6 +372,11 @@ def knowledge_gaps(root: Path) -> list[dict[str, str]]:
         ))
         current["article_ids"] = ";".join(article_ids)
         current["article_count"] = str(len(article_ids))
+        current_article_ids = list(dict.fromkeys(
+            [item.strip() for item in (current.get("current_article_ids", "") + ";" + row.get("current_article_ids", "")).split(";") if item.strip()]
+        ))
+        current["current_article_ids"] = ";".join(current_article_ids)
+        current["current_article_count"] = str(len(current_article_ids))
         if status_rank.get(row.get("status", ""), 0) > status_rank.get(current.get("status", ""), 0):
             current["status"] = row.get("status", "")
         if row.get("first_seen", "") and (not current.get("first_seen") or row["first_seen"] < current["first_seen"]):
@@ -502,20 +516,23 @@ def build_view(root: Path) -> str:
         else:
             impact = "当前没有文章证据映射到本模块；不因空模块自动阻塞文章"
         lines.append("| " + " | ".join(map(markdown_cell, (f"{partition}／{module}", knowledge, sources, unprocessed, missing, impact))) + " |")
-    lines.extend([
-        "", "## 当前知识缺口", "",
-        "> 仅列入完成本地检索后确认的真实公共知识缺口；同一主题按稳定问题合并，出现文章数按不同文章ID计算。",
-        "", "| 缺口主题 | 类型 | 触发依据 | 出现文章数 | 当前状态 | 下一步 | 入口 |",
-        "|---|---|---|---:|---|---|---|",
-    ])
-    for gap in sorted(public_gaps, key=lambda item: (item.get("status", ""), item.get("first_seen", ""), item.get("gap_key", ""))):
-        lines.append("| " + " | ".join(map(markdown_cell, (
-            gap.get("gap_topic", ""), gap.get("gap_type", "公共知识"), gap.get("trigger_basis", ""),
-            gap.get("article_count", "0"), gap.get("status", ""), gap.get("next_action", ""),
-            "[[10_知识缺口记录.csv]]",
-        ))) + " |")
-    if not public_gaps:
-        lines.append("| 暂无已登记公共知识缺口 | 无 | 无 | 0 | 无 | 无 | [[10_知识缺口记录.csv]] |")
+    lines.extend(["", "## 当前知识缺口", "",
+                  "> 按可由同一证据解决的稳定问题归组；历史文章数永久保留，当前影响数只计算各文章现行版本。已解决记录仅证明其登记范围，不覆盖新问题。"])
+    for heading, selected in (
+        ("待处理与部分解决", [g for g in public_gaps if g.get("status") in {"观察中", "待外部调研", "部分解决"}]),
+        ("已解决与已关闭（历史）", [g for g in public_gaps if g.get("status") in {"已解决", "已关闭"}]),
+    ):
+        lines.extend(["", f"### {heading}", "", "| 缺口ID | 缺口主题 | 类型 | 触发依据 | 历史文章数 | 当前影响数 | 当前状态 | 下一步 | 入口 |",
+                      "|---|---|---|---|---:|---:|---|---|---|"])
+        for gap in sorted(selected, key=lambda item: (item.get("first_seen", ""), item.get("gap_key", ""))):
+            lines.append("| " + " | ".join(map(markdown_cell, (
+                gap.get("gap_key", ""), gap.get("gap_topic", ""), gap.get("gap_type", "公共知识"), gap.get("trigger_basis", ""),
+                gap.get("article_count", "0"), gap.get("current_article_count", "0"),
+                gap.get("status", ""), gap.get("next_action", ""),
+                "[[10_知识缺口记录.csv]]",
+            ))) + " |")
+        if not selected:
+            lines.append("| 无 | 无 | 无 | 无 | 0 | 0 | 无 | 无 | [[10_知识缺口记录.csv]] |")
     return "\n".join(lines) + "\n"
 
 
@@ -573,14 +590,16 @@ def run_self_test() -> int:
             writer.writerow({
                 "gap_key": "single-double-beam-boundary", "gap_topic": "单光束与双光束的机制及适用边界",
                 "gap_type": "公共知识", "trigger_basis": "核心章节首次", "article_ids": "DEMO-ART-20260821-001",
-                "article_count": "1", "status": "待外部调研", "current_impact": "影响比较文章",
+                "article_count": "1", "current_article_ids": "DEMO-ART-20260821-001", "current_article_count": "1",
+                "status": "待外部调研", "current_impact": "影响比较文章",
                 "next_action": "开展定向外部调研", "first_seen": "2026-08-21", "last_seen": "2026-08-21",
                 "related_governance_ref": "无",
             })
             writer.writerow({
                 "gap_key": "legacy-duplicate-key", "gap_topic": "单光束与双光束的机制及适用边界",
                 "gap_type": "公共知识", "trigger_basis": "首篇普通缺口", "article_ids": "DEMO-ART-20260822-002",
-                "article_count": "1", "status": "观察中", "current_impact": "影响同主题文章",
+                "article_count": "1", "current_article_ids": "DEMO-ART-20260822-002", "current_article_count": "1",
+                "status": "观察中", "current_impact": "影响同主题文章",
                 "next_action": "复用同一知识问题并合并文章关联", "first_seen": "2026-08-22", "last_seen": "2026-08-22",
                 "related_governance_ref": "无",
             })

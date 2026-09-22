@@ -11,7 +11,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from article_state import transition_task, validate_transition_inputs
+from article_state import (
+    require_standard_faithfulness_record_path,
+    transition_task,
+    validate_transition_inputs,
+)
 from check_integration import faithfulness_result_dir, project_id_for_root
 from handoff_contract import HandoffContractError, load_contract, validate_event, validate_version
 from template_contract import TEMPLATE_VERSION
@@ -122,8 +126,6 @@ def main() -> None:
         )
     if parse_field(read_text(args.knowledge[0]), "资料视图") != "写作素材包":
         raise SystemExit("30_本篇知识库资料.md must declare 资料视图：写作素材包")
-    receipt_exists = args.receipt.exists()
-
     article_text = read_text(args.article)
     article_id = parse_field(article_text, "文章ID")
     article_version = parse_field(article_text, "文章版本")
@@ -133,6 +135,12 @@ def main() -> None:
     ) or args.article.stem
     if not article_id or not article_version or not article_date:
         raise SystemExit("Final article must contain 文章ID、文章版本 and 完成日期")
+    task_dir = args.article.parent.resolve()
+    try:
+        args.receipt = require_standard_faithfulness_record_path(args.article, args.receipt)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    receipt_exists = args.receipt.exists()
 
     if args.result_dir and args.integration_config:
         raise SystemExit("Do not combine --result-dir with --integration-config")
@@ -196,7 +204,6 @@ def main() -> None:
     except HandoffContractError as exc:
         raise SystemExit(str(exc)) from exc
     created_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    task_dir = args.article.parent
     article_title_for_todo = article_title
     try:
         validate_transition_inputs(task_dir, "30_等待Faithfulness")
@@ -222,6 +229,11 @@ def main() -> None:
                 "- Faithfulness导入日期：未导入",
                 f"- Faithfulness执行器：{faithfulness_skill}",
                 "- 外部审核模式：未导入",
+                "- 审核协议版本：等待结果",
+                "- 知识库正式指标：知识附件明确支撑率 = 明确支持 ÷（明确支持 + 尚未确认 + 明确冲突）",
+                "- 指标用途：没有目标值，不判定文章质量、发布资格或是否需要重写",
+                "- 尚未确认主张数：等待结果",
+                "- 明确冲突主张数：等待结果",
                 "- 外部结果文件：未导入",
                 "- unsupported归组处置文件：等待结果 / 不适用（无unsupported）",
                 f"- 终稿SHA-256：{sha256_file(args.article)}",
@@ -229,9 +241,9 @@ def main() -> None:
                 "",
                 "## 一、Faithfulness结果",
                 "",
-                "| 支持事实主张数 | 全部事实主张数 | 不支持事实主张数 | Faithfulness | 正式Claim映射数 | 未映射的支持主张数 |",
-                "|---:|---:|---:|---:|---:|---:|",
-                "| 等待结果 | 等待结果 | 等待结果 | 等待结果 | 等待结果 | 等待结果 |",
+                "| 明确支持 | 全部可验证主张 | 尚未确认（证据不足） | 明确冲突 | 知识附件明确支撑率 | 正式Claim映射数 | 未映射的明确支持主张数 |",
+                "|---:|---:|---:|---:|---:|---:|---:|",
+                "| 等待结果 | 等待结果 | 等待结果 | 等待结果 | 等待结果 | 等待结果 | 等待结果 |",
                 "",
                 "## 二、正式知识对文章事实的支撑",
                 "",
@@ -278,6 +290,9 @@ def main() -> None:
         updated=created_at[:10],
         link_file="50_文章知识使用与Faithfulness记录.md",
     )
+    transitioned_receipt = transitioned / "50_文章知识使用与Faithfulness记录.md"
+    if not transitioned_receipt.is_file():
+        raise SystemExit(f"状态迁移后标准50记录缺失：{transitioned_receipt}")
     update_integration_status(
         project_root,
         "final_received_success",
@@ -292,7 +307,7 @@ def main() -> None:
     print(f"handoff_contract_version={contract_version}")
     print("status=等待Faithfulness结果")
     print(f"task={transitioned}")
-    print(f"receipt={transitioned / args.receipt.name}")
+    print(f"receipt={transitioned_receipt}")
     print(f"faithfulness_skill={faithfulness_skill}")
     for line in faithfulness_handoff_lines(faithfulness_skill_root):
         print(line)

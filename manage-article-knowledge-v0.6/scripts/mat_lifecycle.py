@@ -25,11 +25,14 @@ MAT_BLOCKING_VALUES = {"否", "是"}
 MAT_ID_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Za-z0-9][A-Za-z0-9_-]*)-MAT-\d{3,}(?!\d)"
 )
-SOURCE_ID_RE = re.compile(r"\bSRC-[A-Za-z0-9]+\b")
+SOURCE_ID_RE = re.compile(r"\bSRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b")
 MAT_LIFECYCLE_COLUMNS = (
     "是否有当前文章依赖",
     "是否阻塞当前文章",
     "内容运营推送状态",
+)
+MAT_PLACEHOLDER_DETAIL_RE = re.compile(
+    r"(?ms)^###\s+\[项目ID\]-MAT-\d+｜.*?(?=^###\s+|^##\s+|\Z)"
 )
 
 
@@ -476,6 +479,8 @@ def formalize_scan_candidates(
     end = int(table["end_index"])
     lines[start:end] = replacement
     text = "\n".join(lines) + "\n"
+    if rows_by_id:
+        text = MAT_PLACEHOLDER_DETAIL_RE.sub("", text)
     existing_detail_text = text
     for item_id, block in details.items():
         if re.search(rf"(?m)^###\s+{re.escape(item_id)}(?:[｜|]|\s)", existing_detail_text):

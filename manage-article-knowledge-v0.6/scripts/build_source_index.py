@@ -634,7 +634,9 @@ def run_self_test() -> int:
         mat_path.write_text(
             "# 源资料处理台账\n\n## 当前事项\n\n"
             "| MAT ID | 事项名称 | 代表文件/资料范围 | 资料数量 | 通俗问题 | 当前文章影响 | 当前阶段 | 下一责任人/动作 | 重开条件 | 详情入口 | 最近更新 |\n"
-            "|---|---|---|---:|---|---|---|---|---|---|---|\n\n## 事项详情\n",
+            "|---|---|---|---:|---|---|---|---|---|---|---|\n\n## 事项详情\n\n"
+            "### [项目ID]-MAT-001｜[一类问题的通俗事项名称]\n\n"
+            "- 当前阶段：暂不处理\n",
             encoding="utf-8",
         )
         candidate_rows = [{
@@ -656,6 +658,9 @@ def run_self_test() -> int:
         ids = [row[0] for row in table["rows"] if row and row[0].endswith("-MAT-001")]
         if ids != ["TEST-MAT-001"]:
             print(json.dumps({"ok": False, "stage": "mat-idempotence", "ids": ids}, ensure_ascii=False))
+            return 1
+        if "[项目ID]-MAT-001" in mat_path.read_text(encoding="utf-8-sig"):
+            print(json.dumps({"ok": False, "stage": "mat-placeholder-cleanup"}, ensure_ascii=False))
             return 1
         history = Path(temp) / "source_version_history.jsonl"
         event = {

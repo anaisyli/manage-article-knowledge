@@ -43,7 +43,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
     non_terminal = set(lifecycle.get("non_terminal_events", []))
     required_non_terminal = {
         "writing_request", "writing_ready", "writing_completed",
-        "faithfulness_request", "faithfulness_completed",
+        "writing_retry_required", "faithfulness_request", "faithfulness_completed",
     }
     if not required_non_terminal.issubset(non_terminal):
         raise HandoffContractError("handoff lifecycle is missing required non-terminal events")
@@ -57,17 +57,26 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
         rule = revision_modes.get(mode, {})
         if not isinstance(rule.get("requires_base_article"), bool):
             raise HandoffContractError(f"revision mode {mode} must declare requires_base_article")
+        if not isinstance(rule.get("requires_same_outline"), bool):
+            raise HandoffContractError(f"revision mode {mode} must declare requires_same_outline")
         pattern = str(rule.get("base_article_version_pattern") or "")
         if rule["requires_base_article"] and not pattern:
             raise HandoffContractError(
                 f"revision mode {mode} must declare base_article_version_pattern"
             )
-        if pattern:
+        outline_pattern = str(rule.get("outline_version_pattern") or "")
+        if not outline_pattern:
+            raise HandoffContractError(
+                f"revision mode {mode} must declare outline_version_pattern"
+            )
+        for label, candidate in (("base version", pattern), ("outline version", outline_pattern)):
+            if not candidate:
+                continue
             try:
-                re.compile(pattern)
+                re.compile(candidate)
             except re.error as exc:
                 raise HandoffContractError(
-                    f"revision mode {mode} has invalid base version pattern"
+                    f"revision mode {mode} has invalid {label} pattern"
                 ) from exc
     return value
 
@@ -114,6 +123,29 @@ def validate_event(event: str, payload: Mapping[str, Any], contract: Mapping[str
         if revision_mode not in contract.get("revision_modes", {}):
             raise HandoffContractError(f"unsupported revision_mode: {revision_mode}")
         mode_contract = contract["revision_modes"][revision_mode]
+        outline_id = str(payload.get("outline_id") or "").strip()
+        outline_version = str(payload.get("outline_version") or "").strip()
+        rewrite_mode = str(payload.get("rewrite_mode") or "").strip()
+        outline_pattern = str(mode_contract.get("outline_version_pattern") or r"^v[1-9]\d*$")
+        if not outline_id:
+            raise HandoffContractError("writing_request requires outline_id")
+        if not re.fullmatch(outline_pattern, outline_version):
+            raise HandoffContractError("outline_version must use vN")
+        if mode_contract.get("requires_same_outline"):
+            if rewrite_mode != "same_outline":
+                raise HandoffContractError("revision writing_request requires rewrite_mode=same_outline")
+            base_outline_id = str(payload.get("base_outline_id") or "").strip()
+            base_outline_version = str(payload.get("base_outline_version") or "").strip()
+            if not base_outline_id or not base_outline_version:
+                raise HandoffContractError(
+                    "same-outline writing_request requires base_outline_id and base_outline_version"
+                )
+            if base_outline_id != outline_id or base_outline_version != outline_version:
+                raise HandoffContractError(
+                    "same-outline writing_request must preserve outline_id and outline_version"
+                )
+        elif rewrite_mode != "not_applicable":
+            raise HandoffContractError("new article writing_request requires rewrite_mode=not_applicable")
         if mode_contract.get("requires_base_article"):
             base_article_id = str(payload.get("base_article_id") or "").strip()
             base_article_version = str(payload.get("base_article_version") or "").strip()
@@ -220,11 +252,35 @@ def self_test() -> None:
         "original_writing_requirements": "Keep the original workflow",
         "current_status": "可准备知识",
         "writing_skill": "writer",
+        "outline_id": "OUTLINE-001",
+        "outline_version": "v1",
+        "rewrite_mode": "same_outline",
         "revision_mode": "knowledge_refresh_and_rewrite",
         "base_article_id": "ARTICLE",
         "base_article_version": "v1",
+        "base_outline_id": "OUTLINE-001",
+        "base_outline_version": "v1",
     }
     validate_event("writing_request", revision_payload, contract)
+    retry_payload = {
+        "handoff_event": "writing_retry_required",
+        "handoff_contract_version": version,
+        "project_id": "PROJECT",
+        "article_id": "ARTICLE",
+        "article_version": "v2",
+        "base_article_version": "v1",
+        "reason": "新终稿正文与基线版本完全相同，尚未完成重写",
+        "next_action": "使用当前30和原大纲重新执行原写作流程",
+    }
+    validate_event("writing_retry_required", retry_payload, contract)
+    incomplete_retry = dict(retry_payload)
+    incomplete_retry.pop("base_article_version")
+    try:
+        validate_event("writing_retry_required", incomplete_retry, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("writing_retry_required without base version was accepted")
     missing_baseline = dict(revision_payload)
     missing_baseline.pop("base_article_id")
     try:
@@ -240,6 +296,21 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("revision request with invalid base version was accepted")
+    missing_outline_identity = dict(revision_payload)
+    missing_outline_identity.pop("base_outline_id")
+    try:
+        validate_event("writing_request", missing_outline_identity, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("revision request without base outline identity was accepted")
+    mismatched_outline_identity = dict(revision_payload, base_outline_id="OUTLINE-002")
+    try:
+        validate_event("writing_request", mismatched_outline_identity, contract)
+    except HandoffContractError:
+        pass
+    else:
+        raise AssertionError("revision request with mismatched outline identity was accepted")
     revision_payload["revision_mode"] = "guess_and_rewrite"
     try:
         validate_event("writing_request", revision_payload, contract)

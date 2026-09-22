@@ -1,7 +1,8 @@
 {
   "contract_id": "manage-article-knowledge-handoff",
-  "handoff_contract_version": "MAK-HANDOFF-1.2",
+  "handoff_contract_version": "MAK-HANDOFF-1.3",
   "compatible_versions": [
+    "MAK-HANDOFF-1.3",
     "MAK-HANDOFF-1.2",
     "MAK-HANDOFF-1.1"
   ],
@@ -14,6 +15,7 @@
       "writing_request",
       "writing_ready",
       "writing_completed",
+      "writing_retry_required",
       "faithfulness_request",
       "faithfulness_completed"
     ],
@@ -27,19 +29,25 @@
     "new_article": {
       "knowledge_refresh_required": true,
       "reuse_current_knowledge_package": false,
-      "requires_base_article": false
+      "requires_base_article": false,
+      "requires_same_outline": false,
+      "outline_version_pattern": "^v[1-9]\\d*$"
     },
     "knowledge_refresh_and_rewrite": {
       "knowledge_refresh_required": true,
       "reuse_current_knowledge_package": false,
       "requires_base_article": true,
-      "base_article_version_pattern": "^v[1-9]\\d*$"
+      "requires_same_outline": true,
+      "base_article_version_pattern": "^v[1-9]\\d*$",
+      "outline_version_pattern": "^v[1-9]\\d*$"
     },
     "article_rewrite_only": {
       "knowledge_refresh_required": false,
       "reuse_current_knowledge_package": true,
       "requires_base_article": true,
-      "base_article_version_pattern": "^v[1-9]\\d*$"
+      "requires_same_outline": true,
+      "base_article_version_pattern": "^v[1-9]\\d*$",
+      "outline_version_pattern": "^v[1-9]\\d*$"
     }
   },
   "events": {
@@ -64,12 +72,17 @@
         "constraints",
         "original_writing_requirements",
         "current_status",
-        "writing_skill"
+        "writing_skill",
+        "outline_id",
+        "outline_version",
+        "rewrite_mode"
       ],
       "optional_fields": [
         "revision_mode",
         "base_article_id",
-        "base_article_version"
+        "base_article_version",
+        "base_outline_id",
+        "base_outline_version"
       ]
     },
     "writing_ready": {
@@ -95,6 +108,20 @@
         "final_path",
         "title",
         "completed_at"
+      ]
+    },
+    "writing_retry_required": {
+      "sender": "manage-article-knowledge",
+      "receiver": "writing_skill",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "project_id",
+        "article_id",
+        "article_version",
+        "base_article_version",
+        "reason",
+        "next_action"
       ]
     },
     "faithfulness_request": {

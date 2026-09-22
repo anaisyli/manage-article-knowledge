@@ -9,10 +9,16 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from article_state import parse_field, task_ready_for_delivery, transition_task
+from article_state import article_package_errors, parse_field, task_ready_for_delivery, transition_task
 from build_coverage_view import OUTPUT_RELATIVE, rebuild_view
+from finalize_knowledge_refresh import finalize_task, self_test as refresh_finalize_self_test
 from handoff_contract import current_version
-from template_contract import ARTICLE_AUDIT_TEMPLATE_VERSION, TEMPLATE_VERSION
+from template_contract import (
+    ARTICLE_AUDIT_TEMPLATE_VERSION,
+    TEMPLATE_VERSION,
+    normalize_markdown_table_spacing,
+    validate_task_templates,
+)
 
 
 def rebuild_coverage(project: Path) -> Path:
@@ -20,41 +26,145 @@ def rebuild_coverage(project: Path) -> Path:
     return rebuild_view(project)
 
 
-def advance_project(project: Path, *, updated: str | None = None) -> list[Path]:
+def delivery_blockers(task_dir: Path) -> list[str]:
+    required = (
+        "10_文章知识需求.md", "15_检索与知识准备记录.md",
+        "20_文章前知识审核.md", "30_本篇知识库资料.md",
+        "35_写作素材来源索引.md",
+    )
+    missing = [name for name in required if not (task_dir / name).is_file()]
+    if missing:
+        return ["缺少交付文件：" + "、".join(missing)]
+    errors = list(validate_task_templates(task_dir))
+    retrieval = (task_dir / "15_检索与知识准备记录.md").read_text(encoding="utf-8-sig")
+    material = (task_dir / "30_本篇知识库资料.md").read_text(encoding="utf-8-sig")
+    audit = (task_dir / "20_文章前知识审核.md").read_text(encoding="utf-8-sig")
+    request_text = (task_dir / "10_文章知识需求.md").read_text(encoding="utf-8-sig")
+    if parse_field(request_text, "任务模式") == "knowledge_refresh_and_rewrite":
+        required_layers = ("已有正式Claim", "客户源资料", "客户官网", "关联网站", "已有外部公共Claim", "新外部调研")
+        missing_layers = [layer for layer in required_layers if layer not in retrieval]
+        if missing_layers:
+            errors.append("知识重整未完成六层重新检索，缺少：" + "、".join(missing_layers))
+        candidate_section = retrieval.split("## 候选事实处置明细", 1)[-1].split("## ", 1)[0]
+        has_candidate = any(line.lstrip().startswith("|") and "---" not in line and "候选事实ID" not in line for line in candidate_section.splitlines())
+        no_new_reason = any(mark in retrieval + material for mark in ("本轮无新增候选事实", "未形成可采纳的新Claim", "未采纳原因"))
+        if not has_candidate and not no_new_reason:
+            errors.append("知识重整未登记本轮候选事实，也未记录无新增/不采纳原因，禁止按重写完成")
+    # 外部调研不能停留在15：必须形成35中的正式Claim映射，或明确记录未采纳原因。
+    research_done = any(mark in retrieval for mark in ("外部调研已完成", "新外部调研：已完成", "RES已完成"))
+    if research_done:
+        source_index_text = (task_dir / "35_写作素材来源索引.md").read_text(encoding="utf-8-sig")
+        imported = "CLM-EXT-" in source_index_text and "写作素材到正式知识映射" in source_index_text
+        explained = any(
+            mark in retrieval + audit
+            for mark in ("未形成可采纳的新Claim", "未采纳原因", "不采纳原因")
+        )
+        if not (imported or explained):
+            errors.append("外部调研已完成但未形成35中的外部正式Claim映射，且15/20未记录明确的不采纳原因")
+    mat_state = parse_field(retrieval, "MAT依赖处理")
+    if mat_state not in {"无", "已决定"}:
+        errors.append(f"MAT依赖处理仍为{mat_state or '空'}")
+    conclusion = parse_field(audit, "结论")
+    if conclusion not in {"自动通过", "带明确排除通过"}:
+        errors.append(f"文章前审核结论尚不可交付：{conclusion or '空'}")
+    problem = task_dir / "文章前问题与处理单.md"
+    if problem.is_file() and parse_field(problem.read_text(encoding="utf-8-sig"), "当前状态") != "已关闭":
+        errors.append("文章前问题与处理单尚未关闭")
+    errors.extend(article_package_errors(task_dir))
+    return list(dict.fromkeys(errors))
+
+
+def normalize_task_tables(task_dir: Path) -> list[Path]:
+    """Apply the one deterministic table repair that does not alter data."""
+    repaired: list[Path] = []
+    for name in ("15_检索与知识准备记录.md", "20_文章前知识审核.md"):
+        path = task_dir / name
+        if not path.is_file():
+            continue
+        original = path.read_text(encoding="utf-8-sig")
+        normalized = normalize_markdown_table_spacing(original)
+        if normalized != original:
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(normalized, encoding="utf-8")
+            temporary.replace(path)
+            repaired.append(path)
+    return repaired
+
+
+def advance_project_detailed(project: Path, *, updated: str | None = None) -> dict[str, object]:
     project = project.resolve()
     source_root = project / "04_文章任务/10_进行中"
     if not source_root.is_dir():
-        return []
+        return {"moved": [], "repaired": [], "blocked": [], "research_required": []}
     moved: list[Path] = []
+    repaired: list[Path] = []
+    blocked: list[tuple[Path, list[str]]] = []
+    research_required: list[tuple[Path, list[str]]] = []
     updated = updated or date.today().isoformat()
     for task_dir in sorted(path for path in source_root.iterdir() if path.is_dir()):
-        if not task_ready_for_delivery(task_dir):
-            continue
+        repaired.extend(path for path in normalize_task_tables(task_dir) if path not in repaired)
         request = task_dir / "10_文章知识需求.md"
+        mode = ""
+        if request.is_file():
+            mode = parse_field(request.read_text(encoding="utf-8-sig"), "任务模式")
+        repair_reasons: list[str] = []
+        if mode == "knowledge_refresh_and_rewrite":
+            try:
+                repair = finalize_task(task_dir)
+            except Exception as exc:
+                blocked.append((task_dir, [f"知识重整自动收口失败：{exc}"]))
+                continue
+            repaired.extend(path for path in repair.repaired if path not in repaired)
+            repair_reasons.extend(repair.blocked_reasons)
+            if repair.research_required:
+                research_required.append((task_dir, list(dict.fromkeys(repair.research_required))))
+        reasons = list(dict.fromkeys(repair_reasons + delivery_blockers(task_dir)))
+        if reasons:
+            blocked.append((task_dir, reasons))
+            continue
+        if not task_ready_for_delivery(task_dir):
+            blocked.append((task_dir, ["交付门禁出现未分类错误；请登记SKFB，不要猜测修改10/15/20/30/35"]))
+            continue
         text = request.read_text(encoding="utf-8-sig")
         article_id = parse_field(text, "文章ID")
         if not article_id:
-            raise ValueError(f"交付就绪文章缺少文章ID：{request}")
+            blocked.append((task_dir, [f"交付就绪文章缺少文章ID：{request}"]))
+            continue
         title = parse_field(text, "标题") or parse_field(text, "文章标题") or task_dir.name
-        moved.append(
-            transition_task(
-                task_dir,
-                "20_等待终稿",
-                article_id=article_id,
-                human_text=f"{title}知识库资料已就绪，等待终稿",
-                blocked="否",
-                owner="内容运营负责人提交终稿；Codex接收后导入Faithfulness",
-                condition="文章要求、客户资料、30或35发生实质变化时归档并递增文章版本",
-                updated=updated,
-                link_file="30_本篇知识库资料.md",
+        try:
+            moved.append(
+                transition_task(
+                    task_dir,
+                    "20_等待终稿",
+                    article_id=article_id,
+                    human_text=f"{title}知识库资料已就绪，等待终稿",
+                    blocked="否",
+                    owner="内容运营负责人提交终稿；Codex接收后导入Faithfulness",
+                    condition="文章要求、客户资料、30或35发生实质变化时归档并递增文章版本",
+                    updated=updated,
+                    link_file="30_本篇知识库资料.md",
+                )
             )
-        )
-    if moved:
+        except Exception as exc:
+            blocked.append((task_dir, [f"任务迁移失败：{exc}"]))
+    if moved or repaired:
         rebuild_coverage(project)
-    return moved
+    return {
+        "moved": moved,
+        "repaired": repaired,
+        "blocked": blocked,
+        "research_required": research_required,
+    }
+
+
+def advance_project(project: Path, *, updated: str | None = None) -> list[Path]:
+    """Backward-compatible wrapper returning only successfully moved tasks."""
+    return list(advance_project_detailed(project, updated=updated)["moved"])
 
 
 def self_test() -> int:
+    if refresh_finalize_self_test() != 0:
+        raise AssertionError("knowledge-refresh finalizer self-test failed")
     with tempfile.TemporaryDirectory(prefix="v05-advance-ready-") as temp:
         root = Path(temp) / "DEMO_测试知识库_v0.6"
         task = root / "04_文章任务/10_进行中/DEMO-ART-001_测试文章"
@@ -78,7 +188,7 @@ def self_test() -> int:
             "- 文章ID：DEMO-ART-001\n- 文章版本：v1\n"
             f"- 模板版本：{TEMPLATE_VERSION}\n"
             "- 资料视图：写作素材包\n- 资料版本：v1\n- 生成日期：2026-08-25\n"
-            "- 目标语言：中文\n- 对应大纲：[[10_文章知识需求.md#大纲]]\n"
+            "- 目标语言：中文\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 对应大纲：[[10_文章知识需求.md#大纲]]\n"
             "- 使用对象：写作流程；本文件为唯一写作事实输入。\n\n"
             "## 一、可直接用于正文的事实\n\n##### 证据正文（供Faithfulness核验）\n\n> 测试事实。\n\n"
             "## 二、可直接采用的英文表达\n\n| 使用场景/大纲章节 | 可采用表达 | 使用条件 |\n|---|---|---|\n| 无 | 无 | 无 |\n\n"
@@ -93,7 +203,7 @@ def self_test() -> int:
                 f"- 模板版本：{TEMPLATE_VERSION}\n- 交接合同版本：{current_version()}\n- 标题：测试文章\n- 关键词：测试\n"
                 "- 目标语言：中文\n- 特殊限制：无\n- 大纲状态：已确认\n- 原始写作请求：测试写作请求\n"
                 "- 产品或内容对象：测试对象\n- 选题方向：测试方向\n- 原始写作要求：测试要求\n- 当前状态：可准备知识\n- 写作Skill：测试写作Skill\n"
-                "- 任务模式：new_article\n- 基线文章版本：不适用\n- 旧版本归档入口：不适用\n\n## 外部写作任务接入\n\n"
+                "- 任务模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章ID：不适用\n- 基线文章版本：不适用\n- 基线大纲ID：不适用\n- 基线大纲版本：不适用\n- 旧版本归档入口：不适用\n\n## 外部写作任务接入\n\n"
                 "- 接入方式：显式提交\n- 外部任务唯一键：DEMO-001\n\n## 大纲\n\n- 测试\n\n"
                 "## 随文章提交文件分类\n\n| 文件名 | 原始路径 | SHA-256 | 文件性质 | 使用范围 | 处理结果 |\n"
                 "|---|---|---|---|---|---|\n| 无 | 无 | 无 | 无随文文件 | 不适用 | 不适用 |\n"
@@ -101,13 +211,18 @@ def self_test() -> int:
             "15_检索与知识准备记录.md": (
                 "# 检索与知识准备记录\n\n- 文章ID：DEMO-ART-001\n- 文章版本：v1\n"
                 f"- 模板版本：{TEMPLATE_VERSION}\n- 最近更新：2026-08-25\n- MAT依赖处理：无\n"
-                "- 知识准备模式：new_article\n- 基线文章版本：不适用\n\n"
+                "- 知识准备模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章版本：不适用\n\n"
                 "## 固定检索层状态\n\n| 检索层 | 当前状态 | 结果或未查原因 | 下一步 |\n|---|---|---|---|\n"
-                "| 已有正式Claim | 已检索并命中 | CLM-DEMO-001 | 使用 |\n\n"
+                "| 已有正式Claim | 已检索并命中 | CLM-DEMO-001 | 使用 |\n"
+                "| 客户官网 | 已检索并命中 | About正文 https://example.com/about-us/ | CF-001已建立客户官网Claim |\n\n"
                 "## 来源命中记录\n\n| 知识问题 | 命中Claim/资料名称与入口 | 相关理由 | 处理结果 |\n|---|---|---|---|\n"
-                "| 测试问题 | CLM-DEMO-001 | 直接支持 | 使用 |\n\n"
+                "| 测试问题 | CLM-DEMO-001；https://example.com/about-us/ Company Introduction第1段 | 直接支持 | 使用 |\n\n"
+                "## 官网正文核验\n\n| 大纲章节/知识问题 | 页面名称与最终具体URL | 获取日期 | 正文位置 | 最小连续原文 | 候选事实ID或未命中 | 处置结果 |\n|---|---|---|---|---|---|---|\n"
+                "| 标题 | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services for brands. | CF-001 | 建立客户官网Claim CLM-DEMO-001 |\n"
+                "| 主问题 | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services for brands. | CF-001 | 建立客户官网Claim CLM-DEMO-001 |\n"
+                "| 测试 | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services for brands. | CF-001 | 建立客户官网Claim CLM-DEMO-001 |\n\n"
                 "## 候选事实处置明细\n\n| 候选事实ID | 独立事实摘要 | 来源与精确位置 | 处置结果 | Formal Claim或排除/治理入口 |\n|---|---|---|---|---|\n"
-                "| CF-001 | 测试独立事实 | demo.md第1段 | 已沉淀Formal Claim | CLM-DEMO-001 |\n\n"
+                "| CF-001 | 提供定制包装服务 | https://example.com/about-us/ Company Introduction第1段 | 已沉淀Formal Claim | CLM-DEMO-001 |\n\n"
                 "## 旧Claim重新核验\n\n| 旧Claim ID | 旧版本归档入口 | 重新核对来源与位置 | 当前证据结论 | 当前归类模块 | 处置 | 依据 |\n"
                 "|---|---|---|---|---|---|---|\n| 无 | 不适用 | 不适用 | 不适用 | 不适用 | 不适用 | 新文章无旧Claim |\n\n"
                 "## 大纲逐项检索与候选事实覆盖\n\n| 大纲章节 | 六层检索范围与结果 | 命中来源与精确入口 | 候选事实ID | 候选事实数 | 已沉淀Claim数 | 未采用事实/缺口及原因 | 下一步 |\n|---|---|---|---|---:|---:|---|---|\n"
@@ -127,7 +242,7 @@ def self_test() -> int:
                 "- 结论：自动通过\n- 可用Claim数：1\n- 客户来源：1\n- 外部来源：0\n"
                 "- 明确排除：无\n- 未解决但不阻塞事项：无\n"
                 "- 计划写作素材：审核通过后生成30_本篇知识库资料.md\n- 计划写作素材来源索引：审核通过后生成35_写作素材来源索引.md\n"
-                "- 知识准备模式：new_article\n- 基线文章版本：不适用\n\n"
+                "- 知识准备模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章版本：不适用\n\n"
                 "## 重做检索复核\n\n| 复核项 | 15记录入口 | 审核结论 | 阻塞或排除 |\n|---|---|---|---|\n"
                 "| 六层重新检索 | 不适用 | 新文章不适用 | 无 |\n| 旧Claim逐条复核 | 不适用 | 新文章不适用 | 无 |\n"
                 "| Claim重新归类 | 不适用 | 新文章不适用 | 无 |\n| 30/35重新生成 | 不适用 | 新文章不适用 | 无 |\n\n"
@@ -145,12 +260,12 @@ def self_test() -> int:
             ),
             "30_本篇知识库资料.md": material_text,
             "35_写作素材来源索引.md": (
-                "# 写作素材来源索引\n\n- 文章ID：DEMO-ART-001\n- 文章版本：v1\n"
+                "# 写作素材来源索引\n\n- 文章ID：DEMO-ART-001\n- 文章版本：v1\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
                 f"- 模板版本：{TEMPLATE_VERSION}\n- 索引版本：v1\n- 生成日期：2026-08-25\n"
                 "- 对应写作素材：[[30_本篇知识库资料.md]]\n- 写作素材SHA-256：__MATERIAL_HASH__\n"
                 "- 用途：仅供内部追溯与Faithfulness映射；不得交给写作模型。\n\n"
                 "## 写作素材到正式知识映射\n\n| 证据正文行开始 | 证据正文行结束 | 素材主题 | 正式Claim ID | Claim通俗标题 | 正式知识文件 | 原始来源与精确位置 |\n"
-                "|---:|---:|---|---|---|---|---|\n| 17 | 17 | 测试事实 | CLM-DEMO-001 | 测试事实 | [[03_正式知识/10_客户知识/demo.md]] | demo.md |\n\n"
+                "|---:|---:|---|---|---|---|---|\n| 20 | 20 | 测试事实 | CLM-DEMO-001 | 测试事实 | [[03_正式知识/10_客户知识/demo.md]] | demo.md |\n\n"
                 "## 写作事实输入确认\n\n- 唯一事实输入：[[30_本篇知识库资料.md]]\n- 其他事实附件：无；随文事实文件必须先进入来源层、Formal Claim和当前30/35。\n"
             ),
         }
@@ -167,6 +282,7 @@ def self_test() -> int:
             raise AssertionError(
                 "delivery-ready task was not recognized by the strict gate: "
                 + repr(validate_task_templates(task))
+                + " package=" + repr(article_package_errors(task))
             )
         retrieval_path = task / "15_检索与知识准备记录.md"
         retrieval_text = retrieval_path.read_text(encoding="utf-8")
@@ -196,10 +312,28 @@ def main() -> None:
         raise SystemExit(self_test())
     if not args.project:
         raise SystemExit("--project is required unless --self-test is used")
-    moved = advance_project(args.project, updated=args.updated)
+    outcome = advance_project_detailed(args.project, updated=args.updated)
+    moved = list(outcome["moved"])
+    repaired = list(outcome["repaired"])
+    blocked = list(outcome["blocked"])
+    research_required = list(outcome["research_required"])
     for path in moved:
         print(f"moved={path}")
+    for path in repaired:
+        print(f"repaired={path}")
+    for task, reasons in blocked:
+        print(f"blocked_task={task}")
+        for reason in reasons:
+            print(f"blocked_reason={reason}")
+    for task, gap_ids in research_required:
+        print(f"research_task={task}")
+        for gap_id in gap_ids:
+            print(f"research_required={gap_id}")
+        print("next_action=当前Agent继续按external-research-contract.md完成定向外部调研和RES/正式Claim沉淀；完成后重新运行本脚本，不得把本次输出当作任务终点")
     print(f"moved_count={len(moved)}")
+    print(f"repaired_count={len(repaired)}")
+    print(f"blocked_count={len(blocked)}")
+    print(f"research_required_count={sum(len(gap_ids) for _, gap_ids in research_required)}")
 
 
 if __name__ == "__main__":

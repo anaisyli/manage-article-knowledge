@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -46,6 +47,16 @@ EXTERNAL_ADMIN_LABELS = {
     "目标语言", "target language", "关键词", "keywords", "keyword", "slug",
     "meta title", "meta description", "交接合同版本", "handoff contract version",
 }
+DOCX_HEADING_STYLE_NAMES = {
+    "sectionlabel": 2,
+    "sectiontitle": 2,
+    "subheading": 2,
+    "subhead": 2,
+}
+
+
+class OutlineChangeRequiresConfirmation(SystemExit):
+    """An article-level outline change, not an integration outage."""
 
 
 def read_text(path: Path) -> str:
@@ -84,22 +95,106 @@ def read_article_text(path: Path) -> str:
     body = root.find(".//w:body", ns)
     if body is None:
         return ""
+    styles: dict[str, ET.Element] = {}
+    try:
+        with zipfile.ZipFile(path) as package:
+            styles_xml = package.read("word/styles.xml")
+        styles_root = ET.fromstring(styles_xml)
+        styles = {
+            style.get(f"{{{ns['w']}}}styleId", ""): style
+            for style in styles_root.findall(".//w:style", ns)
+            if style.get(f"{{{ns['w']}}}styleId")
+        }
+    except (KeyError, ET.ParseError):
+        styles = {}
     blocks: list[str] = []
 
     def paragraph_text(paragraph: ET.Element) -> str:
         return "".join(node.text or "" for node in paragraph.findall(".//w:t", ns)).strip()
+
+    def word_value(node: ET.Element | None) -> str:
+        return node.get(f"{{{ns['w']}}}val", "") if node is not None else ""
+
+    def word_toggle(node: ET.Element | None) -> bool:
+        """Read an OOXML on/off element; presence without w:val means true."""
+        if node is None:
+            return False
+        value = word_value(node).strip().casefold()
+        return value not in {"0", "false", "off", "no"}
+
+    def word_boolean_attribute(node: ET.Element | None, name: str) -> bool:
+        if node is None:
+            return False
+        value = node.get(f"{{{ns['w']}}}{name}", "").strip().casefold()
+        return value in {"1", "true", "on", "yes"}
+
+    def normalized_style_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    def style_heading_level(style_id: str, seen: set[str] | None = None) -> int | None:
+        if not style_id:
+            return None
+        seen = seen or set()
+        if style_id in seen:
+            return None
+        seen.add(style_id)
+        style = styles.get(style_id)
+        style_name = word_value(style.find("./w:name", ns)) if style is not None else ""
+        normalized_names = {
+            normalized_style_name(style_id),
+            normalized_style_name(style_name),
+        }
+        if "title" in normalized_names:
+            return 1
+        for name in normalized_names:
+            match = re.fullmatch(r"heading([1-6])", name)
+            if match:
+                return int(match.group(1))
+            if name in DOCX_HEADING_STYLE_NAMES:
+                return DOCX_HEADING_STYLE_NAMES[name]
+        if style is not None:
+            outline = style.find("./w:pPr/w:outlineLvl", ns)
+            if outline is not None:
+                try:
+                    return min(6, max(1, int(word_value(outline)) + 1))
+                except ValueError:
+                    pass
+            based_on = word_value(style.find("./w:basedOn", ns))
+            return style_heading_level(based_on, seen)
+        return None
+
+    def paragraph_heading(paragraph: ET.Element) -> tuple[int, str] | None:
+        direct_outline = paragraph.find("./w:pPr/w:outlineLvl", ns)
+        if direct_outline is not None:
+            try:
+                return min(6, max(1, int(word_value(direct_outline)) + 1)), "outline"
+            except ValueError:
+                pass
+        style_id = word_value(paragraph.find("./w:pPr/w:pStyle", ns))
+        level = style_heading_level(style_id)
+        return (level, style_id) if level is not None else None
 
     for child in list(body):
         tag = child.tag.rsplit("}", 1)[-1]
         if tag == "p":
             value = paragraph_text(child)
             if value:
-                blocks.append(value)
+                heading = paragraph_heading(child)
+                if heading:
+                    level, style_id = heading
+                    safe_style = re.sub(r"[^A-Za-z0-9_. -]+", "", style_id).replace("--", "-")
+                    blocks.append(
+                        f"{'#' * level} {value} "
+                        f"<!-- MAK_DOCX_HEADING_STYLE:{safe_style or 'outline'} -->"
+                    )
+                else:
+                    blocks.append(value)
         elif tag == "tbl":
-            # Preserve table semantics as Markdown rows while ignoring all
-            # drawing/media parts. Faithfulness receives text and table values,
-            # never the article's image binaries.
-            rows: list[str] = []
+            # Preserve Word's header semantics and emit a complete Markdown
+            # table. A separator row is required both for Obsidian rendering
+            # and for downstream structural exclusion of table headers.
+            row_cells: list[list[str]] = []
+            row_headers: list[bool] = []
             for row in child.findall("./w:tr", ns):
                 cells: list[str] = []
                 for cell in row.findall("./w:tc", ns):
@@ -110,9 +205,23 @@ def read_article_text(path: Path) -> str:
                     )
                     cells.append(value.replace("|", "\\|"))
                 if cells:
-                    rows.append("| " + " | ".join(cells) + " |")
-            if rows:
-                blocks.append("\n".join(rows))
+                    row_cells.append(cells)
+                    row_headers.append(word_toggle(row.find("./w:trPr/w:tblHeader", ns)))
+            if row_cells:
+                column_count = max(len(cells) for cells in row_cells)
+                normalized_rows = [cells + [""] * (column_count - len(cells)) for cells in row_cells]
+                table_look = child.find("./w:tblPr/w:tblLook", ns)
+                first_row_is_header = row_headers[0] or word_boolean_attribute(table_look, "firstRow")
+                if first_row_is_header:
+                    markdown_rows = [normalized_rows[0], ["---"] * column_count, *normalized_rows[1:]]
+                else:
+                    # Markdown requires a header even when the Word source has
+                    # none. Use an empty structural header so no data row is
+                    # silently promoted or excluded from factual review.
+                    markdown_rows = [[""] * column_count, ["---"] * column_count, *normalized_rows]
+                blocks.append(
+                    "\n".join("| " + " | ".join(cells) + " |" for cells in markdown_rows)
+                )
     return "\n\n".join(blocks)
 
 
@@ -210,6 +319,48 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def normalized_body_fingerprint(value: str) -> str:
+    """Fingerprint article wording while ignoring Unicode and whitespace-only changes."""
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def managed_article_body(path: Path) -> str:
+    """Read the explicit body from an archived managed 40 file."""
+    text = read_text(path)
+    if text.count(ARTICLE_BODY_START) != 1 or text.count(ARTICLE_BODY_END) != 1:
+        raise ValueError(f"归档基线40正文边界必须各出现一次：{path}")
+    start = text.index(ARTICLE_BODY_START)
+    end = text.index(ARTICLE_BODY_END)
+    if start >= end:
+        raise ValueError(f"归档基线40正文边界顺序无效：{path}")
+    body = text[start + len(ARTICLE_BODY_START):end].strip()
+    if not body:
+        raise ValueError(f"归档基线40正文为空：{path}")
+    return body
+
+
+def archived_base_article(project: Path, request: str) -> tuple[Path, str]:
+    """Resolve a rewrite baseline only from the archive entry persisted in 10."""
+    archive_entry = field(request, "旧版本归档入口")
+    base_version = field(request, "基线文章版本")
+    if not archive_entry or archive_entry == "不适用":
+        raise ValueError("重做任务缺少旧版本归档入口，不能比较基线正文")
+    relative = Path(archive_entry)
+    if relative.is_absolute():
+        raise ValueError("旧版本归档入口必须是项目内稳定相对路径")
+    archive = (project / relative).resolve()
+    try:
+        archive.relative_to(project.resolve())
+    except ValueError as exc:
+        raise ValueError("旧版本归档入口超出当前项目范围") from exc
+    baseline = archive / "40_最终文章.md"
+    if not baseline.is_file():
+        raise ValueError(f"旧版本归档缺少基线40，不能验证是否完成重写：{baseline}")
+    return baseline, base_version
+
+
 def project_code(project: Path) -> str:
     value = project_id_for_root(project)
     value = re.sub(r"[^A-Za-z0-9-]+", "", value).upper()
@@ -262,7 +413,11 @@ def request_document(
     source: Path,
     title: str,
     revision_mode: str = "new_article",
+    rewrite_mode: str = "not_applicable",
+    base_article_id: str = "不适用",
     base_version: str = "不适用",
+    base_outline_id: str = "不适用",
+    base_outline_version: str = "不适用",
     archive_entry: str = "不适用",
 ) -> str:
     body = [
@@ -279,7 +434,13 @@ def request_document(
         f"- 当前状态：{args.current_status}",
         f"- 写作Skill：{args.writing_skill}",
         f"- 任务模式：{revision_mode}",
+        f"- 大纲ID：{args.outline_id}",
+        f"- 大纲版本：{args.outline_version}",
+        f"- 重写模式：{rewrite_mode}",
+        f"- 基线文章ID：{base_article_id}",
         f"- 基线文章版本：{base_version}",
+        f"- 基线大纲ID：{base_outline_id}",
+        f"- 基线大纲版本：{base_outline_version}",
         f"- 旧版本归档入口：{archive_entry}",
         "", "## 外部写作任务接入", "",
         "- 接入方式：已确认写作任务入口",
@@ -380,12 +541,28 @@ def prepare_revision(
     task = current_task(project, article_id)
     request_path = task / "10_文章知识需求.md"
     request_text = read_text(request_path)
+    current_article_id = field(request_text, "文章ID")
+    current_outline_id = field(request_text, "大纲ID")
+    current_outline_version = field(request_text, "大纲版本")
+    supplied_base_outline_id = str(args.base_outline_id or "").strip()
+    supplied_base_outline_version = str(args.base_outline_version or "").strip()
+    supplied_outline_id = str(args.outline_id or "").strip()
+    supplied_outline_version = str(args.outline_version or "").strip()
+    if current_article_id != article_id or str(args.article_id or "").strip() != article_id:
+        raise SystemExit("同大纲重写的基线文章ID与当前任务不匹配，归档前已拒绝")
+    if not current_outline_id or not re.fullmatch(r"v[1-9]\d*", current_outline_version):
+        raise SystemExit("当前任务缺少有效大纲ID或大纲版本，不能按同大纲重写")
+    if not (
+        supplied_outline_id == current_outline_id == supplied_base_outline_id
+        and supplied_outline_version == current_outline_version == supplied_base_outline_version
+    ):
+        raise SystemExit("同大纲重写的大纲ID或大纲版本与当前任务不匹配，归档前已拒绝")
     old_outline = (
         request_text.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip()
         if "## 大纲" in request_text else ""
     )
     if old_outline != outline:
-        raise SystemExit(
+        raise OutlineChangeRequiresConfirmation(
             "两个重做模式都默认锁定原简要大纲；当前提交的大纲与基线版本不同。"
             "请先单独确认大纲变更，再按知识重整模式建立新版本。"
         )
@@ -411,6 +588,8 @@ def prepare_revision(
     old_version = normalized_version(
         field(request_text, "当前版本") or existing.get("article_version", "v1")
     )
+    if normalized_version(str(args.base_article_version or "")) != old_version:
+        raise SystemExit("重做请求的基线文章版本与当前任务不匹配，归档前已拒绝")
     new_version = next_version(old_version)
     if existing.get("article_version") and normalized_version(existing["article_version"]) != old_version:
         raise SystemExit("任务映射中的文章版本与当前10_文章知识需求.md不一致，不能开始重做")
@@ -462,7 +641,11 @@ def prepare_revision(
         source=source,
         title=title,
         revision_mode=mode,
+        rewrite_mode="same_outline",
+        base_article_id=article_id,
         base_version=old_version,
+        base_outline_id=current_outline_id,
+        base_outline_version=current_outline_version,
         archive_entry=archive_entry,
     )
     (staging / "10_文章知识需求.md").write_text(new_request, encoding="utf-8")
@@ -476,6 +659,8 @@ def prepare_revision(
         for name in ("15_检索与知识准备记录.md", "20_文章前知识审核.md", "30_本篇知识库资料.md", "35_写作素材来源索引.md"):
             path = staging / name
             text = replace_field(read_text(path), "文章版本", new_version)
+            if name in {"15_检索与知识准备记录.md", "20_文章前知识审核.md"}:
+                text = replace_field(text, "重写模式", "same_outline")
             path.write_text(text, encoding="utf-8")
         material_hash = sha256(staging / "30_本篇知识库资料.md")
         source_index = staging / "35_写作素材来源索引.md"
@@ -586,12 +771,22 @@ def prepare(args: argparse.Namespace) -> None:
         "current_status": args.current_status.strip(),
         "writing_skill": args.writing_skill.strip(),
         "revision_mode": revision_mode,
+        "outline_id": str(args.outline_id or "").strip(),
+        "outline_version": str(args.outline_version or "").strip(),
+        "rewrite_mode": "same_outline" if revision_mode != "new_article" else "not_applicable",
     }
     if revision_mode != "new_article":
         request_payload["base_article_id"] = (args.article_id or "").strip()
         request_payload["base_article_version"] = (args.base_article_version or "").strip()
-        if not request_payload["base_article_id"] or not request_payload["base_article_version"]:
-            raise SystemExit("重做请求必须提供--article-id和--base-article-version")
+        request_payload["base_outline_id"] = (args.base_outline_id or "").strip()
+        request_payload["base_outline_version"] = (args.base_outline_version or "").strip()
+        if not all(request_payload.get(field) for field in (
+            "base_article_id", "base_article_version", "base_outline_id", "base_outline_version",
+        )):
+            raise SystemExit(
+                "重做请求必须提供--article-id、--base-article-version、"
+                "--base-outline-id和--base-outline-version"
+            )
     try:
         validate_event("writing_request", request_payload)
     except HandoffContractError as exc:
@@ -644,11 +839,14 @@ def prepare(args: argparse.Namespace) -> None:
         if existing_outline != outline:
             changed.append("大纲")
         if changed:
-            raise SystemExit(
+            message = (
                 "同一外部任务唯一键的已登记写作需求发生实质变化："
                 + "、".join(changed)
                 + "。不得静默覆盖10；请按文章版本归档合同更新需求后重新提交。"
             )
+            if "大纲" in changed:
+                raise OutlineChangeRequiresConfirmation(message)
+            raise SystemExit(message)
         record(ledger, item)
         update_integration_status(
             project,
@@ -718,6 +916,38 @@ def self_test() -> None:
         if admin_value in cleaned:
             raise AssertionError(f"self-test failed: writer metadata remained in body: {admin_value}")
     with tempfile.TemporaryDirectory(prefix="mak-writing-bridge-") as temp:
+        styled_docx = Path(temp) / "styled-headings.docx"
+        with zipfile.ZipFile(styled_docx, "w") as package:
+            package.writestr(
+                "word/document.xml",
+                """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Built-in heading</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="SectionLabel"/></w:pPr><w:r><w:t>Custom section label</w:t></w:r></w:p>
+<w:p><w:r><w:t>Ordinary body paragraph.</w:t></w:r></w:p>
+<w:tbl><w:tblPr><w:tblLook w:firstRow="1"/></w:tblPr>
+<w:tr><w:trPr><w:tblHeader w:val="true"/></w:trPr><w:tc><w:p><w:r><w:t>Area</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Decision</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>Size</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Confirm fit</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+</w:body></w:document>""",
+            )
+            package.writestr(
+                "word/styles.xml",
+                """<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style>
+<w:style w:type="paragraph" w:customStyle="1" w:styleId="SectionLabel"><w:name w:val="Section Label"/><w:basedOn w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+</w:styles>""",
+            )
+        styled_text = read_article_text(styled_docx)
+        if "## Built-in heading <!-- MAK_DOCX_HEADING_STYLE:Heading2 -->" not in styled_text:
+            raise AssertionError("self-test failed: Heading2 style was not preserved")
+        if "## Custom section label <!-- MAK_DOCX_HEADING_STYLE:SectionLabel -->" not in styled_text:
+            raise AssertionError("self-test failed: Section Label style was not preserved")
+        if "# Ordinary body paragraph" in styled_text:
+            raise AssertionError("self-test failed: ordinary body paragraph became a heading")
+        expected_table = "| Area | Decision |\n| --- | --- |\n| Size | Confirm fit |"
+        if expected_table not in styled_text:
+            raise AssertionError("self-test failed: DOCX table header was not normalized as Markdown")
         root = Path(temp) / "DEMO_测试知识库_v0.6"
         (root / "04_文章任务/10_进行中").mkdir(parents=True)
         version_entry = root / "01_工作台/30_版本与变更入口.md"
@@ -762,6 +992,10 @@ def self_test() -> None:
             current_status="可准备知识",
             writing_skill="测试写作Skill",
             revision_mode="new_article",
+            outline_id="DEMO-OUT-001",
+            outline_version="v1",
+            base_outline_id=None,
+            base_outline_version=None,
             base_article_version=None,
             article_id=None,
             date="2026-09-04",
@@ -807,14 +1041,23 @@ def self_test() -> None:
             f"| {label} | 已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研 | 03_正式知识/20_产品介绍/测试正式知识.md | CF-001 | 1 | 1 | 无 | 纳入30 |"
             for label in outline_rows
         )
+        website_rows = "\n".join(
+            f"| {label} | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services for brands. | 未命中本篇新增事实 | 已读正文；与当前正式Claim重复，不新增Claim |"
+            for label in outline_rows
+        )
         (task / "15_检索与知识准备记录.md").write_text(
             "# 检索与知识准备记录\n\n"
             f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n"
             "- 最近更新：2026-09-07\n- MAT依赖处理：无\n- 知识准备模式：new_article\n- 基线文章版本：不适用\n\n"
+            "- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
             "## 固定检索层状态\n\n| 检索层 | 当前状态 | 结果或未查原因 | 下一步 |\n|---|---|---|---|\n"
-            "| 已有正式Claim | 已检索并命中 | 命中测试正式知识 | 进入候选事实核验 |\n\n"
+            "| 已有正式Claim | 已检索并命中 | 命中测试正式知识 | 进入候选事实核验 |\n"
+            "| 客户官网 | 已检索但未命中本篇新增事实 | About Us正文 https://example.com/about-us/ | 已记录正文，现有Claim证据更直接 |\n\n"
             "## 来源命中记录\n\n| 知识问题 | 命中Claim/资料名称与入口 | 相关理由 | 处理结果 |\n|---|---|---|---|\n"
-            f"| 测试文章所需事实 | {claim_id}；03_正式知识/20_产品介绍/测试正式知识.md | 直接回答大纲问题 | 复用当前Claim |\n\n"
+            f"| 测试文章所需事实 | {claim_id}；03_正式知识/20_产品介绍/测试正式知识.md | 直接回答大纲问题 | 复用当前Claim |\n"
+            "| 官网核验 | https://example.com/about-us/ Company Introduction第1段 | 已读取相关正文 | 与现有Claim重复，不新增 |\n\n"
+            "## 官网正文核验\n\n| 大纲章节/知识问题 | 页面名称与最终具体URL | 获取日期 | 正文位置 | 最小连续原文 | 候选事实ID或未命中 | 处置结果 |\n|---|---|---|---|---|---|---|\n"
+            f"{website_rows}\n\n"
             "## 候选事实处置明细\n\n| 候选事实ID | 独立事实摘要 | 来源与精确位置 | 处置结果 | Formal Claim或排除/治理入口 |\n|---|---|---|---|---|\n"
             f"| CF-001 | 测试证据正文 | 03_正式知识/20_产品介绍/测试正式知识.md正文 | 复用已有Formal Claim | {claim_id} |\n\n"
             "## 旧Claim重新核验\n\n| 旧Claim ID | 旧版本归档入口 | 重新核对来源与位置 | 当前证据结论 | 当前归类模块 | 处置 | 依据 |\n|---|---|---|---|---|---|---|\n"
@@ -840,6 +1083,7 @@ def self_test() -> None:
             "- 审核日期：2026-09-07\n- 结论：自动通过\n- 可用Claim数：1\n- 客户来源：1\n- 外部来源：0\n"
             "- 明确排除：无\n- 未解决但不阻塞事项：无\n- 计划写作素材：30_本篇知识库资料.md\n- 计划写作素材来源索引：35_写作素材来源索引.md\n"
             "- 知识准备模式：new_article\n- 基线文章版本：不适用\n\n"
+            "- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
             "## 重做检索复核\n\n| 复核项 | 15记录入口 | 审核结论 | 阻塞或排除 |\n|---|---|---|---|\n"
             "| 六层重新检索 | 不适用 | 新文章不适用 | 无 |\n| 旧Claim逐条复核 | 不适用 | 新文章不适用 | 无 |\n"
             "| Claim重新归类 | 不适用 | 新文章不适用 | 无 |\n| 30/35重新生成 | 不适用 | 新文章不适用 | 无 |\n\n"
@@ -883,10 +1127,25 @@ def self_test() -> None:
         if bundle_errors or not article_package_ready(task):
             raise AssertionError(f"self-test failed: valid reusable bundle was rejected: {bundle_errors}")
 
+        baseline_final = Path(temp) / "baseline-final.md"
+        baseline_final.write_text("测试基线正文。\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(),
+            project=root,
+            final_path=baseline_final,
+            article_id=article_id,
+            external_task_key=None,
+        ))
+        baseline_managed = task / "40_最终文章.md"
+        if not baseline_managed.is_file():
+            raise AssertionError("self-test failed: new article did not accept its first final")
+
         rewrite = argparse.Namespace(**vars(args))
         rewrite.revision_mode = "article_rewrite_only"
         rewrite.article_id = article_id
         rewrite.base_article_version = "v1"
+        rewrite.base_outline_id = "DEMO-OUT-001"
+        rewrite.base_outline_version = "v1"
         rewrite.request_text = "知识不变，只按原大纲重写"
         prepare(rewrite)
         rewritten = list((root / "04_文章任务/20_等待终稿").rglob("10_文章知识需求.md"))
@@ -902,6 +1161,33 @@ def self_test() -> None:
             raise AssertionError("self-test failed: reused 35 does not match current 30 hash")
         if (rewritten_task / "40_最终文章.md").exists() or (rewritten_task / "50_文章知识使用与Faithfulness记录.md").exists():
             raise AssertionError("self-test failed: old final or Faithfulness current state leaked into rewrite")
+
+        identical_final = Path(temp) / "identical-final.md"
+        identical_final.write_text("测试基线正文。\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=identical_final, article_id=article_id, external_task_key=None,
+        ))
+        if (rewritten_task / "40_最终文章.md").exists():
+            raise AssertionError("self-test failed: identical rewrite created current 40")
+
+        whitespace_final = Path(temp) / "whitespace-final.md"
+        whitespace_final.write_text("  测试基线正文。\n\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=whitespace_final, article_id=article_id, external_task_key=None,
+        ))
+        if (rewritten_task / "40_最终文章.md").exists():
+            raise AssertionError("self-test failed: whitespace-only rewrite created current 40")
+
+        changed_final = Path(temp) / "changed-final.md"
+        changed_final.write_text("测试基线正文已经完成实质重写。\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=changed_final, article_id=article_id, external_task_key=None,
+        ))
+        if not (rewritten_task / "40_最终文章.md").is_file():
+            raise AssertionError("self-test failed: changed rewrite did not create current 40")
         changed_scope = argparse.Namespace(**vars(rewrite))
         changed_scope.base_article_version = "v2"
         changed_scope.title = "已改变知识范围的标题"
@@ -917,6 +1203,8 @@ def self_test() -> None:
         refresh.revision_mode = "knowledge_refresh_and_rewrite"
         refresh.article_id = article_id
         refresh.base_article_version = "v2"
+        refresh.base_outline_id = "DEMO-OUT-001"
+        refresh.base_outline_version = "v1"
         refresh.request_text = "按原大纲重新整理知识并重写"
         prepare(refresh)
         refreshed = list((root / "04_文章任务/10_进行中").rglob("10_文章知识需求.md"))
@@ -929,6 +1217,15 @@ def self_test() -> None:
             "30_本篇知识库资料.md", "35_写作素材来源索引.md",
         )):
             raise AssertionError("self-test failed: knowledge refresh reused old knowledge files")
+        refreshed_task = refreshed[0].parent
+        refresh_identical = Path(temp) / "refresh-identical-final.md"
+        refresh_identical.write_text("测试基线正文已经完成实质重写。\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=refresh_identical, article_id=article_id, external_task_key=None,
+        ))
+        if (refreshed_task / "40_最终文章.md").exists():
+            raise AssertionError("self-test failed: identical knowledge-refresh rewrite created current 40")
         archives = list((root / "04_文章任务/90_归档/10_文章历史版本").rglob("00_版本说明.md"))
         if len(archives) != 2:
             raise AssertionError("self-test failed: both rewrite modes did not archive prior versions")
@@ -1030,6 +1327,41 @@ def finalize(args: argparse.Namespace) -> None:
         raise SystemExit(f"无法确定终稿正文边界：{exc}") from exc
     if ARTICLE_BODY_START in source_text or ARTICLE_BODY_END in source_text:
         raise SystemExit("终稿正文中残留嵌套正文边界，不能生成40_最终文章.md")
+    revision_mode = field(request, "任务模式") or "new_article"
+    if revision_mode in {"knowledge_refresh_and_rewrite", "article_rewrite_only"}:
+        try:
+            baseline_path, base_version = archived_base_article(project, request)
+            baseline_text = managed_article_body(baseline_path)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if normalized_body_fingerprint(source_text) == normalized_body_fingerprint(baseline_text):
+            retry_payload = {
+                "handoff_event": "writing_retry_required",
+                "handoff_contract_version": contract_version,
+                "project_id": project_id_for_root(project),
+                "article_id": article_id,
+                "article_version": version,
+                "base_article_version": base_version,
+                "reason": "新终稿正文与基线版本完全相同，尚未完成重写",
+                "next_action": "使用当前30和原大纲重新执行原写作流程",
+            }
+            try:
+                validate_event("writing_retry_required", retry_payload)
+            except HandoffContractError as exc:
+                raise SystemExit(f"writing_retry_required合同校验失败：{exc}") from exc
+            update_integration_status(
+                project,
+                "writing_retry_required",
+                article_id=article_id,
+                article_version=version,
+                detail=f"基线版本：{base_version}；未生成当前40，退回原写作Skill",
+            )
+            for key in (
+                "handoff_event", "handoff_contract_version", "project_id", "article_id",
+                "article_version", "base_article_version", "reason", "next_action",
+            ):
+                print(f"{key}={retry_payload[key]}")
+            return
     try:
         validate_event(
             "writing_completed",
@@ -1093,6 +1425,8 @@ def main() -> None:
     p.add_argument("--topic-direction", default="未提供")
     p.add_argument("--keywords", default="")
     p.add_argument("--outline", default="")
+    p.add_argument("--outline-id", required=True)
+    p.add_argument("--outline-version", required=True)
     p.add_argument("--outline-status", default="")
     p.add_argument("--target-language", default="待补充")
     p.add_argument("--constraints", default="未提供")
@@ -1106,6 +1440,8 @@ def main() -> None:
         help="新文章或两种明确重做模式；重做时还要提供article-id和base-article-version",
     )
     p.add_argument("--base-article-version")
+    p.add_argument("--base-outline-id")
+    p.add_argument("--base-outline-version")
     p.add_argument("--article-id")
     p.add_argument("--date", default=date.today().isoformat())
     p.set_defaults(func=prepare)
@@ -1128,7 +1464,10 @@ def main() -> None:
     except SystemExit as exc:
         # The bridge uses SystemExit for user-facing validation failures.
         # Mirror those failures into the project summary before re-raising.
-        event = "writing_task_failure" if args.command == "prepare" else "final_received_failure"
+        if args.command == "prepare" and isinstance(exc, OutlineChangeRequiresConfirmation):
+            event = "writing_task_outline_confirmation_required"
+        else:
+            event = "writing_task_failure" if args.command == "prepare" else "final_received_failure"
         update_integration_status(
             args.project,
             event,

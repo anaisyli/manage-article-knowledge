@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 import tempfile
 from pathlib import Path
@@ -20,6 +21,47 @@ CLAIM_RECHECK_HEADER = (
     "当前归类模块", "处置", "依据",
 )
 REVISION_REVIEW_HEADER = ("复核项", "15记录入口", "审核结论", "阻塞或排除")
+REFRESH_SUMMARY_HEADER = ("项目", "本轮结果")
+REFRESH_SUMMARY_ITEMS = (
+    "基线版本", "重新检索范围", "基线Claim数", "本轮候选事实数", "保留", "新增",
+    "更新", "拆分", "迁移", "失效", "转入gap/CUS/MAT/ANM", "中文结论",
+)
+REFRESH_COUNT_ITEMS = (
+    "基线Claim数", "本轮候选事实数", "保留", "新增", "更新", "拆分", "迁移",
+    "失效", "转入gap/CUS/MAT/ANM",
+)
+BASELINE_GAP_REVIEW_HEADER = (
+    "缺口ID", "基线Faithfulness入口", "当前台账状态", "与原大纲关系", "本轮处理",
+)
+WEBSITE_EVIDENCE_HEADER = (
+    "大纲章节/知识问题", "页面名称与最终具体URL", "获取日期", "正文位置",
+    "最小连续原文", "候选事实ID或未命中", "处置结果",
+)
+GENERIC_WEBSITE_DISPOSITIONS = (
+    "仅用于链接和品牌导航",
+    "用于关键词链接和品牌页面确认",
+    "用于官网画像和链接选择",
+    "不用官网导航替代Claim",
+    "官网用于品牌与页面确认",
+    "官网命中相关导航",
+)
+HTTP_URL_RE = re.compile(r"https?://[^\s|；，、]+", re.IGNORECASE)
+
+
+def resolve_archive_entry(task_dir: Path, entry: str) -> Path | None:
+    """Resolve a project-relative archive entry without escaping the project root."""
+    if not entry or entry == "不适用":
+        return None
+    relative = Path(entry)
+    if relative.is_absolute():
+        return None
+    project = task_dir.parents[2].resolve()
+    candidate = (project / relative).resolve()
+    try:
+        candidate.relative_to(project)
+    except ValueError:
+        return None
+    return candidate
 
 COMPLEX_MATERIAL_HEADER = (
     "资料ID", "文件名与稳定路径", "未索引内容/处理原因", "与本篇关系判断",
@@ -39,18 +81,19 @@ CONTRACTS: dict[str, dict[str, Any]] = {
     "10_文章知识需求.md": {
         "title": "# 文章知识需求",
         "version_field": "模板版本",
-        "fields": ("文章ID", "当前版本", "模板版本", "交接合同版本", "标题", "关键词", "目标语言", "特殊限制", "大纲状态", "原始写作请求", "产品或内容对象", "选题方向", "原始写作要求", "当前状态", "写作Skill", "任务模式", "基线文章版本", "旧版本归档入口"),
+        "fields": ("文章ID", "当前版本", "模板版本", "交接合同版本", "标题", "关键词", "目标语言", "特殊限制", "大纲状态", "原始写作请求", "产品或内容对象", "选题方向", "原始写作要求", "当前状态", "写作Skill", "任务模式", "大纲ID", "大纲版本", "重写模式", "基线文章ID", "基线文章版本", "基线大纲ID", "基线大纲版本", "旧版本归档入口"),
         "headings": ("## 外部写作任务接入", "## 大纲", "## 随文章提交文件分类"),
         "tables": {"## 随文章提交文件分类": ("文件名", "原始路径", "SHA-256", "文件性质", "使用范围", "处理结果")},
     },
     "15_检索与知识准备记录.md": {
         "title": "# 检索与知识准备记录",
         "version_field": "模板版本",
-        "fields": ("文章ID", "文章版本", "模板版本", "最近更新", "MAT依赖处理", "知识准备模式", "基线文章版本"),
-        "headings": ("## 固定检索层状态", "## 来源命中记录", "## 候选事实处置明细", "## 旧Claim重新核验", "## 大纲逐项检索与候选事实覆盖", "## MAT依赖与资料选择", "## 复杂资料处理与原件核对"),
+        "fields": ("文章ID", "文章版本", "模板版本", "最近更新", "MAT依赖处理", "知识准备模式", "大纲ID", "大纲版本", "重写模式", "基线文章版本"),
+        "headings": ("## 固定检索层状态", "## 来源命中记录", "## 官网正文核验", "## 候选事实处置明细", "## 旧Claim重新核验", "## 大纲逐项检索与候选事实覆盖", "## MAT依赖与资料选择", "## 复杂资料处理与原件核对"),
         "tables": {
             "## 固定检索层状态": ("检索层", "当前状态", "结果或未查原因", "下一步"),
             "## 来源命中记录": ("知识问题", "命中Claim/资料名称与入口", "相关理由", "处理结果"),
+            "## 官网正文核验": WEBSITE_EVIDENCE_HEADER,
             "## 候选事实处置明细": ("候选事实ID", "独立事实摘要", "来源与精确位置", "处置结果", "Formal Claim或排除/治理入口"),
             "## 旧Claim重新核验": CLAIM_RECHECK_HEADER,
             "## 大纲逐项检索与候选事实覆盖": ("大纲章节", "六层检索范围与结果", "命中来源与精确入口", "候选事实ID", "候选事实数", "已沉淀Claim数", "未采用事实/缺口及原因", "下一步"),
@@ -61,7 +104,7 @@ CONTRACTS: dict[str, dict[str, Any]] = {
     "20_文章前知识审核.md": {
         "title": "# 文章前知识审核",
         "version_field": "审核模板版本",
-        "fields": ("文章ID", "文章版本", "审核模板版本", "审核日期", "结论", "可用Claim数", "客户来源", "外部来源", "明确排除", "未解决但不阻塞事项", "计划写作素材", "计划写作素材来源索引", "知识准备模式", "基线文章版本"),
+        "fields": ("文章ID", "文章版本", "审核模板版本", "审核日期", "结论", "可用Claim数", "客户来源", "外部来源", "明确排除", "未解决但不阻塞事项", "计划写作素材", "计划写作素材来源索引", "知识准备模式", "大纲ID", "大纲版本", "重写模式", "基线文章版本"),
         "headings": ("## 重做检索复核", "## 大纲知识覆盖检查", "## 知识准备充分性复核", "## 复杂资料与原件核对复核", "## CUS / ANM检测结果"),
         "tables": {
             "## 重做检索复核": REVISION_REVIEW_HEADER,
@@ -109,7 +152,7 @@ CONTRACTS: dict[str, dict[str, Any]] = {
         "fields": ("文章ID", "文章标题", "文章版本", "模板版本", "交接合同版本", "当前状态", "终稿", "本篇知识库资料", "写作素材来源索引", "终稿接收日期", "Faithfulness结果入口", "指定审核结果目录", "Faithfulness导入日期", "Faithfulness执行器", "外部审核模式", "外部结果文件", "unsupported归组处置文件", "终稿SHA-256", "本篇知识库资料及SHA-256"),
         "headings": ("## 一、Faithfulness结果", "## 二、正式知识对文章事实的支撑", "## 三、未被本次知识附件覆盖的内容", "## 四、后续动作", "## 五、更新记录"),
         "tables": {
-            "## 一、Faithfulness结果": ("支持事实主张数", "全部事实主张数", "不支持事实主张数", "Faithfulness", "正式Claim映射数", "未映射的支持主张数"),
+            "## 一、Faithfulness结果": ("明确支持", "全部可验证主张", "尚未确认（证据不足）", "明确冲突", "知识附件明确支撑率", "正式Claim映射数", "未映射的明确支持主张数"),
             "## 二、正式知识对文章事实的支撑": ("文章事实/位置", "Formal Claim及通俗标题", "正式知识文件", "原始来源与位置", "支撑判断"),
             "## 三、未被本次知识附件覆盖的内容": ("归组及claim_id", "知识问题/内容", "分类", "分类依据", "本篇影响", "关联事项/入口", "当前处理", "下一步"),
             "## 四、后续动作": ("事项", "当前状态", "下一责任人", "关联入口", "更新/关闭条件"),
@@ -162,6 +205,137 @@ def table_rows(text: str, heading: str) -> list[list[str]]:
     return rows
 
 
+def website_retrieval_errors(text: str) -> list[str]:
+    """Require auditable page-body retrieval before an article can be delivered."""
+    errors: list[str] = []
+    layer_rows = table_rows(text, "## 固定检索层状态")
+    website_layer = next(
+        (row for row in layer_rows if row and row[0].strip() == "客户官网"),
+        None,
+    )
+    if not website_layer or len(website_layer) < 4:
+        return ["客户官网检索层缺失或列数不足"]
+
+    status, layer_result, next_step = (cell.strip() for cell in website_layer[1:4])
+    layer_record = " ".join((status, layer_result, next_step))
+    if any(phrase in layer_record for phrase in GENERIC_WEBSITE_DISPOSITIONS):
+        errors.append("客户官网仍使用仅导航/链接的笼统处置语，未证明读取正文")
+    if status.startswith("已检索") and not HTTP_URL_RE.search(layer_record):
+        errors.append("客户官网已标记检索，但固定检索层没有最终具体URL")
+
+    if table_header(text, "## 官网正文核验") != WEBSITE_EVIDENCE_HEADER:
+        errors.append("缺少固定表头的官网正文核验")
+        return errors
+    evidence_rows = table_rows(text, "## 官网正文核验")
+    if not evidence_rows:
+        errors.append("官网正文核验没有实际记录")
+        return errors
+
+    matrix_rows = table_rows(text, "## 大纲逐项检索与候选事实覆盖")
+    expected_questions = [row[0].strip().strip("*`# ") for row in matrix_rows if row and row[0].strip()]
+    actual_questions = [row[0].strip().strip("*`# ") for row in evidence_rows if row]
+    for question in expected_questions:
+        if not any(question == actual or question in actual or actual in question for actual in actual_questions):
+            errors.append(f"官网正文核验未逐项覆盖：{question}")
+
+    candidate_rows = {
+        row[0].strip(): row
+        for row in table_rows(text, "## 候选事实处置明细")
+        if len(row) >= 5 and re.fullmatch(r"CF-\d{3}", row[0].strip())
+    }
+    website_candidate_ids: set[str] = set()
+    for row in evidence_rows:
+        if len(row) != len(WEBSITE_EVIDENCE_HEADER):
+            errors.append("官网正文核验存在列数错误的数据行")
+            continue
+        question, page, fetched, position, excerpt, candidate_result, disposition = (
+            cell.strip() for cell in row
+        )
+        if not all((question, page, fetched, position, excerpt, candidate_result, disposition)):
+            errors.append(f"官网正文核验记录不完整：{question or '未命名知识问题'}")
+            continue
+        if not HTTP_URL_RE.search(page):
+            errors.append(f"官网正文核验缺少最终具体URL：{question}")
+        if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", fetched):
+            errors.append(f"官网正文核验获取日期必须为YYYY-MM-DD：{question}")
+        if any(phrase in disposition for phrase in GENERIC_WEBSITE_DISPOSITIONS):
+            errors.append(f"官网正文核验仍使用仅导航/链接的笼统处置语：{question}")
+
+        candidate_ids = set(re.findall(r"\bCF-\d{3}\b", candidate_result))
+        website_candidate_ids.update(candidate_ids)
+        if candidate_ids:
+            if position in {"无", "不适用", "导航", "页面"}:
+                errors.append(f"官网候选事实缺少正文标题、区块或段落位置：{question}")
+            if excerpt in {"无", "不适用", "页面标题", "导航"} or len(excerpt) < 12:
+                errors.append(f"官网候选事实缺少最小连续原文：{question}")
+            for candidate_id in sorted(candidate_ids):
+                candidate = candidate_rows.get(candidate_id)
+                if not candidate:
+                    errors.append(f"官网正文核验引用不存在的候选事实：{candidate_id}")
+                    continue
+                if not HTTP_URL_RE.search(candidate[2]):
+                    errors.append(f"官网候选事实没有在来源与精确位置保留URL：{candidate_id}")
+                if candidate[3].strip() in {"排除", "进入治理"} and candidate[4].strip() in {
+                    "无", "未采用", "待补充",
+                }:
+                    errors.append(f"官网候选事实缺少具体排除或治理依据：{candidate_id}")
+        elif not any(marker in candidate_result for marker in ("未命中", "无法访问", "不适用")):
+            errors.append(f"官网正文核验既没有候选事实ID，也没有明确未命中/访问结果：{question}")
+
+    source_hit_rows = table_rows(text, "## 来源命中记录")
+    if status.startswith("已检索") and not any(
+        any(HTTP_URL_RE.search(cell) for cell in row) for row in source_hit_rows
+    ):
+        errors.append("来源命中记录没有官网具体URL，无法证明本篇实际访问")
+    if "命中" in status and "未命中" not in status and not website_candidate_ids:
+        errors.append("客户官网标记为命中，但官网正文核验没有任何候选事实ID")
+    return list(dict.fromkeys(errors))
+
+
+def markdown_table_layout_errors(text: str, heading: str) -> list[str]:
+    """Validate the rendered Markdown table boundary, not only parsed cells."""
+    match = re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE)
+    if not match:
+        return []
+    body = text[match.end():]
+    next_heading = re.search(r"^##\s+", body, re.MULTILINE)
+    if next_heading:
+        body = body[:next_heading.start()]
+    lines = body.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip().startswith("|")), None)
+    if first is None:
+        return []
+    table_end = first
+    while table_end < len(lines) and lines[table_end].strip().startswith("|"):
+        table_end += 1
+    later_table = next(
+        (index for index in range(table_end, len(lines)) if lines[index].strip().startswith("|")),
+        None,
+    )
+    if later_table is not None:
+        return [f"{heading}表格内部存在空行或非表格内容，表头和数据必须连续"]
+    if table_end - first < 3:
+        return [f"{heading}表头、分隔行和首条数据必须连续"]
+    return []
+
+
+def normalize_markdown_table_spacing(text: str) -> str:
+    """Remove only blank lines sandwiched between Markdown table rows."""
+    lines = text.splitlines()
+    normalized: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.strip() and normalized and normalized[-1].strip().startswith("|"):
+            next_nonblank = next(
+                (candidate for candidate in lines[index + 1:] if candidate.strip()),
+                "",
+            )
+            if next_nonblank.strip().startswith("|"):
+                continue
+        normalized.append(line)
+    suffix = "\n" if text.endswith("\n") else ""
+    return "\n".join(normalized) + suffix
+
+
 def section_body(text: str, heading: str) -> str:
     match = re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE)
     if not match:
@@ -197,7 +371,7 @@ def validate_complex_material_rows(rows: list[list[str]]) -> list[str]:
             if source_id != "无" or is_placeholder(reason):
                 errors.append("复杂资料不适用行必须写资料ID“无”及本篇没有可能相关复杂资料的理由")
             continue
-        if not re.fullmatch(r"SRC-[A-Za-z0-9]+", source_id):
+        if not re.fullmatch(r"SRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", source_id):
             errors.append(f"复杂资料处理资料ID必须使用完整SRC ID：{source_id or '空'}")
         elif source_id in seen:
             errors.append(f"复杂资料处理资料ID重复：{source_id}")
@@ -255,8 +429,31 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
         if not re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE):
             errors.append(f"缺少固定章节：{heading}")
     for heading, expected in contract["tables"].items():
+        errors.extend(markdown_table_layout_errors(text, heading))
         actual = table_header(text, heading)
-        if actual != expected:
+        legacy_faithfulness_headers = {
+            (
+                "有证据支持事实主张数", "全部事实主张数", "未获严格支持事实主张数",
+                "Faithfulness（严格支撑）", "DeepEval兼容诊断（不代表知识库实际支撑率）",
+                "证据不足（unknown）", "明确冲突（contradicted）", "正式Claim映射数",
+                "未映射的支持主张数",
+            ),
+            (
+                "严格支持事实主张数", "全部事实主张数", "严格不支持事实主张数",
+                "Faithfulness（严格支撑）", "DeepEval规则复现率", "unknown数",
+                "正式Claim映射数", "未映射的支持主张数",
+            ),
+            (
+                "支持事实主张数", "全部事实主张数", "不支持事实主张数",
+                "Faithfulness", "正式Claim映射数", "未映射的支持主张数",
+            ),
+        }
+        legacy_ok = (
+            (contract_name or path.name) == "50_文章知识使用与Faithfulness记录.md"
+            and heading == "## 一、Faithfulness结果"
+            and actual in legacy_faithfulness_headers
+        )
+        if actual != expected and not legacy_ok:
             errors.append(
                 f"{heading}固定表头不符：应为{' | '.join(expected)}，实际为{' | '.join(actual) or '缺失'}"
             )
@@ -273,24 +470,81 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
         if mode not in REVISION_MODES:
             errors.append(f"任务模式无效：{mode}")
         base_version = parse_field(text, "基线文章版本")
+        article_id = parse_field(text, "文章ID")
+        current_version = parse_field(text, "当前版本")
+        outline_id = parse_field(text, "大纲ID")
+        outline_version = parse_field(text, "大纲版本")
+        rewrite_mode = parse_field(text, "重写模式")
+        base_article_id = parse_field(text, "基线文章ID")
+        base_outline_id = parse_field(text, "基线大纲ID")
+        base_outline_version = parse_field(text, "基线大纲版本")
         archive_entry = parse_field(text, "旧版本归档入口")
+        if not outline_id:
+            errors.append("必须记录稳定的大纲ID")
+        if not re.fullmatch(r"v[1-9]\d*", outline_version):
+            errors.append("大纲版本必须使用vN")
         if mode == "new_article":
-            if base_version != "不适用" or archive_entry != "不适用":
-                errors.append("新文章的基线文章版本和旧版本归档入口必须为“不适用”")
+            if rewrite_mode != "not_applicable":
+                errors.append("新文章的重写模式必须为not_applicable")
+            if any(value != "不适用" for value in (
+                base_article_id, base_version, base_outline_id, base_outline_version, archive_entry,
+            )):
+                errors.append("新文章的基线文章/大纲身份和旧版本归档入口必须为“不适用”")
         elif mode in {"knowledge_refresh_and_rewrite", "article_rewrite_only"}:
+            if rewrite_mode != "same_outline":
+                errors.append("重做任务的重写模式必须为same_outline")
+            if base_article_id != article_id:
+                errors.append("同大纲重写的基线文章ID必须与文章ID一致")
             if not re.fullmatch(r"v[1-9]\d*", base_version):
                 errors.append("重做任务的基线文章版本必须使用vN")
+            elif re.fullmatch(r"v[1-9]\d*", current_version):
+                if int(current_version[1:]) != int(base_version[1:]) + 1:
+                    errors.append("同大纲重写只允许文章版本在基线版本上递增1")
+            if base_outline_id != outline_id or base_outline_version != outline_version:
+                errors.append("同大纲重写必须原样沿用大纲ID和大纲版本")
             if not archive_entry or archive_entry == "不适用":
                 errors.append("重做任务必须记录真实旧版本归档入口")
     elif path.name == "15_检索与知识准备记录.md":
+        errors.extend(website_retrieval_errors(text))
         knowledge_mode = parse_field(text, "知识准备模式")
         base_version = parse_field(text, "基线文章版本")
+        outline_id = parse_field(text, "大纲ID")
+        outline_version = parse_field(text, "大纲版本")
+        rewrite_mode = parse_field(text, "重写模式")
+        if not outline_id or not re.fullmatch(r"v[1-9]\d*", outline_version):
+            errors.append("15必须记录有效大纲ID和vN大纲版本")
+        if rewrite_mode not in {"not_applicable", "same_outline"}:
+            errors.append(f"重写模式无效：{rewrite_mode}")
         if knowledge_mode not in {"new_article", "knowledge_refresh_and_rewrite"}:
             errors.append(f"知识准备模式无效：{knowledge_mode}")
         elif knowledge_mode == "new_article" and base_version != "不适用":
             errors.append("新文章知识准备的基线文章版本必须为“不适用”")
         elif knowledge_mode == "knowledge_refresh_and_rewrite" and not re.fullmatch(r"v[1-9]\d*", base_version):
             errors.append("知识重整的基线文章版本必须使用vN")
+        if knowledge_mode == "knowledge_refresh_and_rewrite":
+            if rewrite_mode != "same_outline":
+                errors.append("知识重整重写的重写模式必须为same_outline")
+            if table_header(text, "## 本轮知识刷新结论") != REFRESH_SUMMARY_HEADER:
+                errors.append("知识重整必须包含固定表头的本轮知识刷新结论")
+            refresh_rows = table_rows(text, "## 本轮知识刷新结论")
+            refresh_summary = {row[0].strip(): row[1].strip() for row in refresh_rows if len(row) >= 2}
+            missing_items = [item for item in REFRESH_SUMMARY_ITEMS if not refresh_summary.get(item)]
+            if missing_items:
+                errors.append("本轮知识刷新结论缺少项目：" + "、".join(missing_items))
+            for item in REFRESH_COUNT_ITEMS:
+                value = refresh_summary.get(item, "")
+                if value and not value.isdigit():
+                    errors.append(f"本轮知识刷新结论的{item}必须是非负整数")
+            if refresh_summary.get("基线版本") != base_version:
+                errors.append("本轮知识刷新结论的基线版本必须与15头部一致")
+            scope = refresh_summary.get("重新检索范围", "")
+            if scope in {"已检索", "检索完成", "无", "不适用"}:
+                errors.append("本轮知识刷新结论必须用中文写明实际重新检索范围")
+            conclusion = refresh_summary.get("中文结论", "")
+            if not re.search(r"[\u3400-\u9fff]", conclusion):
+                errors.append("本轮知识刷新结论必须使用中文人话")
+            if conclusion and "不阻塞文章重写" not in conclusion:
+                errors.append("本轮知识刷新结论必须明确说明不阻塞文章重写")
         candidate_details = table_rows(text, "## 候选事实处置明细")
         candidate_ids: set[str] = set()
         candidate_claims: dict[str, str] = {}
@@ -363,6 +617,13 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
     elif path.name == "20_文章前知识审核.md":
         knowledge_mode = parse_field(text, "知识准备模式")
         base_version = parse_field(text, "基线文章版本")
+        outline_id = parse_field(text, "大纲ID")
+        outline_version = parse_field(text, "大纲版本")
+        rewrite_mode = parse_field(text, "重写模式")
+        if not outline_id or not re.fullmatch(r"v[1-9]\d*", outline_version):
+            errors.append("20必须记录有效大纲ID和vN大纲版本")
+        if rewrite_mode not in {"not_applicable", "same_outline"}:
+            errors.append(f"重写模式无效：{rewrite_mode}")
         if knowledge_mode not in {"new_article", "knowledge_refresh_and_rewrite"}:
             errors.append(f"知识准备模式无效：{knowledge_mode}")
         elif knowledge_mode == "new_article" and base_version != "不适用":
@@ -371,6 +632,10 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
             errors.append("知识重整审核的基线文章版本必须使用vN")
         revision_rows = table_rows(text, "## 重做检索复核")
         required_revision_checks = {"六层重新检索", "旧Claim逐条复核", "Claim重新归类", "30/35重新生成"}
+        if knowledge_mode == "knowledge_refresh_and_rewrite":
+            if rewrite_mode != "same_outline":
+                errors.append("知识重整审核的重写模式必须为same_outline")
+            required_revision_checks.add("本轮知识刷新结论")
         actual_revision_checks = {row[0].strip() for row in revision_rows if row}
         for check in sorted(required_revision_checks - actual_revision_checks):
             errors.append(f"重做检索复核缺少“{check}”固定行")
@@ -436,7 +701,7 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
             if state == "不适用":
                 if source_id != "无" or is_placeholder(conclusion):
                     errors.append("复杂资料复核不适用行必须写资料ID“无”和本篇审核结论")
-            elif not re.fullmatch(r"SRC-[A-Za-z0-9]+", source_id):
+            elif not re.fullmatch(r"SRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", source_id):
                 errors.append(f"复杂资料复核资料ID必须使用完整SRC ID：{source_id or '空'}")
             if any(is_placeholder(value) for value in (retrieval_entry, impact, conclusion)):
                 errors.append(f"{source_id or '未编号资料'}复杂资料复核缺少15入口、对Claim影响或审核结论")
@@ -549,6 +814,19 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                 if review_by_source[source_id][2].strip() != row[8].strip():
                     errors.append(f"15与20的复杂资料最终状态不一致：{source_id}")
         mode = parse_field(request_text, "任务模式") or "new_article"
+        request_outline_id = parse_field(request_text, "大纲ID")
+        request_outline_version = parse_field(request_text, "大纲版本")
+        request_rewrite_mode = parse_field(request_text, "重写模式")
+        for path, filename in ((retrieval, "15_检索与知识准备记录.md"), (audit, "20_文章前知识审核.md")):
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8-sig")
+            if parse_field(content, "大纲ID") != request_outline_id:
+                errors.append(f"{filename}：大纲ID必须与10一致")
+            if parse_field(content, "大纲版本") != request_outline_version:
+                errors.append(f"{filename}：大纲版本必须与10一致")
+            if parse_field(content, "重写模式") != request_rewrite_mode:
+                errors.append(f"{filename}：重写模式必须与10一致")
         if mode == "knowledge_refresh_and_rewrite":
             base_version = parse_field(request_text, "基线文章版本")
             archive_entry = parse_field(request_text, "旧版本归档入口")
@@ -569,11 +847,13 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                     errors.append("15_检索与知识准备记录.md：旧Claim重新核验必须至少有一行真实记录")
                 old_claims: set[str] = set()
                 if archive_entry and archive_entry != "不适用":
-                    archive = task_dir.parents[2] / Path(archive_entry)
-                    old_source_index = archive / "35_写作素材来源索引.md"
-                    if not old_source_index.is_file():
+                    archive = resolve_archive_entry(task_dir, archive_entry)
+                    if archive is None:
+                        errors.append("15_检索与知识准备记录.md：旧版本归档入口必须位于当前项目内")
+                    old_source_index = archive / "35_写作素材来源索引.md" if archive else None
+                    if old_source_index is not None and not old_source_index.is_file():
                         errors.append("15_检索与知识准备记录.md：旧版本归档缺少35，无法证明旧Claim已重新核验")
-                    else:
+                    elif old_source_index is not None:
                         old_claims = set(re.findall(r"\bCLM-[A-Za-z0-9-]+\b", old_source_index.read_text(encoding="utf-8-sig")))
                 recorded_claims = {row[0].strip() for row in claim_rows if row and row[0].strip() != "无"}
                 missing_claims = sorted(old_claims - recorded_claims)
@@ -585,12 +865,106 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                         continue
                     if row[0].strip() != "无" and any(not cell.strip() for cell in row[:len(CLAIM_RECHECK_HEADER)]):
                         errors.append(f"15_检索与知识准备记录.md：{row[0] or '未编号旧Claim'}重新核验记录不完整")
+                    if row[0].strip() != "无" and row[5].strip() not in {"复用", "更新", "拆分", "迁移", "失效", "不适用"}:
+                        errors.append(
+                            f"15_检索与知识准备记录.md：{row[0] or '未编号旧Claim'}处置必须使用复用/更新/拆分/迁移/失效/不适用"
+                        )
+                refresh_rows = table_rows(retrieval_text, "## 本轮知识刷新结论")
+                refresh_summary = {
+                    row[0].strip(): row[1].strip() for row in refresh_rows if len(row) >= 2
+                }
+                candidate_rows = table_rows(retrieval_text, "## 候选事实处置明细")
+                newly_created_claims = {
+                    claim_id
+                    for row in candidate_rows if len(row) >= 5 and row[3].strip() == "已沉淀Formal Claim"
+                    for claim_id in re.findall(r"\bCLM-[A-Za-z0-9-]+\b", row[4])
+                    if claim_id not in old_claims
+                }
+                expected_counts = {
+                    "基线Claim数": len(old_claims),
+                    "本轮候选事实数": len({
+                        row[0].strip() for row in candidate_rows
+                        if row and re.fullmatch(r"CF-\d{3}", row[0].strip())
+                    }),
+                    "新增": len(newly_created_claims),
+                    "保留": sum(1 for row in claim_rows if len(row) >= 6 and row[5].strip() == "复用"),
+                    "更新": sum(1 for row in claim_rows if len(row) >= 6 and row[5].strip() == "更新"),
+                    "拆分": sum(1 for row in claim_rows if len(row) >= 6 and row[5].strip() == "拆分"),
+                    "迁移": sum(1 for row in claim_rows if len(row) >= 6 and row[5].strip() == "迁移"),
+                    "失效": sum(1 for row in claim_rows if len(row) >= 6 and row[5].strip() == "失效"),
+                    "转入gap/CUS/MAT/ANM": sum(
+                        1 for row in candidate_rows if len(row) >= 4 and row[3].strip() == "进入治理"
+                    ),
+                }
+                for label, expected_count in expected_counts.items():
+                    value = refresh_summary.get(label, "")
+                    if value.isdigit() and int(value) != expected_count:
+                        errors.append(
+                            f"15_检索与知识准备记录.md：本轮知识刷新结论的{label}与明细不一致，"
+                            f"应为{expected_count}，实际为{value}"
+                        )
+                archive = resolve_archive_entry(task_dir, archive_entry)
+                baseline_record = archive / "50_文章知识使用与Faithfulness记录.md" if archive else None
+                baseline_gaps = (
+                    set(re.findall(r"\bGAP-[A-Za-z0-9-]+\b", baseline_record.read_text(encoding="utf-8-sig")))
+                    if baseline_record and baseline_record.is_file() else set()
+                )
+                if baseline_gaps:
+                    if table_header(retrieval_text, "## 基线知识缺口复核") != BASELINE_GAP_REVIEW_HEADER:
+                        errors.append("15_检索与知识准备记录.md：知识重整必须包含固定表头的基线知识缺口复核")
+                    gap_review_rows = table_rows(retrieval_text, "## 基线知识缺口复核")
+                    reviews = {
+                        row[0].strip(): row for row in gap_review_rows
+                        if len(row) >= len(BASELINE_GAP_REVIEW_HEADER)
+                    }
+                    for gap_id in sorted(baseline_gaps - set(reviews)):
+                        errors.append(f"15_检索与知识准备记录.md：未继承基线Faithfulness缺口{gap_id}")
+                    gap_csv = task_dir.parents[2] / "05_数据与审核/20_知识库覆盖与缺口/10_知识缺口记录.csv"
+                    gap_ledger: dict[str, dict[str, str]] = {}
+                    if gap_csv.is_file():
+                        with gap_csv.open("r", encoding="utf-8-sig", newline="") as stream:
+                            gap_ledger = {
+                                row.get("gap_key", ""): row for row in csv.DictReader(stream)
+                                if row.get("gap_key", "")
+                            }
+                    restrictions = " ".join(
+                        parse_field(request_text, label)
+                        for label in ("特殊限制", "原始写作要求", "原始写作请求")
+                    )
+                    forbidden = any(
+                        marker in restrictions
+                        for marker in ("本篇不开展新的外部调研", "禁止外部调研", "不使用任何外部来源")
+                    )
+                    for gap_id in sorted(baseline_gaps):
+                        ledger_row = gap_ledger.get(gap_id)
+                        if not ledger_row:
+                            errors.append(f"基线Faithfulness缺口未在项目知识缺口台账登记：{gap_id}")
+                            continue
+                        try:
+                            count = int(
+                                ledger_row.get("current_article_count", ledger_row.get("article_count", "0")) or 0
+                            )
+                        except ValueError:
+                            count = 0
+                        status = ledger_row.get("status", "")
+                        if count >= 2 and status == "观察中":
+                            errors.append(f"重复公共知识缺口不能保持观察中：{gap_id}")
+                        review = reviews.get(gap_id, [])
+                        relationship = review[3].strip() if len(review) >= 5 else ""
+                        handling = review[4].strip() if len(review) >= 5 else ""
+                        excluded = any(marker in relationship for marker in ("无关", "已排除", "不再需要"))
+                        specific_exclusion = excluded and len(handling) >= 12 and handling not in {"中性表达", "一般原理", "缩小范围", "省略"}
+                        if status == "待外部调研" and not forbidden and not specific_exclusion:
+                            errors.append(
+                                f"{gap_id}已达到待外部调研门槛；知识重整必须先完成正式外部调研，"
+                                "不能只用一般原理或中性表达跳过"
+                            )
             if audit.is_file():
                 audit_text = audit.read_text(encoding="utf-8-sig")
                 if table_header(audit_text, "## 重做检索复核") != REVISION_REVIEW_HEADER:
                     errors.append("20_文章前知识审核.md：重做检索复核固定表头不符")
                 rows = table_rows(audit_text, "## 重做检索复核")
-                required_checks = {"六层重新检索", "旧Claim逐条复核", "Claim重新归类", "30/35重新生成"}
+                required_checks = {"六层重新检索", "旧Claim逐条复核", "Claim重新归类", "本轮知识刷新结论", "30/35重新生成"}
                 actual_checks = {row[0].strip() for row in rows if row}
                 for check in sorted(required_checks - actual_checks):
                     errors.append(f"20_文章前知识审核.md：重做检索复核缺少“{check}”")
@@ -631,7 +1005,13 @@ def self_test() -> None:
                     value = "已确认"
                 elif field in {"任务模式", "知识准备模式"}:
                     value = "new_article"
-                elif field in {"基线文章版本", "旧版本归档入口"}:
+                elif field == "大纲ID":
+                    value = "DEMO-OUT-001"
+                elif field == "大纲版本":
+                    value = "v1"
+                elif field == "重写模式":
+                    value = "not_applicable"
+                elif field in {"基线文章ID", "基线文章版本", "基线大纲ID", "基线大纲版本", "旧版本归档入口"}:
                     value = "不适用"
                 lines.append(f"- {field}：{value}")
             for heading in contract["headings"]:
@@ -643,8 +1023,14 @@ def self_test() -> None:
                     values = ["测试" for _ in expected]
                     if heading == "## 大纲知识覆盖检查":
                         values = ["标题", "标题成立需要哪些事实", "已覆盖", "CLM-DEMO-001", "无", "使用"]
+                    elif heading == "## 固定检索层状态":
+                        values = ["客户官网", "已检索并命中", "About正文 https://example.com/about-us/", "CF-001已建立客户官网Claim"]
+                    elif heading == "## 来源命中记录":
+                        values = ["标题", "https://example.com/about-us/ Company Introduction第1段", "直接支持", "建立客户官网Claim"]
+                    elif heading == "## 官网正文核验":
+                        values = ["标题", "About Us；https://example.com/about-us/", "2026-09-21", "Company Introduction第1段", "Example Company provides custom packaging services for brands.", "CF-001", "建立客户官网Claim CLM-DEMO-001"]
                     elif heading == "## 候选事实处置明细":
-                        values = ["CF-001", "测试独立事实", "测试来源第1段", "已沉淀Formal Claim", "CLM-DEMO-001"]
+                        values = ["CF-001", "提供定制包装服务", "https://example.com/about-us/ Company Introduction第1段", "已沉淀Formal Claim", "CLM-DEMO-001"]
                     elif heading == "## 旧Claim重新核验":
                         values = ["无", "不适用", "不适用", "不适用", "不适用", "不适用", "新文章无旧Claim"]
                     elif heading == "## 重做检索复核":
@@ -667,6 +1053,9 @@ def self_test() -> None:
                     elif heading == "## 大纲逐项检索与候选事实覆盖":
                         lines.append("| 主问题 | 已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研 | 测试来源第1段 | CF-001 | 1 | 1 | 无 | 纳入30 |")
                         lines.append("| 测试主题与主要问题 | 已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研 | 测试来源第1段 | CF-001 | 1 | 1 | 无 | 纳入30 |")
+                    elif heading == "## 官网正文核验":
+                        lines.append("| 主问题 | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services for brands. | CF-001 | 建立客户官网Claim CLM-DEMO-001 |")
+                        lines.append("| 测试主题与主要问题 | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services for brands. | CF-001 | 建立客户官网Claim CLM-DEMO-001 |")
                     elif heading == "## 知识准备充分性复核":
                         lines.append("| 主问题 | 1 | 1 | 1 | 充分 | 无 |")
                         lines.append("| 测试主题与主要问题 | 1 | 1 | 1 | 充分 | 无 |")
@@ -681,8 +1070,30 @@ def self_test() -> None:
             path = root / name
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             assert not validate_file(path), (name, validate_file(path))
+            if name == "20_文章前知识审核.md":
+                valid_text = path.read_text(encoding="utf-8")
+                broken = valid_text.replace(
+                    "| 大纲章节 | 候选事实数 | 已沉淀Claim数 | 计划纳入30的事实块数 | 覆盖结论 | 未采用事实/缺口及入口 |\n|---|---|---|---|---|---|\n| 标题 |",
+                    "| 大纲章节 | 候选事实数 | 已沉淀Claim数 | 计划纳入30的事实块数 | 覆盖结论 | 未采用事实/缺口及入口 |\n|---|---|---|---|---|---|\n\n| 标题 |",
+                    1,
+                )
+                assert broken != valid_text
+                path.write_text(broken, encoding="utf-8")
+                assert any("表格内部存在空行" in error for error in validate_file(path))
+                normalized = normalize_markdown_table_spacing(broken)
+                assert "|---|---|---|---|---|---|\n| 标题 |" in normalized
+                assert normalize_markdown_table_spacing(normalized) == normalized
+                path.write_text(valid_text, encoding="utf-8")
             if name == "15_检索与知识准备记录.md":
                 valid_text = path.read_text(encoding="utf-8")
+                generic_website = valid_text.replace(
+                    "About正文 https://example.com/about-us/",
+                    "官网主页、Products和Custom Service仅用于链接和品牌导航",
+                    1,
+                )
+                path.write_text(generic_website, encoding="utf-8")
+                assert any("仅导航/链接" in item for item in validate_file(path))
+                path.write_text(valid_text, encoding="utf-8")
                 incomplete = valid_text.replace(
                     "| 标题 | 已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研 | 测试来源第1段 | CF-001 | 1 | 1 | 无 | 纳入30 |",
                     "| 标题 | 已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研 | 测试来源第1段 | CF-001 | 2 | 1 | 无 | 纳入30 |",
@@ -692,6 +1103,40 @@ def self_test() -> None:
                 negative_errors = validate_file(path)
                 assert any("候选事实ID数量与候选事实数不一致" in item for item in negative_errors)
                 assert any("没有逐项记录未采用原因" in item for item in negative_errors)
+                path.write_text(valid_text, encoding="utf-8")
+                refresh_text = valid_text.replace(
+                    "- 知识准备模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章版本：不适用",
+                    "- 知识准备模式：knowledge_refresh_and_rewrite\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：same_outline\n- 基线文章版本：v1",
+                    1,
+                ) + (
+                    "\n## 本轮知识刷新结论\n\n| 项目 | 本轮结果 |\n|---|---|\n"
+                    "| 基线版本 | v1 |\n| 重新检索范围 | 已检查正式Claim、客户源资料、官网、关联网站、外部Claim、新外部调研和治理队列 |\n"
+                    "| 基线Claim数 | 0 |\n| 本轮候选事实数 | 1 |\n| 保留 | 0 |\n| 新增 | 1 |\n"
+                    "| 更新 | 0 |\n| 拆分 | 0 |\n| 迁移 | 0 |\n| 失效 | 0 |\n| 转入gap/CUS/MAT/ANM | 0 |\n"
+                    "| 中文结论 | 已重新核验当前事实，本结论不阻塞文章重写。 |\n"
+                )
+                path.write_text(refresh_text, encoding="utf-8")
+                assert not validate_file(path), validate_file(path)
+                path.write_text(
+                    refresh_text.replace("本结论不阻塞文章重写", "继续处理"),
+                    encoding="utf-8",
+                )
+                assert any("不阻塞文章重写" in item for item in validate_file(path))
+                path.write_text(valid_text, encoding="utf-8")
+            elif name == "20_文章前知识审核.md":
+                valid_text = path.read_text(encoding="utf-8")
+                refresh_text = valid_text.replace(
+                    "- 知识准备模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章版本：不适用",
+                    "- 知识准备模式：knowledge_refresh_and_rewrite\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：same_outline\n- 基线文章版本：v1",
+                    1,
+                ).replace(
+                    "| 30/35重新生成 | 不适用 | 新文章不适用 | 无 |",
+                    "| 本轮知识刷新结论 | [[15_检索与知识准备记录.md#本轮知识刷新结论]] | 已复核 | 不阻塞 |\n"
+                    "| 30/35重新生成 | 不适用 | 新文章不适用 | 无 |",
+                    1,
+                )
+                path.write_text(refresh_text, encoding="utf-8")
+                assert not validate_file(path), validate_file(path)
                 path.write_text(valid_text, encoding="utf-8")
             path.write_text(path.read_text(encoding="utf-8").replace(contract["title"], "# 被简化的文件", 1), encoding="utf-8")
             assert validate_file(path), name

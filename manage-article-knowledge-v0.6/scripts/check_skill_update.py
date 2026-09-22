@@ -53,6 +53,27 @@ def atomic_write(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+def markdown_table_cells(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return None
+    return [cell.strip() for cell in stripped[1:-1].split("|")]
+
+
+def is_table_separator(cells: list[str] | None) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def canonical_change_table(rows: list[list[str]]) -> list[str]:
+    header = ["日期", "变更", "依据", "执行方", "关联对象", "影响范围"]
+    separator = ["---"] * len(header)
+    return [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(separator) + " |",
+        *["| " + " | ".join(row[: len(header)]) + " |" for row in rows],
+    ]
+
+
 def append_change_row(text: str, row: str) -> str:
     section = re.search(r"(?ms)^## 项目级变更\s*\n(.*?)(?=^##\s|\Z)", text)
     if not section:
@@ -66,18 +87,40 @@ def append_change_row(text: str, row: str) -> str:
         return text[: marker.start()] + addition + text[marker.start() :] if marker else text.rstrip() + "\n\n" + addition
     body = section.group(1)
     lines = body.splitlines()
-    header = next((index for index, line in enumerate(lines) if line.strip().startswith("| 日期 |")), None)
-    if header is None:
+    table_blocks: list[tuple[int, int, list[list[str]]]] = []
+    index = 0
+    while index < len(lines):
+        cells = markdown_table_cells(lines[index])
+        if not cells or cells[0] != "日期":
+            index += 1
+            continue
+        block_start = index
+        index += 1
+        separator = markdown_table_cells(lines[index]) if index < len(lines) else None
+        if is_table_separator(separator):
+            index += 1
+        rows: list[list[str]] = []
+        while index < len(lines):
+            row_cells = markdown_table_cells(lines[index])
+            if row_cells is None:
+                break
+            if not is_table_separator(row_cells):
+                rows.append(row_cells)
+            index += 1
+        table_blocks.append((block_start, index, rows))
+
+    if table_blocks:
+        first_start = table_blocks[0][0]
+        last_end = table_blocks[-1][1]
+        rows = [row for _, _, block_rows in table_blocks for row in block_rows]
+        new_table = canonical_change_table(rows + [markdown_table_cells(row) or []])
+        lines = lines[:first_start] + new_table + lines[last_end:]
+        body = "\n".join(lines) + "\n"
+    else:
         body = body.rstrip() + "\n\n" + (
             "| 日期 | 变更 | 依据 | 执行方 | 关联对象 | 影响范围 |\n"
             "|---|---|---|---|---|---|\n" + row + "\n"
         )
-    else:
-        insert_at = header + 2
-        while insert_at < len(lines) and lines[insert_at].strip().startswith("|"):
-            insert_at += 1
-        lines.insert(insert_at, row)
-        body = "\n".join(lines) + "\n"
     return text[: section.start(1)] + body + text[section.end(1) :]
 
 
@@ -205,8 +248,12 @@ def run_self_test() -> int:
             "- 当前Skill：manage-article-knowledge v0.6\n"
             f"- Skill文件SHA-256：{'a' * 64}\n\n"
             "## 项目级变更\n\n"
+            "| 日期         | 变更 | 依据 | 执行方 | 关联对象 | 影响范围 |\n"
+            "| ---------- | --- | --- | --- | --- | --- |\n"
+            "| 2026-09-01 | 初始化 | 初始记录 | Codex | DEMO | 控制结构 |\n\n"
             "| 日期 | 变更 | 依据 | 执行方 | 关联对象 | 影响范围 |\n"
-            "|---|---|---|---|---|---|\n\n"
+            "|---|---|---|---|---|---|\n"
+            "| 2026-09-02 | 旧版追加 | 历史记录 | Codex | DEMO | 版本检测 |\n\n"
             "## 相关入口\n",
             encoding="utf-8",
         )
@@ -224,7 +271,14 @@ def run_self_test() -> int:
         if not first["changed"] or not first["feedback_updated"] or second["changed"]:
             print(json.dumps({"ok": False, "stage": "change-detection", "first": first, "second": second}, ensure_ascii=False))
             return 1
-        if "## 最近Skill版本检测" not in feedback_text or version_text.count("启动检测同步Skill版本") != 1:
+        expected_header = "| 日期 | 变更 | 依据 | 执行方 | 关联对象 | 影响范围 |"
+        if (
+            "## 最近Skill版本检测" not in feedback_text
+            or version_text.count("启动检测同步Skill版本") != 1
+            or version_text.count(expected_header) != 1
+            or "初始化" not in version_text
+            or "旧版追加" not in version_text
+        ):
             print(json.dumps({"ok": False, "stage": "artifacts"}, ensure_ascii=False))
             return 1
     print(json.dumps({"ok": True}, ensure_ascii=False))

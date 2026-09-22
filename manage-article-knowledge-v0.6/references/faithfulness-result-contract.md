@@ -12,13 +12,15 @@ Faithfulness由独立文章审核Skill产生。本Skill不抽取文章原子事�
 
 不能因为资料包链接了知识库，就把整个知识库放入retrieval context。写作提示、SEO/GEO规则和文章评价指令都不是证据。`30`中的直接写作事实、英文表达、控制、建议、缺口处理和审计说明都不是可引用的正向证据；审核Skill只提取第一至第三节中明确标明为“证据正文”的连续来源正文或已核验目标语言翻译。直接写作事实可以指导作者，但外部审核的证据引文必须落在对应证据正文。
 
-受管v0.6的`40_最终文章.md`必须且只能包含一组`<!-- ARTICLE_BODY_START -->`与`<!-- ARTICLE_BODY_END -->`。审核器只解析两标记之间的正文文字、列表和表格；标题、关键词、TDK、图片说明、交付管理字段和审核文字不进入文章单元。标记缺失、重复或倒置时硬失败，并要求知识库桥接器重新规范化`40`，不得由审核器猜测正文范围。
+受管v0.6的`40_最终文章.md`必须且只能包含一组`<!-- ARTICLE_BODY_START -->`与`<!-- ARTICLE_BODY_END -->`。审核器只解析两标记之间的正文文字、列表和表格；标题、关键词、TDK、图片说明、交付管理字段和审核文字不进入文章单元。知识库导入器复核prepared时必须使用同一行解析规则：`![alt]`和`![alt](url)`均不计作正文，普通`[text](url)`保留`text`。标记缺失、重复或倒置时硬失败，并要求知识库桥接器重新规范化`40`，不得由审核器猜测正文范围。
+
+外部终稿为DOCX时，`writing_bridge.py`必须读取段落样式并把明确的Word`Title`、`Heading 1-6`、段落/样式`outlineLvl`和已登记的`Section Label/Section Title/Subheading`类样式转换为Markdown标题，同时留下`MAK_DOCX_HEADING_STYLE`来源标记。普通正文不得因粗体、字号、短句或空行外观被猜成标题。Word表格必须输出标准Markdown表头分隔行；明确的`w:tblHeader`或首行表格样式作为结构表头，没有表头时生成空结构表头并保留全部原始数据行。Faithfulness在prepared中保留结构标题和表格表头的原顺序，但不给候选证据、不给claim，并在分母冻结前确定性排除；该结构排除不能被`heading_override_reason`恢复。
 
 Faithfulness只报告“终稿事实被实际交付事实附件支持的比例”。它不是SEO/GEO质量、搜索表现、可发布性、文风或模型能力的总分，不设置100%门槛，也不要求每句话都有附件证据。模型可以为文章完整性补充行业常识、一般原理、解释、结构和过渡；这些内容若没有进入事实附件，可能被标为`unsupported`，但仅表示本次上下文未覆盖，不能单独视为写错或要求重写。单篇结果用于记录本次覆盖，并在完成本地检索后触发轻量公共知识缺口登记：核心章节或高风险公共事实首次出现即进入`待外部调研`；普通公共知识首次为`观察中`，第二个不同文章ID出现时升级。客户专属、未处理本地资料和来源异常仍分别进入CUS、MAT、ANM，不由外部调研替代。
 
 ## 3. 可接收文件
 
-当前deepeval-article-audit可交接：文章ID-prepared.json、文章ID-judgments.json和faithfulness_summary.md。详细Markdown和HTML仍由审核Skill管理，不是知识台账导入必需文件。
+当前deepeval-article-audit可交接：文章ID-prepared.json、文章ID-judgments.json和faithfulness_summary.md。协议2.0受管结果还必须在同目录提供`文章ID-adversarial-review.json`作为独立语义复核审计件；导入器必须验证它与judgments逐条一致。详细Markdown和HTML仍由审核Skill管理，不是知识台账导入必需文件。
 
 judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知识Claim ID。
 
@@ -34,16 +36,25 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
 
 1. prepared和judgment schema受支持；
 2. 文章ID一致；
-3. verdict只含supported或unsupported；
+3. 旧协议verdict只含supported或unsupported；协议2.0还必须包含并一致映射`deepeval_verdict=yes/no/idk`与`semantic_status=entailed/contradicted/unknown`，且只有entailed可映射为supported；
 4. supported判断含证据；
 5. prepared中的文章内容仍与40_最终文章.md一致；
 6. prepared中的知识块仍与实际资料文件一致；
 7. summary的计数和百分比与judgments一致；
-8. 保存文章和当前`30`的SHA-256，并确认prepared中只有这一个manage-v0.6事实输入。
+8. 保存文章和当前`30`的SHA-256，并确认prepared中只有这一个manage-v0.6事实输入；
+9. 协议2.0的独立adversarial-review覆盖每条claim，且judgments已通过`reconciliation.gate_version=1.0`双轮自动收敛；每条claim和复核行的最终语义状态一致。每条复核行必须携带并匹配`unit_id + article_quote + 完整规范化claim`命题身份，`claim_id`只作显示和逐行覆盖检查，不能单独证明两轮审核的是同一命题；`article_line`保留用于定位但不作为稳定身份键。`claim_fragment`只解释本行关注的词或语义成分，可以很短、也可以在多条claim中重复，但不得用于绑定、重绑或跨命题迁移。若`claim_inventory.matched_claim_id`存在，也必须指向相同完整命题身份。收敛器只能保留或降级，不能升级第一轮判断；分歧、覆盖不全、模板化复核或未解决原子性时自动落为unknown，不建立人工审核队列。
 
-受管结果目录必须严格是`[结果总目录]/[项目ID]/[文章ID]/v[文章版本]/`；导入器会核对prepared中的项目ID、文章ID、文章版本、文章/知识文件SHA-256、受管标记、`handoff_contract_version`和三个核心文件是否都在该目录。派生的Claim总表会在CSV提交前预检；预检失败不得留下新的Faithfulness CSV记录或文章状态迁移。
+知识库正式指标始终是知识附件明确支撑率：`entailed ÷ (entailed + unknown + contradicted)`。该指标没有目标值；0%、低分或仅一条明确支持都可作为正常结果，不表示文章质量、发布资格，也不触发写作重试。DeepEval默认兼容率仅保留在机器JSON/CSV中用于接口诊断，不展示在HTML、Markdown、`50`、月报或交接页。按GitHub默认行为，`penalize_ambiguous_claims=false`时`idk`可能计入兼容分子；这只表示“未被明确否定”，绝不能解释为“得到支持”或写入正式Claim支撑关系。
 
-这些只是兼容性和完整性校验，不是重新做语义评价。本Skill不得因为另一来源更有说服力而改写外部结论。
+人读记录固定使用四态：灰色非主张不计入、绿色`entailed`写“明确支持”、黄色`unknown`写“尚未确认（证据不足）”、红色`contradicted`写“明确冲突”。红色只用于允许证据在同一对象、范围、条件和时间/版本下明确不相容且双轮均确认冲突；证据缺失、部分覆盖、版本无法对齐或双轮分歧只能是黄色。项目机器明细继续保留兼容字段：`unsupported = unknown + contradicted`。协议2.0的`10_文章Faithfulness明细.csv`分别保存`unknown_claims`和`contradicted_claims`，`50_文章知识使用与Faithfulness记录.md`、月度审核和交接审核分别展示两项数量。旧协议没有三态字段时写`N/A（旧协议未记录）`，不得把全部unsupported推断为明确冲突。
+
+审核器必须先执行两轮相互独立的全文原子主张识别并取并集：除prepared已结构化标记的标题外，任一轮识别为可验证主张即进入分母；只有两轮都确认是纯问题、CTA、纯过渡、纯修辞或无可验证关系的纯偏好时才排除。分母在查证据和判绿黄红前冻结。规则信号兜底只能恢复漏项，不能替代第二轮；若只能把复合单元整体恢复为一条黄色主张，必须保留coverage warning，不能借此签发100%。不得通过漏提、扩大证据含义或把建议误归非主张来抬分。
+
+同质并列成员共享主体、谓词/操作关系、范围、条件、时间和语气时，Faithfulness按一条集合值主张计数；成员仅仅可以逐项枚举不构成拆分理由。不同对象、关系、条件、数量/时间、效果或因果可能得到不同证据/verdict时仍须拆分。该边界在查看证据前确定：集合值需全部实质成员被覆盖才可为`entailed`，部分覆盖为`unknown`；同范围证据明确否定某成员时可整体为`contradicted`并定位冲突成员。知识库导入器不得为改善比例或与旧结果对齐而重拆、重并或重判；同一文章的新审核可能因当前抽取规则形成与旧结果不同的claim inventory，旧结果继续按原审计件留存，不强制批量重算。
+
+受管结果目录必须严格是`[结果总目录]/[项目ID]/[文章ID]/v[文章版本]/`；导入器会核对prepared中的项目ID、文章ID、文章版本、文章/知识文件SHA-256、受管标记、`handoff_contract_version`和核心文件是否都在该目录。旧协议1.0要求prepared、judgments和summary三个核心文件；协议2.0还必须核对同目录的独立`[文章ID]-adversarial-review.json`，且judgments使用schema 1.1并完成reconciliation gate 1.0。审核器产生的`audit_quality: warning`与`audit_warnings`属于过程提示，不改变知识附件明确支撑率，也不创建人工逐条队列；但协议2.0独立复核文件缺失、损坏、身份不一致、Claim行不全或语义状态不一致属于导入硬错误。派生的Claim总表会在CSV提交前预检；预检失败不得留下新的Faithfulness CSV记录或文章状态迁移。
+
+这些只是兼容性和完整性校验，不是重新做语义评价。本Skill不得因为另一来源更有说服力而改写外部结论，也不得按月报、交接或历史比例需要调整审计器的主张边界。
 
 不兼容时拒绝导入，任务继续等待外部Faithfulness结果，并明确指出不匹配项。
 
@@ -71,6 +82,10 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
       "next_owner": "下一责任人；无需动作写无",
       "entry": "现有事项或证据入口；writing_only可写无",
       "close_condition": "更新、关闭或重新评估条件",
+      "scope_review": {
+        "knowledge_question": "这一组能够由同一组证据回答的具体知识问题",
+        "claim_matches": {"C001": "C001与该问题的具体关系", "C002": "C002与该问题的具体关系"}
+      },
       "fact_check": {
         "contains_factual_judgment": true,
         "reusable_across_articles": true,
@@ -84,7 +99,7 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
 
 `knowledge_domains`只使用：`none / customer_fact / technical / method / regulation_standard / safety_limit / detection_validity / procurement_selection / dynamic_fact / other_public_knowledge`。一组涉及多个领域时列多个值；`none`不能与其他值并存。
 
-导入器执行以下硬校验：每个unsupported claim_id恰好出现一次；supported ID不得出现；`group_id`唯一；同一公共缺口`issue_key`在本篇只能有一个归组（该组可包含任意数量的相关Claim）；分类和必填字段有效；人工管理字段包含中文人话；`existing_gap/new_public_gap`的`issue_key`已经存在于知识缺口CSV且关联当前文章ID；`cus/mat/anm`的ID前缀正确，且现有项目台账中确有该ID。`package_omission`只表示项目已有经核验的客户正式知识却漏入当前`30`：必须声明`customer_fact`、不可跨文章复用，分类依据必须写明已核对的正式Claim/正式知识或`35`映射。归组按一个稳定、可解释的知识问题组织，Claim数量不设机械上限；只有知识问题不同才拆组。行业常识、一般原理、选型、方法和运营判断不得用`package_omission`规避公共知识缺口。没有unsupported时不需要本文件。校验失败时不得写指标、`50`、台账或完成文章迁移。
+导入器执行以下硬校验：每个unsupported claim_id恰好出现一次；supported ID不得出现；`group_id`唯一；同一公共缺口`issue_key`在本篇只能有一个归组；分类和必填字段有效；人工管理字段包含中文人话；`existing_gap/new_public_gap`的`issue_key`已经存在于知识缺口CSV且关联当前文章ID，且当前状态不得为`已解决/已关闭`；处置中的`status`必须与缺口CSV当前状态完全一致，且人话字段不得引用另一个GAP-ID或把活动缺口写成已解决；`cus/mat/anm`的ID前缀正确，且现有项目台账中确有该ID。公共缺口组还必须提供一个具体的`scope_review.knowledge_question`和覆盖全部claim_id的`claim_matches`，逐条说明每条主张怎样落入同一个可由同组证据回答的问题。品牌、结构、材料、验证、物流或采购等多个维度可以共同构成同一方法问题；关键词数量、维度数量或Claim数量都不是拆组依据。只有主张实际需要不同证据问题、适用边界或解决范围时才拆组。若claim文本含客户名称、客户专属能力或`customer_fact`，不得归为`existing_gap/new_public_gap`，必须先走`package_omission/CUS/MAT/ANM`分流。机器校验只检查映射完整性，Codex仍须逐Claim核对语义，不能填批量模板。`package_omission`仅用于经核验的客户或公共正式知识确能覆盖当前主张但漏进`30`；公共知识须列具体且存在的Formal Claim ID，主题相近不够。没有unsupported时不需要本文件。校验失败时不得写指标、`50`、台账或完成文章迁移。
 
 `writing_only`还执行独立硬门禁：`contains_factual_judgment`和`reusable_across_articles`都必须为`false`，`knowledge_domains`必须恰好为`["none"]`，`why_not_knowledge_issue`必须具体说明其纯结构、过渡、CTA、修辞或一次性观点作用。任一claim含事实而同组另有纯写作内容时必须拆组。法规、标准、认证、安全、限值、检测有效性、采购选型或动态事实的实质判断禁止归为`writing_only`；导入器对judgments原文中的明显高风险信号再做一层拒绝检查。其他类别必须至少声明“含事实判断”或“可跨文章复用”，且`knowledge_domains`不能为`none`。
 
@@ -113,4 +128,4 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
 
 unsupported只表示给定知识上下文没有支持该文章事实。它可能来自知识缺口、写作者使用了未交接来源、范围扩张或评价限制，不能自动判定为假。导入前按[知识缺口与CUS/ANM检测协议](governance-detection-and-lifecycle.md)对全部unsupported claim_id做穷尽且互斥的归组：每个ID恰好进入一组，优先匹配文章前已有事项，再判断资料包覆盖遗漏、CUS、MAT、ANM、公共知识缺口或无需治理的写作内容。不得按原子事实逐条建缺口；公共问题写入唯一`10_知识缺口记录.csv`并按不同文章ID去重。核心章节指删去后文章标题、主问题或一级/二级主要章节无法完成；高风险公共事实指法规、标准、认证、安全、限值、检测有效性、采购选型或随地区、时间变化的事实。纯过渡、结构、CTA、修辞、不可复用观点或非事实写作通过`writing_only`硬门禁后只记录排除理由。一般原理、行业常识、技术解释、方法判断和采购建议只要可以判断真假或跨文章复用，就不是纯写作内容，必须进入公共知识缺口、资料包覆盖遗漏或其他适用治理类别。
 
-不得用终稿作为证据，也不得从终稿建立Claim。只有完成信号检测且理由明确时才建立后续：客户确认用CUS、复杂客户资料用MAT、冲突或危险范围扩张用ANM、公共事实先复查前五层再登记稳定`gap_key`。普通非关键公共问题首次仍为`观察中`；核心/高风险首次或第二篇不同文章重复时进入`待外部调研`。Faithfulness导入和登记完成后，只对未被本篇禁止的新增`待外部调研`项执行独立知识维护；`观察中`不调研。后续调研更新RES证据、正式公共Claim、缺口、覆盖视图、运行账本和`50`中的治理状态/回链；不得改变原Faithfulness判断、分数、哈希或当前`30/40`，也不自动改写文章。只有通过`writing_only`硬门禁的纯写作内容可以只记录排除理由。`50`必须逐组把分类、分类依据、关联事项/入口、当前处理和下一步拆列显示，不得把全部unsupported合并成默认“无后续动作”。
+不得用终稿作为证据，也不得从终稿建立Claim。只有完成信号检测且理由明确时才建立后续：客户确认用CUS、复杂客户资料用MAT、冲突或危险范围扩张用ANM、公共事实先复查前五层再登记稳定`gap_key`。普通非关键公共问题首次仍为`观察中`；核心/高风险首次或第二篇不同文章重复时进入`待外部调研`。Faithfulness导入和登记完成后，新增`待外部调研`项进入独立知识维护队列；`观察中`不调研。`待外部调研`尚未有RES是正常状态，不能被报告为证据缺失、文章错误或导入失败；只有`部分解决`或`已解决`才必须关联RES。后续调研更新RES证据、正式公共Claim、缺口、覆盖视图、运行账本和`50`中的治理状态/回链；不得改变原Faithfulness判断、分数、哈希或当前`30/40`，也不自动改写文章。只有通过`writing_only`硬门禁的纯写作内容可以只记录排除理由。`50`必须逐组把分类、分类依据、关联事项/入口、当前处理和下一步拆列显示，不得把全部unsupported合并成默认“无后续动作”。

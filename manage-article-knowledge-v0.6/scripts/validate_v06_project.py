@@ -51,25 +51,43 @@ REQUIRED_FILES = (
 METRIC_FIELDS = (
     "audit_id", "article_id", "article_version", "article_date", "article_file",
     "article_sha256", "knowledge_files", "knowledge_sha256", "evaluation_mode",
+    "evaluation_protocol_version", "deepeval_reproduction_percent", "unknown_claims", "contradicted_claims", "primary_metric",
     "prepared_file", "judgments_file", "summary_file", "supported_claims",
     "total_claims", "unsupported_claims", "faithfulness_percent",
     "mapped_formal_claims", "unmapped_supported_claims", "imported_at", "status",
 )
 SUPPORT_FIELDS = (
     "audit_id", "article_id", "article_version", "article_fact_id", "article_line",
-    "article_quote", "article_claim", "verdict", "formal_claim_id", "mapping_status",
+    "article_quote", "article_claim", "deepeval_verdict", "semantic_status", "verdict",
+    "formal_claim_id", "mapping_status",
     "evidence_source_file", "evidence_line_start", "evidence_line_end",
     "evidence_quote", "reason",
 )
+LEGACY_SUPPORT_FIELDS = tuple(
+    field for field in SUPPORT_FIELDS
+    if field not in {"deepeval_verdict", "semantic_status"}
+)
 KNOWLEDGE_GAP_FIELDS = (
     "gap_key", "gap_topic", "gap_type", "trigger_basis", "article_ids",
-    "article_count", "status", "current_impact", "next_action", "first_seen",
+    "article_count", "current_article_ids", "current_article_count",
+    "status", "current_impact", "next_action", "first_seen",
     "last_seen", "related_governance_ref",
 )
-KNOWLEDGE_GAP_STATUSES = {"观察中", "待外部调研", "已解决", "已关闭"}
+LEGACY_KNOWLEDGE_GAP_FIELDS = tuple(
+    field for field in KNOWLEDGE_GAP_FIELDS
+    if field not in {"current_article_ids", "current_article_count"}
+)
+KNOWLEDGE_GAP_STATUSES = {"观察中", "待外部调研", "部分解决", "已解决", "已关闭"}
 WRITING_TASK_IMPORT_FIELDS = (
     "external_task_key", "source_path", "source_locator", "source_sha256",
     "article_id", "article_version", "imported_at", "current_status",
+)
+PREVIOUS_METRIC_FIELDS = tuple(
+    field for field in METRIC_FIELDS if field != "contradicted_claims"
+)
+LEGACY_METRIC_FIELDS = tuple(
+    field for field in METRIC_FIELDS
+    if field not in {"evaluation_protocol_version", "deepeval_reproduction_percent", "unknown_claims", "contradicted_claims", "primary_metric"}
 )
 CLAIM_REQUIRED_FIELDS = (
     "Claim ID", "Claim", "适用范围", "来源类型", "来源链接", "精确位置",
@@ -134,6 +152,24 @@ CANONICAL_ARTICLE_FILES = {
     "文章前问题与处理单.md",
 }
 ARTICLE_STATES = ("10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成")
+# Source IDs may include meaningful hyphenated namespaces, e.g. SRC-EXT-P005-001.
+SOURCE_ID_RE = re.compile(r"\bSRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b")
+
+
+def extract_source_ids(text: str) -> set[str]:
+    """Extract complete source-ID tokens; never silently truncate a hyphenated ID."""
+    return set(SOURCE_ID_RE.findall(text))
+
+
+def external_research_source_ids(root: Path) -> set[str]:
+    """Read external source identities from current RES evidence records."""
+    evidence_root = root / "02_源资料/50_外部调研证据"
+    if not evidence_root.is_dir():
+        return set()
+    source_ids: set[str] = set()
+    for path in evidence_root.rglob("10_来源原文证据.md"):
+        source_ids.update(extract_source_ids(path.read_text(encoding="utf-8-sig")))
+    return source_ids
 
 
 def is_transient_article_directory(path: Path) -> bool:
@@ -263,10 +299,13 @@ def markdown_section(text: str, heading: str) -> str:
 
 
 def normalized_evidence_text(text: str) -> str:
-    """Normalize Markdown quote markers and whitespace for exact evidence reuse checks."""
+    """Normalize only quoted evidence, excluding Chinese management labels and prose."""
     lines = []
     for line in text.splitlines():
-        line = re.sub(r"^\s*>\s?", "", line).strip()
+        match = re.match(r"^\s*>\s?(.*)$", line)
+        if not match:
+            continue
+        line = match.group(1).strip()
         if line:
             lines.append(line)
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
@@ -442,9 +481,6 @@ MONTHLY_COVERAGE_STATUSES = {
 CUS_DETECTION_CATEGORIES = (
     "客户能力", "规格", "认证", "案例", "商业条件", "公开授权",
 )
-CUS_LOW_FAITHFULNESS_THRESHOLD = 80.0
-
-
 def table_headers(text: str) -> list[tuple[str, ...]]:
     lines = text.splitlines()
     headers: list[tuple[str, ...]] = []
@@ -535,7 +571,7 @@ def validate_retrieval_records(root: Path, errors: list[str]) -> None:
             if len(row) >= len(COMPLEX_MATERIAL_HEADER) and row[0].strip() != "无"
         }
         referenced_partial_sources = {
-            source_id for source_id in re.findall(r"\bSRC-[A-Za-z0-9]+\b", text)
+            source_id for source_id in extract_source_ids(text)
             if source_searchability.get(source_id, "").startswith("部分内容可搜索")
         }
         for source_id in sorted(referenced_partial_sources):
@@ -556,7 +592,7 @@ def validate_retrieval_records(root: Path, errors: list[str]) -> None:
             "10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成"
         }), "")
         referenced_sources = {
-            source_id for source_id in re.findall(r"\bSRC-[A-Za-z0-9]+\b", text)
+            source_id for source_id in extract_source_ids(text)
             if source_id in source_mat
         }
         referenced_mats = set(re.findall(r"\bMAT-[A-Za-z0-9-]+\b", text))
@@ -753,17 +789,6 @@ def validate_article_governance_checks(
                     errors.append(
                         f"CUS候选检测未覆盖固定类别（{'、'.join(missing_categories)}）：{path}"
                     )
-                article_id = parse_field(text, "文章ID")
-                metric = current_metrics.get(article_id, {})
-                try:
-                    score = float(metric.get("faithfulness_percent", ""))
-                except (TypeError, ValueError):
-                    score = None
-                if score is not None and score < CUS_LOW_FAITHFULNESS_THRESHOLD:
-                    if "Faithfulness低于80%后复核" not in signals and "Faithfulness低于80%后复核" not in handling:
-                        errors.append(
-                            f"Faithfulness低于{CUS_LOW_FAITHFULNESS_THRESHOLD:.0f}%后必须重新检查CUS六类客户事实：{path}"
-                        )
             if conclusion not in allowed:
                 errors.append(f"{detector}分类结论无效：{conclusion or '空'}（{path}）")
             if not entry or not handling:
@@ -787,14 +812,15 @@ def validate_source_references(root: Path, errors: list[str]) -> None:
     except sqlite3.Error as exc:
         errors.append(f"无法读取来源ID集合：{exc}")
         return
-    marker = re.compile(r"\bSRC-[A-Za-z0-9]+\b")
+    external_source_ids = external_research_source_ids(root)
+    marker = SOURCE_ID_RE
     for path in root.rglob("*.md"):
         if any(part in {".obsidian", ".git", "90_归档", "40_Skill运行反馈"} for part in path.parts):
             continue
         text = path.read_text(encoding="utf-8-sig")
         for line_number, line in enumerate(text.splitlines(), 1):
             for source_id in marker.findall(line):
-                if source_id not in source_ids:
+                if source_id not in source_ids and source_id not in external_source_ids:
                     errors.append(f"来源ID不存在或被截断：{source_id}（{path}:{line_number}）")
 
 
@@ -855,7 +881,7 @@ def validate_mat_dependencies(root: Path, errors: list[str]) -> None:
     task_root = root / "04_文章任务"
     if not task_root.is_dir():
         return
-    source_marker = re.compile(r"\bSRC-[A-Za-z0-9]+\b")
+    source_marker = SOURCE_ID_RE
     for article_dir in task_root.iterdir():
         if not article_dir.is_dir() or article_dir.name == "90_归档":
             continue
@@ -1085,18 +1111,45 @@ def detail_block(text: str, item_id: str) -> str:
     return match.group(1) if match else ""
 
 
-def load_metrics(path: Path, errors: list[str]) -> list[dict[str, str]]:
+def load_metrics(path: Path, errors: list[str], warnings: list[str] | None = None) -> list[dict[str, str]]:
     if not path.is_file():
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != METRIC_FIELDS:
+        actual_fields = tuple(reader.fieldnames or ())
+        if actual_fields not in {METRIC_FIELDS, PREVIOUS_METRIC_FIELDS, LEGACY_METRIC_FIELDS}:
             errors.append(f"Faithfulness明细CSV字段不符合v0.6：{path}")
             return []
-        return list(reader)
+        if warnings is not None and actual_fields == PREVIOUS_METRIC_FIELDS:
+            warnings.append(f"Faithfulness明细CSV尚未独立记录contradicted_claims；读取时按协议2.0推导，并在下次导入时迁移：{path}")
+        elif warnings is not None and actual_fields == LEGACY_METRIC_FIELDS:
+            warnings.append(f"Faithfulness明细CSV仍使用旧协议字段，将在下次导入时迁移：{path}")
+        rows = list(reader)
+        for row in rows:
+            if row.get("evaluation_protocol_version") != "2.0":
+                continue
+            try:
+                unknown = int(row.get("unknown_claims", ""))
+                unsupported = int(row.get("unsupported_claims", ""))
+                contradicted_text = row.get("contradicted_claims", "")
+                contradicted = int(contradicted_text) if contradicted_text != "" else unsupported - unknown
+            except ValueError:
+                errors.append(f"Faithfulness明细CSV三态数量不是整数：{row.get('audit_id', '未编号')}（{path}）")
+                continue
+            if min(unknown, contradicted, unsupported) < 0 or unknown + contradicted != unsupported:
+                errors.append(
+                    f"Faithfulness明细CSV三态数量不一致：unknown({unknown}) + contradicted({contradicted}) "
+                    f"!= unsupported({unsupported})；{row.get('audit_id', '未编号')}（{path}）"
+                )
+        return rows
 
 
-def check_csv_schema(path: Path, expected: tuple[str, ...], errors: list[str]) -> None:
+def check_csv_schema(
+    path: Path,
+    expected: tuple[str, ...],
+    errors: list[str],
+    warnings: list[str] | None = None,
+) -> None:
     if not path.is_file():
         return
     if not path.read_bytes().startswith(UTF8_BOM):
@@ -1104,8 +1157,11 @@ def check_csv_schema(path: Path, expected: tuple[str, ...], errors: list[str]) -
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.reader(stream)
         header = tuple(next(reader, []))
-    if header != expected:
+    legacy = expected == SUPPORT_FIELDS and header == LEGACY_SUPPORT_FIELDS
+    if header != expected and not legacy:
         errors.append(f"CSV字段不符合v0.6：{path}")
+    elif legacy and warnings is not None:
+        warnings.append(f"Claim支撑CSV仍使用旧协议字段，将在下次Faithfulness导入时迁移：{path}")
 
 
 def validate_writing_task_imports(path: Path, errors: list[str]) -> None:
@@ -1129,11 +1185,16 @@ def validate_writing_task_imports(path: Path, errors: list[str]) -> None:
 
 
 def validate_knowledge_gaps(path: Path, errors: list[str]) -> None:
-    check_csv_schema(path, KNOWLEDGE_GAP_FIELDS, errors)
     if not path.is_file():
         return
+    if not path.read_bytes().startswith(UTF8_BOM):
+        errors.append(f"受管CSV必须使用UTF-8 with BOM：{path}")
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
+        fieldnames = tuple(reader.fieldnames or ())
+        if fieldnames not in {KNOWLEDGE_GAP_FIELDS, LEGACY_KNOWLEDGE_GAP_FIELDS}:
+            errors.append(f"CSV字段不符合v0.6：{path}")
+            return
         seen_keys: set[str] = set()
         for line_number, row in enumerate(reader, 2):
             key = row.get("gap_key", "").strip()
@@ -1151,14 +1212,53 @@ def validate_knowledge_gaps(path: Path, errors: list[str]) -> None:
                 article_count = -1
             if not article_ids or article_count != len(article_ids):
                 errors.append(f"知识缺口文章数必须等于不同文章ID数：{path}:{line_number}")
+            current_article_ids = list(dict.fromkeys(
+                item.strip() for item in row.get("current_article_ids", row.get("article_ids", "")).split(";") if item.strip()
+            ))
+            try:
+                current_article_count = int(
+                    row.get("current_article_count", row.get("article_count", ""))
+                )
+            except ValueError:
+                current_article_count = -1
+            if current_article_count != len(current_article_ids) or not set(current_article_ids).issubset(article_ids):
+                errors.append(f"知识缺口当前影响数必须等于当前文章ID数且属于历史文章：{path}:{line_number}")
             if not row.get("gap_topic", "").strip() or not row.get("next_action", "").strip():
                 errors.append(f"知识缺口缺少人话主题或下一步：{path}:{line_number}")
-            if row.get("status") == "已解决" and "RES-" not in row.get("related_governance_ref", ""):
-                errors.append(f"已解决知识缺口必须关联RES调研记录：{path}:{line_number}")
+            trigger_basis = row.get("trigger_basis", "").strip()
+            status = row.get("status", "").strip()
+            if current_article_count >= 2 and status not in {"待外部调研", "部分解决", "已解决", "已关闭"}:
+                errors.append(
+                    f"重复出现在至少两篇文章的知识缺口必须进入待外部调研或已解决/已关闭：{path}:{line_number}"
+                )
+            direct_trigger = trigger_basis in {"核心章节首次", "高风险事实首次"} or current_article_count >= 2
+            if direct_trigger and status == "观察中":
+                errors.append(f"{trigger_basis}不能保持观察中，必须明确外部调研或终态：{path}:{line_number}")
+            if status in {"待外部调研", "部分解决"} and "外部调研" not in row.get("next_action", ""):
+                errors.append(f"待外部调研缺口的下一步必须明确外部调研：{path}:{line_number}")
+            # 观察中和待外部调研是正常的未取证队列状态；没有RES不是错误。
+            if status in {"部分解决", "已解决"} and "RES-" not in row.get("related_governance_ref", ""):
+                errors.append(f"部分解决或已解决知识缺口必须关联RES调研记录：{path}:{line_number}")
+            if status == "已关闭" and not row.get("related_governance_ref", "").strip():
+                errors.append(f"已关闭知识缺口必须记录关闭依据：{path}:{line_number}")
+
+
+def active_task_claim_ids(root: Path) -> set[str]:
+    """Return Formal Claims used by non-archived current tasks' 35 mapping files."""
+    task_root = root / "04_文章任务"
+    if not task_root.is_dir():
+        return set()
+    result: set[str] = set()
+    for path in task_root.rglob("35_写作素材来源索引.md"):
+        if "90_归档" in path.parts or is_transient_article_directory(path.parent):
+            continue
+        result.update(re.findall(r"\bCLM-[A-Za-z0-9_.-]+\b", path.read_text(encoding="utf-8-sig")))
+    return result
 
 
 def validate_claims(root: Path, errors: list[str], warnings: list[str]) -> None:
     claim_ids: dict[str, Path] = {}
+    active_claim_ids = active_task_claim_ids(root)
     marker = re.compile(r"^\s*[-*]\s*Claim ID[：:]\s*([A-Za-z0-9_.-]+)\s*$", re.MULTILINE)
     for path in (root / "03_正式知识").rglob("*.md"):
         text = path.read_text(encoding="utf-8-sig")
@@ -1172,9 +1272,13 @@ def validate_claims(root: Path, errors: list[str], warnings: list[str]) -> None:
             claim_ids[claim_id] = path
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
             block = text[match.start():end]
-            for field in CLAIM_REQUIRED_FIELDS:
-                if not parse_field(block, field):
-                    errors.append(f"Claim {claim_id} 缺少字段：{field}（{path}）")
+            missing_fields = [field for field in CLAIM_REQUIRED_FIELDS if not parse_field(block, field)]
+            for field in missing_fields:
+                message = f"Claim {claim_id} 缺少字段：{field}（{path}）"
+                if claim_id in active_claim_ids:
+                    errors.append(message)
+                else:
+                    warnings.append(f"历史Claim待迁移，不阻塞当前任务：{message}")
             status = parse_field(block, "状态")
             if status and status not in CLAIM_STATUSES:
                 errors.append(f"Claim {claim_id} 状态无效：{status}")
@@ -1275,6 +1379,7 @@ def validate_external_claim_links(
         return
     project_info = root / "01_工作台/10_项目基础信息.md"
     is_competitor_policy_project = project_info.is_file() and "竞品信息限制：" in project_info.read_text(encoding="utf-8-sig")
+    active_claim_ids = active_task_claim_ids(root)
     marker = re.compile(r"^\s*[-*]\s*Claim ID[：:]\s*([A-Za-z0-9_.-]+)\s*$", re.MULTILINE)
     for path in external_root.rglob("*.md"):
         text = path.read_text(encoding="utf-8-sig")
@@ -1287,10 +1392,14 @@ def validate_external_claim_links(
                 errors.append(f"外部公共知识目录中的Claim必须使用CLM-EXT命名空间：{claim_id}（{path}）")
             evidence = parse_field(block, "原文证据")
             review = parse_field(block, "调研核验")
-            if not evidence or "RES-" not in evidence:
-                errors.append(f"外部Claim {claim_id} 缺少RES原文证据回链：{path}")
-            if not review or "RES-" not in review:
-                errors.append(f"外部Claim {claim_id} 缺少RES调研核验回链：{path}")
+            for label, value in (("RES原文证据回链", evidence), ("RES调研核验回链", review)):
+                if value and "RES-" in value:
+                    continue
+                message = f"外部Claim {claim_id} 缺少{label}：{path}"
+                if claim_id in active_claim_ids:
+                    errors.append(message)
+                elif warnings is not None:
+                    warnings.append(f"历史外部Claim待迁移，不阻塞当前任务：{message}")
             competitor_screen = parse_field(block, "竞品信息筛查")
             if not competitor_screen and is_competitor_policy_project:
                 errors.append(f"外部Claim {claim_id} 缺少竞品信息筛查记录：{path}")
@@ -1311,6 +1420,11 @@ def validate_ledgers(root: Path, errors: list[str]) -> None:
         if not header:
             errors.append(f"{prefix}缺少当前事项主表：{path}")
             continue
+        placeholder_pattern = re.compile(
+            rf"(?m)^###\s+\[项目ID\]-{re.escape(prefix)}-\d+｜"
+        )
+        if placeholder_pattern.search(text):
+            errors.append(f"{prefix}正式台账残留[项目ID]示例详情：{path}")
         missing_human = [field for field in HUMAN_LEDGER_FIELDS[prefix] if field not in header]
         if missing_human:
             errors.append(f"{prefix}人工可读表头缺少字段 {missing_human}：{path}")
@@ -1374,6 +1488,16 @@ def validate_ledgers(root: Path, errors: list[str]) -> None:
                 errors.append(f"MAT疑似把同一类问题重复拆项：{group_keys[group_key]} 与 {item_id}")
             else:
                 group_keys[group_key] = item_id
+        detail_ids = set(
+            re.findall(
+                rf"(?m)^###\s+([A-Za-z0-9_.-]+-{re.escape(prefix)}-\d+)｜",
+                text,
+            )
+        )
+        for item_id in sorted(seen - detail_ids):
+            errors.append(f"{prefix}主表事项缺少对应详情区块：{item_id}（{path}）")
+        for item_id in sorted(detail_ids - seen):
+            errors.append(f"{prefix}存在没有主表行的孤立详情区块：{item_id}（{path}）")
 
 
 def validate_index(root: Path, errors: list[str], warnings: list[str]) -> None:
@@ -1873,6 +1997,46 @@ def validate_article_state_gates(
             outline_content = re.sub(r"^\s*-\s*大纲状态[：:].*$", "", outline_body, flags=re.MULTILINE).strip()
             if not outline_match or outline_status != "已确认" or not outline_content or outline_content in {"待定", "待知识准备后按原写作流程确定"}:
                 errors.append(f"交付前文章知识需求的大纲必须非空且标记“已确认”：{request_path}")
+            outline_id = parse_field(request_text, "大纲ID")
+            outline_version = parse_field(request_text, "大纲版本")
+            rewrite_mode = parse_field(request_text, "重写模式")
+            task_mode = parse_field(request_text, "任务模式")
+            base_article_id = parse_field(request_text, "基线文章ID")
+            base_article_version = parse_field(request_text, "基线文章版本")
+            base_outline_id = parse_field(request_text, "基线大纲ID")
+            base_outline_version = parse_field(request_text, "基线大纲版本")
+            archive_entry = parse_field(request_text, "旧版本归档入口")
+            if not outline_id or not re.fullmatch(r"v[1-9]\d*", outline_version):
+                errors.append(f"交付前文章知识需求缺少有效大纲身份（大纲ID/大纲版本）：{request_path}")
+            if rewrite_mode not in {"not_applicable", "same_outline"}:
+                errors.append(f"交付前文章知识需求的重写模式无效：{request_path}")
+            if task_mode == "new_article":
+                if rewrite_mode != "not_applicable":
+                    errors.append(f"新文章不得声明same_outline重写模式：{request_path}")
+                if any(value != "不适用" for value in (base_article_id, base_article_version, base_outline_id, base_outline_version, archive_entry)):
+                    errors.append(f"新文章的基线文章/大纲身份和归档入口必须为“不适用”：{request_path}")
+            elif task_mode in {"knowledge_refresh_and_rewrite", "article_rewrite_only"}:
+                if rewrite_mode != "same_outline":
+                    errors.append(f"重做任务必须使用same_outline重写模式：{request_path}")
+                if base_article_id != article_id or not re.fullmatch(r"v[1-9]\d*", base_article_version):
+                    errors.append(f"重做任务的基线文章身份无效或未与当前文章匹配：{request_path}")
+                if base_outline_id != outline_id or base_outline_version != outline_version:
+                    errors.append(f"重做任务必须沿用基线大纲ID和大纲版本：{request_path}")
+                if not archive_entry or archive_entry == "不适用":
+                    errors.append(f"重做任务缺少真实旧版本归档入口：{request_path}")
+            else:
+                errors.append(f"交付前文章知识需求缺少有效任务模式：{request_path}")
+            for filename in ("15_检索与知识准备记录.md", "20_文章前知识审核.md", "30_本篇知识库资料.md", "35_写作素材来源索引.md"):
+                companion = task_dir / filename
+                if not companion.is_file():
+                    continue
+                companion_text = companion.read_text(encoding="utf-8-sig")
+                if parse_field(companion_text, "大纲ID") != outline_id:
+                    errors.append(f"{filename}的大纲ID必须与10一致：{companion}")
+                if parse_field(companion_text, "大纲版本") != outline_version:
+                    errors.append(f"{filename}的大纲版本必须与10一致：{companion}")
+                if parse_field(companion_text, "重写模式") != rewrite_mode:
+                    errors.append(f"{filename}的重写模式必须与10一致：{companion}")
 
         audit_path = task_dir / "20_文章前知识审核.md"
         audit_result = ""
@@ -2365,7 +2529,7 @@ def _open_report_items(root: Path, *, handoff: bool) -> dict[str, list[str]]:
         try:
             with gap_path.open("r", encoding="utf-8-sig", newline="") as stream:
                 for row in csv.DictReader(stream):
-                    if row.get("status", "").strip() in {"观察中", "待外部调研"}:
+                    if row.get("status", "").strip() in {"观察中", "待外部调研", "部分解决"}:
                         key = row.get("gap_key", "").strip()
                         topic = row.get("gap_topic", "").strip()
                         if key:
@@ -2407,6 +2571,10 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
     review_root = root / "05_数据与审核/40_月度与交接"
     if not review_root.is_dir():
         return
+    # Historical reports are snapshots. Later ledger changes cannot make them retroactively incomplete.
+    ledger_paths = [root / spec[0] for spec in REPORT_LEDGER_SPECS.values()]
+    ledger_paths.append(root / "05_数据与审核/20_知识库覆盖与缺口/10_知识缺口记录.csv")
+    latest_ledger_change = max((item.stat().st_mtime for item in ledger_paths if item.is_file()), default=0)
     open_problem_sheets: list[tuple[str, str, Path]] = []
     for sheet in (root / "04_文章任务").rglob("文章前问题与处理单.md"):
         text = sheet.read_text(encoding="utf-8-sig")
@@ -2486,10 +2654,11 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
             if "当前文章影响" in section_two:
                 errors.append(f"月度审核第二部分不应继续以当前文章影响为固定列：{path}")
         check_problem_sheet_links(path, text)
-        try:
-            _check_report_snapshot(path, text, monthly_open_items, handoff=False)
-        except ValueError as exc:
-            errors.append(str(exc))
+        if path.stat().st_mtime >= latest_ledger_change:
+            try:
+                _check_report_snapshot(path, text, monthly_open_items, handoff=False)
+            except ValueError as exc:
+                errors.append(str(exc))
     handoff_open_items = _open_report_items(root, handoff=True)
     for path in review_root.glob("*_项目交接审核.md"):
         text = path.read_text(encoding="utf-8-sig")
@@ -2500,13 +2669,51 @@ def validate_monthly_and_handoff(root: Path, errors: list[str], warnings: list[s
             if label not in text:
                 errors.append(f"项目交接缺少 {label}：{path}")
         check_problem_sheet_links(path, text)
-        try:
-            _check_report_snapshot(path, text, handoff_open_items, handoff=True)
-        except ValueError as exc:
-            errors.append(str(exc))
+        if path.stat().st_mtime >= latest_ledger_change:
+            try:
+                _check_report_snapshot(path, text, handoff_open_items, handoff=True)
+            except ValueError as exc:
+                errors.append(str(exc))
 
 
 def run_self_test() -> int:
+    with tempfile.TemporaryDirectory(prefix="v06-gap-lifecycle-test-") as temp:
+        gap_path = Path(temp) / "10_知识缺口记录.csv"
+        row = {
+            "gap_key": "demo-gap",
+            "gap_topic": "测试对象缺少哪些公开适用条件？",
+            "gap_type": "公共知识",
+            "trigger_basis": "重复文章",
+            "article_ids": "ART-001;ART-002",
+            "article_count": "2",
+            "current_article_ids": "ART-001;ART-002",
+            "current_article_count": "2",
+            "status": "观察中",
+            "current_impact": "影响两篇文章的公开事实覆盖",
+            "next_action": "同主题继续观察",
+            "first_seen": "2026-09-01",
+            "last_seen": "2026-09-14",
+            "related_governance_ref": "无",
+        }
+        with gap_path.open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=KNOWLEDGE_GAP_FIELDS)
+            writer.writeheader()
+            writer.writerow(row)
+        gap_errors: list[str] = []
+        validate_knowledge_gaps(gap_path, gap_errors)
+        if not any("重复文章不能保持观察中" in item for item in gap_errors):
+            print(json.dumps({"ok": False, "stage": "repeated-gap-lifecycle", "errors": gap_errors}, ensure_ascii=False))
+            return 1
+        row.update(status="待外部调研", next_action="按批准范围开展定向外部调研")
+        with gap_path.open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=KNOWLEDGE_GAP_FIELDS)
+            writer.writeheader()
+            writer.writerow(row)
+        gap_errors = []
+        validate_knowledge_gaps(gap_path, gap_errors)
+        if gap_errors:
+            print(json.dumps({"ok": False, "stage": "valid-research-gap", "errors": gap_errors}, ensure_ascii=False))
+            return 1
     with tempfile.TemporaryDirectory(prefix="v06-claim-check-test-") as temp:
         root = Path(temp)
         external = root / "03_正式知识/20_外部公共知识/50_行业知识与洞察/选型原则.md"
@@ -2695,6 +2902,20 @@ def run_self_test() -> int:
             print(json.dumps({"ok": False, "stage": "valid-grouped-mat", "errors": valid_errors}, ensure_ascii=False))
             return 1
 
+        placeholder = valid.replace(
+            "### DEMO-MAT-001｜培训资料版本判断",
+            "### [项目ID]-MAT-001｜[一类问题的通俗事项名称]\n\n- 当前阶段：暂不处理\n\n"
+            "### DEMO-MAT-001｜培训资料版本判断",
+            1,
+        )
+        path.write_text(placeholder, encoding="utf-8")
+        placeholder_errors: list[str] = []
+        validate_ledgers(root, placeholder_errors)
+        if not any("残留[项目ID]示例详情" in item for item in placeholder_errors):
+            print(json.dumps({"ok": False, "stage": "ledger-placeholder-not-rejected", "errors": placeholder_errors}, ensure_ascii=False))
+            return 1
+        path.write_text(valid, encoding="utf-8")
+
         invalid = valid.replace(
             "4段培训视频 + 1份配套PPT | 5 |",
             "SRC-a1b2c3d4e5f6, SRC-112233aabbcc | 2 |",
@@ -2755,22 +2976,26 @@ def run_self_test() -> int:
         )
         (valid_task / "10_文章知识需求.md").write_text(
             f"# 文章知识需求\n\n- 文章ID：{article_id}\n- 当前版本：v1\n"
-            "- 文章标题：测试文章\n- 目标语言：中文\n- 关键词：测试\n- 大纲状态：已确认\n\n"
+            "- 文章标题：测试文章\n- 目标语言：中文\n- 关键词：测试\n- 大纲状态：已确认\n"
+            "- 任务模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
+            "- 基线文章ID：不适用\n- 基线文章版本：不适用\n- 基线大纲ID：不适用\n- 基线大纲版本：不适用\n- 旧版本归档入口：不适用\n\n"
             "## 大纲\n\n测试文章的基本组织方向。\n",
             encoding="utf-8",
         )
         (valid_task / "15_检索与知识准备记录.md").write_text(
-            f"# 检索与知识准备记录\n\n- 文章ID：{article_id}\n- 文章版本：v1\n", encoding="utf-8"
+            f"# 检索与知识准备记录\n\n- 文章ID：{article_id}\n- 文章版本：v1\n"
+            "- 知识准备模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章版本：不适用\n", encoding="utf-8"
         )
         (valid_task / "20_文章前知识审核.md").write_text(
             f"# 文章前知识审核\n\n- 文章ID：{article_id}\n- 文章版本：v1\n"
+            "- 知识准备模式：new_article\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 基线文章版本：不适用\n"
             "- 结论：自动通过\n- 可用Claim数：1\n", encoding="utf-8"
         )
         material_path = valid_task / "30_本篇知识库资料.md"
         material_path.write_text(
             f"# 本篇写作素材包\n\n"
             f"- 文章ID：{article_id}\n- 文章版本：v1\n- 资料视图：写作素材包\n- 资料版本：1\n"
-            "- 生成日期：2026-08-19\n- 目标语言：英文\n"
+            "- 生成日期：2026-08-19\n- 目标语言：英文\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
             "- 对应大纲：[[10_文章知识需求.md#大纲]]\n"
             "- 使用对象：写作流程；本文件为唯一写作事实输入。\n\n"
             "## 一、可直接用于正文的事实\n\n"
@@ -2786,14 +3011,14 @@ def run_self_test() -> int:
         )
         material_hash = sha256_file(material_path)
         (valid_task / "35_写作素材来源索引.md").write_text(
-            f"# 写作素材来源索引\n\n- 文章ID：{article_id}\n- 文章版本：v1\n- 索引版本：1\n"
+            f"# 写作素材来源索引\n\n- 文章ID：{article_id}\n- 文章版本：v1\n- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n- 索引版本：1\n"
             f"- 生成日期：2026-08-19\n- 对应写作素材：[[30_本篇知识库资料.md]]\n"
             f"- 写作素材SHA-256：{material_hash}\n"
             "- 用途：仅供内部追溯与Faithfulness映射；不得交给写作模型。\n\n"
             "## 写作素材到正式知识映射\n\n"
             "| 证据正文行开始 | 证据正文行结束 | 素材主题 | 正式Claim ID | Claim通俗标题 | 正式知识文件 | 原始来源与精确位置 |\n"
             "|---|---|---|---|---|---|---|\n"
-            "| 23 | 23 | Demo | CLM-DEMO-001 | Demo fact | [[../../../03_正式知识/demo.md]] | demo.pdf p.1 |\n\n"
+            "| 26 | 26 | Demo | CLM-DEMO-001 | Demo fact | [[../../../03_正式知识/demo.md]] | demo.pdf p.1 |\n\n"
             "## 写作事实输入确认\n\n"
             "- 唯一事实输入：[[30_本篇知识库资料.md]]\n"
             "- 其他事实附件：无；随文事实文件必须先进入来源层、Formal Claim和当前30/35。\n",
@@ -2836,7 +3061,7 @@ def run_self_test() -> int:
             return 1
         material_path.write_text(valid_material_text, encoding="utf-8")
         audit_path.write_text(valid_audit_text, encoding="utf-8")
-        audit_path.write_text(valid_audit_text.replace("| 23 | 23 |", "| 18 | 18 |"), encoding="utf-8")
+        audit_path.write_text(valid_audit_text.replace("| 26 | 26 |", "| 18 | 18 |"), encoding="utf-8")
         boundary_errors: list[str] = []
         validate_article_knowledge_packages(root, boundary_errors, [])
         if not any("必须完全位于30的证据正文" in item for item in boundary_errors):
@@ -3088,15 +3313,18 @@ def main() -> None:
             errors.append(f"缺少必需文件：{relative}")
 
     base = root / "01_工作台/10_项目基础信息.md"
-    if base.is_file() and "manage-article-knowledge v0.6" not in base.read_text(encoding="utf-8-sig"):
-        errors.append("项目基础信息未声明manage-article-knowledge v0.6")
+    if base.is_file() and not re.search(
+        r"manage-article-knowledge v0\.6(?:\.1)?",
+        base.read_text(encoding="utf-8-sig"),
+    ):
+        errors.append("项目基础信息未声明manage-article-knowledge v0.6或v0.6.1")
 
     metrics_path = root / "05_数据与审核/10_Faithfulness/10_文章Faithfulness明细.csv"
     support_path = root / "05_数据与审核/10_Faithfulness/20_Claim文章支撑记录.csv"
     gap_path = root / "05_数据与审核/20_知识库覆盖与缺口/10_知识缺口记录.csv"
     writing_import_path = root / "05_数据与审核/50_运行记录/10_写作任务接入记录.csv"
-    metrics = load_metrics(metrics_path, errors)
-    check_csv_schema(support_path, SUPPORT_FIELDS, errors)
+    metrics = load_metrics(metrics_path, errors, warnings)
+    check_csv_schema(support_path, SUPPORT_FIELDS, errors, warnings)
     validate_knowledge_gaps(gap_path, errors)
     validate_writing_task_imports(writing_import_path, errors)
     integration = validate_integration_config(

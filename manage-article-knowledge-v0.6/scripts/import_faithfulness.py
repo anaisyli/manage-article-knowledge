@@ -16,7 +16,11 @@ from typing import Any
 from handoff_contract import HandoffContractError, load_contract, validate_event, validate_version
 from template_contract import TEMPLATE_VERSION, validate_file
 
-from article_state import transition_task, validate_transition_inputs
+from article_state import (
+    require_standard_faithfulness_record_path,
+    transition_task,
+    validate_transition_inputs,
+)
 from check_integration import project_id_for_root
 from update_integration_status import update as update_integration_status
 from build_coverage_view import rebuild_view
@@ -25,16 +29,28 @@ from build_coverage_view import rebuild_view
 METRIC_FIELDS = (
     "audit_id", "article_id", "article_version", "article_date", "article_file",
     "article_sha256", "knowledge_files", "knowledge_sha256", "evaluation_mode",
+    "evaluation_protocol_version", "deepeval_reproduction_percent", "unknown_claims", "contradicted_claims", "primary_metric",
     "prepared_file", "judgments_file", "summary_file", "supported_claims",
     "total_claims", "unsupported_claims", "faithfulness_percent",
     "mapped_formal_claims", "unmapped_supported_claims", "imported_at", "status",
 )
-CUS_LOW_FAITHFULNESS_THRESHOLD = 80.0
+PREVIOUS_METRIC_FIELDS = tuple(
+    field for field in METRIC_FIELDS if field != "contradicted_claims"
+)
+LEGACY_METRIC_FIELDS = tuple(
+    field for field in METRIC_FIELDS
+    if field not in {"evaluation_protocol_version", "deepeval_reproduction_percent", "unknown_claims", "contradicted_claims", "primary_metric"}
+)
 SUPPORT_FIELDS = (
     "audit_id", "article_id", "article_version", "article_fact_id", "article_line",
-    "article_quote", "article_claim", "verdict", "formal_claim_id", "mapping_status",
+    "article_quote", "article_claim", "deepeval_verdict", "semantic_status", "verdict",
+    "formal_claim_id", "mapping_status",
     "evidence_source_file", "evidence_line_start", "evidence_line_end",
     "evidence_quote", "reason",
+)
+LEGACY_SUPPORT_FIELDS = tuple(
+    field for field in SUPPORT_FIELDS
+    if field not in {"deepeval_verdict", "semantic_status"}
 )
 
 
@@ -48,6 +64,15 @@ def write_completion_receipt(
     audit_id: str,
     imported_at: str,
 ) -> Path:
+    current_50 = Path(task_dir) / "50_文章知识使用与Faithfulness记录.md"
+    if not current_50.is_file():
+        raise ValueError(f"拒绝签发article_completed：当前完成任务缺少标准50记录：{current_50}")
+    current_50_errors = validate_file(current_50, "50_文章知识使用与Faithfulness记录.md")
+    if current_50_errors:
+        raise ValueError(
+            "拒绝签发article_completed：当前50记录未通过模板门禁："
+            + "；".join(current_50_errors)
+        )
     receipt = result_dir / "article_completed.json"
     payload = {
         "handoff_event": "article_completed",
@@ -126,6 +151,53 @@ WRITING_ONLY_RISK_PATTERNS = (
         ),
     ),
 )
+
+# A public knowledge gap must describe reusable industry knowledge. Customer
+# names, brands, or customer-specific capability language belong to
+# package_omission/CUS/MAT/ANM triage first. These checks are deliberately
+# conservative: they reject an unsafe public classification and make the
+# disposition author choose a narrower, auditable route.
+CUSTOMER_NAME_FIELD_RE = re.compile(
+    r"^\s*[-*]\s*(?:项目中文名称|项目英文名称|官网)[：:]\s*(.*?)\s*$",
+    re.MULTILINE,
+)
+CUSTOMER_MARKER_RE = re.compile(
+    r"\b(?:JERL)\b|杰睿包装|客户专属|本公司|我司|our products|our services",
+    re.IGNORECASE,
+)
+GAP_REF_RE = re.compile(r"\bGAP-[A-Za-z0-9-]+\b")
+
+
+def project_customer_markers(project_root: Path | None) -> list[str]:
+    if project_root is None:
+        return []
+    path = project_root / "01_工作台/10_项目基础信息.md"
+    if not path.is_file():
+        return []
+    markers: list[str] = []
+    for match in CUSTOMER_NAME_FIELD_RE.finditer(read_text(path)):
+        value = match.group(1)
+        for item in re.findall(r"[A-Za-z][A-Za-z0-9 .&-]{2,}|[\u3400-\u9fff]{2,}", value):
+            item = item.strip(" .&-")
+            if len(item) >= 3 and item.casefold() not in {"https", "http"}:
+                markers.append(item)
+    return list(dict.fromkeys(markers))
+
+
+def claim_text_for_group(group: dict[str, Any], claim_by_id: dict[str, dict[str, Any]]) -> str:
+    return "\n".join(
+        str(
+            claim_by_id[claim_id].get("claim")
+            or claim_by_id[claim_id].get("article_claim")
+            or claim_by_id[claim_id].get("text")
+            or claim_by_id[claim_id].get("statement")
+            or ""
+        )
+        for claim_id in group.get("claim_ids", [])
+        if claim_id in claim_by_id
+    )
+
+
 ADMIN_END_HEADINGS = (
     "codex自动闭环结果", "codex 自动闭环结果", "自动审核结果", "引用率统计",
 )
@@ -161,27 +233,6 @@ def parse_field(text: str, label: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def mark_low_faithfulness_cus_recheck(audit_path: Path, score: float | None) -> None:
-    """Record the mandatory six-category CUS recheck trigger on low scores."""
-    if score is None or score >= CUS_LOW_FAITHFULNESS_THRESHOLD or not audit_path.is_file():
-        return
-    text = read_text(audit_path)
-    marker = "Faithfulness低于80%后复核"
-    if marker in text:
-        return
-    pattern = re.compile(
-        r"(?m)^\|\s*CUS候选检测\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*$"
-    )
-    match = pattern.search(text)
-    if not match:
-        return
-    signals = match.group(1).strip()
-    replacement = "| CUS候选检测 | " + signals + "；" + marker + " | " + " | ".join(
-        group.strip() for group in match.groups()[1:]
-    ) + " |"
-    audit_path.write_text(text[:match.start()] + replacement + text[match.end():], encoding="utf-8")
-
-
 def markdown_cell(value: Any) -> str:
     return " ".join(str(value or "").replace("|", "\\|").split()) or "无"
 
@@ -192,7 +243,10 @@ def require_human_chinese(value: str, field: str, group_id: str) -> None:
 
 
 def normalize_inline_markdown(text: str) -> str:
-    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    # Image alt text describes an asset; it is not article prose.  Keep this
+    # identical to Faithfulness audit_common.normalize_inline_markdown().
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"!\[[^\]]*\](?!\()", "", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"<[^>]+>", "", text)
@@ -586,7 +640,27 @@ def load_csv(path: Path, fields: tuple[str, ...]) -> list[dict[str, str]]:
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != fields:
+        actual_fields = tuple(reader.fieldnames or ())
+        if actual_fields == fields:
+            return list(reader)
+        if fields == METRIC_FIELDS and actual_fields in {PREVIOUS_METRIC_FIELDS, LEGACY_METRIC_FIELDS}:
+            rows = list(reader)
+            for row in rows:
+                if actual_fields == LEGACY_METRIC_FIELDS:
+                    row.update({
+                        "evaluation_protocol_version": "1.0",
+                        "deepeval_reproduction_percent": "",
+                        "unknown_claims": "",
+                        "primary_metric": "strict_support",
+                    })
+                row["contradicted_claims"] = ""
+            return rows
+        if fields == SUPPORT_FIELDS and actual_fields == LEGACY_SUPPORT_FIELDS:
+            rows = list(reader)
+            for row in rows:
+                row.update({"deepeval_verdict": "", "semantic_status": ""})
+            return rows
+        if actual_fields != fields:
             raise ValueError(f"Unexpected CSV schema: {path}")
         return list(reader)
 
@@ -609,6 +683,132 @@ def audit_matches_existing(
         and existing.get("article_sha256", "").strip().lower() == article_hash.lower()
         and existing_knowledge_hashes == knowledge_hashes
     )
+
+
+def protocol2_reconciliation_error(judgments: dict[str, Any]) -> str | None:
+    reconciliation = judgments.get("reconciliation")
+    if (
+        not isinstance(reconciliation, dict)
+        or reconciliation.get("gate_version") != "1.0"
+        or reconciliation.get("policy") != "two_pass_consensus"
+        or reconciliation.get("completed") is not True
+        or reconciliation.get("no_human_queue") is not True
+    ):
+        return "Protocol 2.0 result must complete automatic two-pass reconciliation gate 1.0"
+    return None
+
+
+def normalized_claim_text(value: Any) -> str:
+    return " ".join(re.findall(r"\w+", " ".join(str(value or "").split()).casefold()))
+
+
+def claim_proposition_key(claim: dict[str, Any]) -> tuple[str, str]:
+    return str(claim.get("unit_id", "")), normalized_claim_text(claim.get("claim"))
+
+
+def claim_identity_key(claim: dict[str, Any]) -> tuple[str, str, str]:
+    """Return the protocol-2 proposition identity; display IDs are not identity."""
+    return (
+        str(claim.get("unit_id", "")),
+        str(claim.get("article_quote", "")),
+        normalized_claim_text(claim.get("claim")),
+    )
+
+
+def has_claim_identity(row: dict[str, Any]) -> bool:
+    return bool(
+        str(row.get("unit_id", "")).strip()
+        and str(row.get("article_quote", "")).strip()
+        and str(row.get("claim", "")).strip()
+    )
+
+
+def explanatory_fragment_is_valid(fragment: Any, claim: dict[str, Any]) -> bool:
+    value = str(fragment or "").strip()
+    return bool(value) and value in str(claim.get("claim", ""))
+
+
+def protocol2_adversarial_error(
+    adversarial_review: Any,
+    claims: list[dict[str, Any]],
+    article_id: str,
+) -> str | None:
+    """Return a hard import error for a missing or structurally invalid blind review.
+
+    Semantic uncertainty is handled by reconciliation and may remain ``unknown``.
+    The independent artifact itself, however, is part of the protocol-2 import
+    contract and cannot be downgraded to a warning, including for zero-claim
+    articles.
+    """
+    if not isinstance(adversarial_review, dict):
+        return "Protocol 2.0 requires an adversarial review artifact"
+    if adversarial_review.get("schema_version") != "1.0":
+        return "Protocol 2.0 adversarial review must use schema_version 1.0"
+    if adversarial_review.get("evaluation_protocol_version") != "2.0":
+        return "Protocol 2.0 adversarial review has an incompatible evaluation protocol"
+    if adversarial_review.get("article_id") != article_id:
+        return "Protocol 2.0 adversarial review article_id does not match judgments"
+    if adversarial_review.get("review_mode") != "independent_adversarial":
+        return "Protocol 2.0 adversarial review must declare independent_adversarial mode"
+    reconciliation = adversarial_review.get("reconciliation")
+    if (
+        not isinstance(reconciliation, dict)
+        or reconciliation.get("gate_version") != "1.0"
+        or reconciliation.get("policy") != "two_pass_consensus"
+        or reconciliation.get("completed") is not True
+        or reconciliation.get("no_human_queue") is not True
+    ):
+        return "Protocol 2.0 adversarial review must contain completed reconciliation gate 1.0"
+    rows = adversarial_review.get("claim_reviews")
+    if not isinstance(rows, list):
+        return "Protocol 2.0 adversarial review has no claim_reviews array"
+    claim_ids = [str(claim.get("claim_id", "")).strip() for claim in claims]
+    row_ids = [str(row.get("claim_id", "")).strip() for row in rows if isinstance(row, dict)]
+    if len(row_ids) != len(rows) or any(not claim_id for claim_id in row_ids):
+        return "Protocol 2.0 adversarial review contains an invalid claim_id row"
+    if len(row_ids) != len(set(row_ids)) or set(row_ids) != set(claim_ids):
+        return "Protocol 2.0 adversarial review must contain exactly one row for every claim"
+    by_id = {str(row["claim_id"]): row for row in rows}
+    proposition_keys: set[tuple[str, str]] = set()
+    for claim in claims:
+        claim_id = str(claim.get("claim_id", "")).strip()
+        proposition_key = claim_proposition_key(claim)
+        if proposition_key in proposition_keys:
+            return f"Protocol 2.0 contains duplicate proposition {claim_id} in one article unit"
+        proposition_keys.add(proposition_key)
+        row = by_id[claim_id]
+        if not has_claim_identity(claim):
+            return f"Protocol 2.0 judgments claim {claim_id} lacks full proposition identity"
+        if not has_claim_identity(row):
+            return f"Protocol 2.0 adversarial review {claim_id} lacks full proposition identity"
+        if claim_identity_key(row) != claim_identity_key(claim):
+            return f"Protocol 2.0 adversarial review {claim_id} belongs to another proposition"
+        if not explanatory_fragment_is_valid(row.get("claim_fragment"), claim):
+            return f"Protocol 2.0 adversarial review {claim_id} has an invalid explanatory claim_fragment"
+        if row.get("semantic_status") != claim.get("semantic_status"):
+            return f"Protocol 2.0 adversarial review disagrees with final semantic status for {claim_id}"
+        if row.get("reconciled_semantic_status") != claim.get("semantic_status"):
+            return f"Protocol 2.0 adversarial reconciliation does not match final semantic status for {claim_id}"
+        if (
+            claim.get("semantic_status") in {"entailed", "contradicted"}
+            and len(str(row.get("challenge_reason", "")).strip()) < 20
+        ):
+            return f"Protocol 2.0 adversarial review for {claim_id} lacks a concrete challenge_reason"
+        if claim.get("semantic_status") == "entailed" and not str(row.get("evidence_fragment", "")).strip():
+            return f"Protocol 2.0 adversarial review for {claim_id} lacks an evidence_fragment"
+    inventory = adversarial_review.get("claim_inventory")
+    if isinstance(inventory, list):
+        claims_by_id = {str(claim["claim_id"]): claim for claim in claims}
+        for item in inventory:
+            if not isinstance(item, dict):
+                return "Protocol 2.0 claim_inventory contains an invalid row"
+            matched_claim_id = str(item.get("matched_claim_id", ""))
+            if matched_claim_id and (
+                matched_claim_id not in claims_by_id
+                or claim_identity_key(item) != claim_identity_key(claims_by_id[matched_claim_id])
+            ):
+                return "Protocol 2.0 claim_inventory matched_claim_id belongs to another proposition"
+    return None
 
 
 def self_test() -> None:
@@ -634,6 +834,17 @@ def self_test() -> None:
         knowledge_hashes=["K1", "K2"],
     ):
         raise SystemExit("self-test failed: conflicting audit input")
+    if protocol2_reconciliation_error({}) is None:
+        raise SystemExit("self-test failed: missing protocol 2.0 reconciliation was accepted")
+    if protocol2_reconciliation_error({
+        "reconciliation": {
+            "gate_version": "1.0",
+            "policy": "two_pass_consensus",
+            "completed": True,
+            "no_human_queue": True,
+        }
+    }) is not None:
+        raise SystemExit("self-test failed: valid protocol 2.0 reconciliation was rejected")
     print("self-test=passed")
 
 
@@ -738,6 +949,29 @@ def load_disposition(
                     "combine its claim_ids instead of repeating the same gap in 50"
                 )
             seen_public_issue_keys.add(issue_key)
+            # Run the customer-specific safety check before the finer
+            # scope-review shape checks. A rejected customer classification
+            # must report the governing reason first; otherwise malformed
+            # scope_review data can hide the more serious misclassification.
+            group_claim_text = claim_text_for_group(group, claim_by_id)
+            if schema_version == "1.1" and CUSTOMER_MARKER_RE.search(group_claim_text):
+                raise ValueError(
+                    f"Customer-specific claim cannot be classified as {category}: {group_id}; "
+                    "check package_omission/CUS/MAT/ANM before creating a public gap"
+                )
+            if schema_version == "1.1":
+                scope_review = group.get("scope_review")
+                if not isinstance(scope_review, dict):
+                    raise ValueError(f"Public gap requires scope_review: {group_id}")
+                question = str(scope_review.get("knowledge_question", "")).strip()
+                matches = scope_review.get("claim_matches")
+                if len(question) < 12 or not re.search(r"[\u3400-\u9fff]", question):
+                    raise ValueError(f"Public gap must state one concrete knowledge question: {group_id}")
+                if not isinstance(matches, dict) or set(matches) != set(normalized_ids):
+                    raise ValueError(f"Public gap must map every claim_id to its knowledge question: {group_id}")
+                if any(len(str(reason).strip()) < 12 for reason in matches.values()):
+                    raise ValueError(f"Public gap has an unexplained claim-to-question mapping: {group_id}")
+                group["scope_review"] = {"knowledge_question": question, "claim_matches": matches}
         if category in {"package_omission", "writing_only"} and issue_key:
             raise ValueError(f"Disposition category {category} must not invent issue_key: {group_id}")
 
@@ -782,6 +1016,17 @@ def load_disposition(
                 "why_not_knowledge_issue": why_not,
             }
 
+            # Public gaps are not a catch-all for customer facts. Do this after
+            # fact_check normalization so the explicit customer_fact
+            # declaration is checked as well as the claim text. Multi-dimensional
+            # claims are governed by the semantic knowledge_question and exact
+            # claim_matches above, never by counting topic keywords.
+            if category in {"existing_gap", "new_public_gap"}:
+                if "customer_fact" in normalized_domains:
+                    raise ValueError(
+                        f"Customer-specific claim cannot be classified as {category}: {group_id}; "
+                        "check package_omission/CUS/MAT/ANM before creating a public gap"
+                    )
             if category == "writing_only":
                 if contains_factual or reusable or normalized_domains != ["none"]:
                     raise ValueError(
@@ -826,20 +1071,18 @@ def load_disposition(
                         f"Non-writing disposition must leave why_not_knowledge_issue empty: {group_id}"
                     )
                 if category == "package_omission":
-                    if reusable:
+                    if not reusable and "customer_fact" not in normalized_domains:
                         raise ValueError(
-                            f"package_omission cannot contain cross-article reusable knowledge: {group_id}; "
-                            "record a public gap or another governance item"
-                        )
-                    if "customer_fact" not in normalized_domains:
-                        raise ValueError(
-                            f"package_omission is only for an existing verified customer fact omitted from 30: {group_id}"
+                            f"package_omission must identify a verified customer or public formal claim omitted from 30: {group_id}"
                         )
                     basis = group["classification_basis"]
                     if not re.search(r"(?:正式Claim|正式知识|35_写作素材来源索引|35写作素材来源索引)", basis):
                         raise ValueError(
                             f"package_omission must identify the existing formal knowledge or 35 mapping checked: {group_id}"
                         )
+                    if reusable and not re.search(r"CLM-[A-Za-z0-9-]+", basis):
+                        raise ValueError(f"Public package_omission must identify the verified Formal Claim ID: {group_id}")
+
         normalized.append(group)
 
     missing = sorted(unsupported_ids - seen_claim_ids)
@@ -878,6 +1121,46 @@ def validate_disposition_links(
                 raise ValueError(
                     f"Disposition gap_key does not include current article_id: {group['issue_key']}"
                 )
+            status = row.get("status", "").strip()
+            if status in {"已解决", "已关闭"}:
+                raise ValueError(
+                    f"{group['issue_key']} is {status}; unsupported claims cannot inherit its terminal status. "
+                    "Check the Formal Claim for a package omission, or reopen the same question / register a new gap before import"
+                )
+            if group.get("status", "").strip() != status:
+                raise ValueError(
+                    f"Disposition status does not match the knowledge-gap ledger for {group['issue_key']}: "
+                    f"disposition={group.get('status', '').strip()} ledger={status}"
+                )
+            referenced_gaps = set()
+            for field in ("topic", "classification_basis", "handling", "entry", "close_condition"):
+                referenced_gaps.update(GAP_REF_RE.findall(str(group.get(field, ""))))
+            wrong_refs = sorted(ref for ref in referenced_gaps if ref != group["issue_key"])
+            if wrong_refs:
+                raise ValueError(
+                    f"Disposition {group['issue_key']} refers to another gap key in its human fields: "
+                    + ", ".join(wrong_refs)
+                )
+            if status in {"观察中", "待外部调研", "部分解决"} and re.search(
+                r"已解决|已关闭|解决状态保持|已完成调研|已有.*Claim.*解决", " ".join(
+                    str(group.get(field, "")) for field in ("handling", "next_owner", "entry")
+                )
+            ):
+                raise ValueError(
+                    f"Active gap {group['issue_key']} cannot be described as resolved in the disposition"
+                )
+            if group["category"] == "new_public_gap" and status not in {"观察中", "待外部调研", "部分解决"}:
+                raise ValueError(f"New public gap has invalid active status: {group['issue_key']}")
+
+    catalog = formal_claim_catalog(project_root)
+    for group in groups:
+        if group["category"] != "package_omission":
+            continue
+        claim_ids = re.findall(r"CLM-[A-Za-z0-9-]+", str(group.get("classification_basis", "")))
+        if not claim_ids or any(claim_id not in catalog for claim_id in claim_ids):
+            raise ValueError(
+                f"package_omission must reference existing Formal Claim IDs in the project: {group['group_id']}"
+            )
 
     for group in groups:
         category = group["category"]
@@ -1031,6 +1314,7 @@ def main() -> None:
         help="Required when judgments contain unsupported facts; exhaustive grouped handling JSON.",
     )
     args = parser.parse_args()
+    import_warnings: list[str] = []
 
     try:
         args.prepared, args.judgments, args.summary = resolve_artifacts(
@@ -1042,6 +1326,10 @@ def main() -> None:
     for path in [args.prepared, args.judgments, args.summary, args.article, *args.knowledge]:
         if not path.is_file():
             raise SystemExit(f"Required file not found: {path}")
+    try:
+        args.receipt = require_standard_faithfulness_record_path(args.article, args.receipt)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     new_view_inputs = [
         path for path in args.knowledge
         if parse_field(read_text(path), "资料视图") == "写作素材包"
@@ -1066,8 +1354,31 @@ def main() -> None:
     article_id = str(judgments.get("article_id", "")).strip()
     if not article_id or prepared.get("article_id") != article_id:
         raise SystemExit("Prepared and judgment article IDs do not match")
-    if str(prepared.get("schema_version")) != "1.0" or str(judgments.get("schema_version")) != "1.0":
+    if str(prepared.get("schema_version")) != "1.0" or str(judgments.get("schema_version")) not in {"1.0", "1.1"}:
         raise SystemExit("Unsupported Faithfulness artifact schema")
+    evaluation_protocol_version = str(judgments.get("evaluation_protocol_version", "1.0")).strip()
+    if evaluation_protocol_version not in {"1.0", "2.0"}:
+        raise SystemExit("Unsupported Faithfulness evaluation protocol")
+    if evaluation_protocol_version == "2.0" and str(judgments.get("schema_version")) != "1.1":
+        raise SystemExit("Protocol 2.0 requires judgment schema 1.1")
+    if evaluation_protocol_version == "2.0":
+        reconciliation_error = protocol2_reconciliation_error(judgments)
+        if reconciliation_error:
+            raise SystemExit(reconciliation_error)
+    penalize_ambiguous_claims = judgments.get("penalize_ambiguous_claims", False)
+    if evaluation_protocol_version == "2.0" and not isinstance(penalize_ambiguous_claims, bool):
+        raise SystemExit("Protocol 2.0 must record penalize_ambiguous_claims as a boolean")
+    adversarial_path = args.judgments.with_name(
+        args.judgments.name.replace("-judgments.json", "-adversarial-review.json")
+    )
+    adversarial_review = None
+    if evaluation_protocol_version == "2.0":
+        if not adversarial_path.is_file():
+            raise SystemExit("Protocol 2.0 requires the adjacent adversarial review artifact")
+        try:
+            adversarial_review = json.loads(read_text(adversarial_path))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Protocol 2.0 adversarial review cannot be read: {exc}") from exc
     managed_contract = args.result_dir is not None or prepared.get("integration_mode") == "manage-article-knowledge-v0.6"
     contract_version = ""
     if managed_contract:
@@ -1138,6 +1449,10 @@ def main() -> None:
     claims = judgments.get("claims")
     if not isinstance(claims, list):
         raise SystemExit("Judgment artifact has no claims array")
+    if evaluation_protocol_version == "2.0":
+        adversarial_error = protocol2_adversarial_error(adversarial_review, claims, article_id)
+        if adversarial_error:
+            raise SystemExit(adversarial_error)
     try:
         verify_judgment_locations(claims, args.article.resolve(), [path.resolve() for path in args.knowledge])
     except ValueError as exc:
@@ -1152,6 +1467,32 @@ def main() -> None:
         verdict = claim.get("verdict")
         if verdict not in {"supported", "unsupported"}:
             raise SystemExit(f"Invalid verdict for {claim_id}: {verdict}")
+        if evaluation_protocol_version == "2.0":
+            semantic_status = claim.get("semantic_status")
+            if semantic_status not in {"entailed", "contradicted", "unknown"}:
+                raise SystemExit(f"Invalid semantic_status for {claim_id}: {semantic_status}")
+            expected_verdict = "supported" if semantic_status == "entailed" else "unsupported"
+            if verdict != expected_verdict:
+                raise SystemExit(f"Verdict does not match semantic_status for {claim_id}")
+            if claim.get("deepeval_verdict") not in {"yes", "no", "idk"}:
+                raise SystemExit(f"Invalid deepeval_verdict for {claim_id}")
+            expected_semantic_status = {
+                "yes": "entailed",
+                "no": "contradicted",
+                "idk": "unknown",
+            }[claim["deepeval_verdict"]]
+            if semantic_status != expected_semantic_status:
+                raise SystemExit(f"semantic_status does not match deepeval_verdict for {claim_id}")
+            claim_reconciliation = claim.get("reconciliation")
+            if (
+                not isinstance(claim_reconciliation, dict)
+                or claim_reconciliation.get("gate_version") != "1.0"
+                or claim_reconciliation.get("final_semantic_status") != semantic_status
+                or claim_reconciliation.get("action") not in {"retained", "downgraded_to_unknown"}
+            ):
+                raise SystemExit(f"Missing or invalid automatic reconciliation record for {claim_id}")
+            if claim_reconciliation.get("action") == "downgraded_to_unknown" and semantic_status != "unknown":
+                raise SystemExit(f"Downgraded reconciliation must end as unknown for {claim_id}")
         if verdict == "supported":
             supported += 1
             if not claim.get("evidence"):
@@ -1178,6 +1519,8 @@ def main() -> None:
     artifact_digest = hashlib.sha256()
     artifact_digest.update(args.prepared.read_bytes())
     artifact_digest.update(args.judgments.read_bytes())
+    if adversarial_review is not None:
+        artifact_digest.update(adversarial_path.read_bytes())
     audit_id = f"FTH-{artifact_digest.hexdigest()[:16].upper()}"
     imported_at = datetime.now().astimezone().isoformat(timespec="seconds")
     article_hash = sha256_file(args.article)
@@ -1226,6 +1569,8 @@ def main() -> None:
                         "article_line": claim.get("article_line", ""),
                         "article_quote": claim.get("article_quote", ""),
                         "article_claim": claim.get("claim", ""),
+                        "deepeval_verdict": claim.get("deepeval_verdict", ""),
+                        "semantic_status": claim.get("semantic_status", ""),
                         "verdict": claim.get("verdict", ""),
                         "formal_claim_id": formal_claim_id,
                         "mapping_status": "mapped" if formal_claim_id else "unmapped",
@@ -1313,6 +1658,21 @@ def main() -> None:
     for row in metrics_rows:
         if row["article_id"] == article_id and row["status"] == "current":
             row["status"] = "superseded"
+    unknown_claims = sum(
+        claim.get("semantic_status") == "unknown" for claim in claims
+    ) if evaluation_protocol_version == "2.0" else ""
+    contradicted_claims = sum(
+        claim.get("semantic_status") == "contradicted" for claim in claims
+    ) if evaluation_protocol_version == "2.0" else ""
+    deepeval_reproduction_percent = ""
+    if evaluation_protocol_version == "2.0" and total:
+        deepeval_count = sum(
+            claim.get("deepeval_verdict") == "yes"
+            if penalize_ambiguous_claims
+            else claim.get("deepeval_verdict") != "no"
+            for claim in claims
+        )
+        deepeval_reproduction_percent = f"{deepeval_count * 100 / total:.2f}"
     metric_row = {
         "audit_id": audit_id,
         "article_id": article_id,
@@ -1323,6 +1683,11 @@ def main() -> None:
         "knowledge_files": json.dumps([str(path) for path in current_knowledge_paths], ensure_ascii=False),
         "knowledge_sha256": json.dumps(knowledge_hashes, ensure_ascii=False),
         "evaluation_mode": evaluation_mode,
+        "evaluation_protocol_version": evaluation_protocol_version,
+        "deepeval_reproduction_percent": deepeval_reproduction_percent,
+        "unknown_claims": unknown_claims,
+        "contradicted_claims": contradicted_claims,
+        "primary_metric": "strict_support",
         "prepared_file": str(args.prepared.resolve()),
         "judgments_file": str(args.judgments.resolve()),
         "summary_file": str(args.summary.resolve()),
@@ -1365,9 +1730,6 @@ def main() -> None:
         metrics_preflight.unlink(missing_ok=True)
         support_preflight.unlink(missing_ok=True)
         raise SystemExit(f"状态迁移预检查失败，未写入Faithfulness结果或指标：{exc}") from exc
-    mark_low_faithfulness_cus_recheck(
-        source_task / "20_文章前知识审核.md", score
-    )
     args.receipt.parent.mkdir(parents=True, exist_ok=True)
     knowledge_hash_text = "；".join(
         f"{path} = {checksum}"
@@ -1479,6 +1841,11 @@ def main() -> None:
                 f"- Faithfulness导入日期：{imported_at}",
                 "- Faithfulness执行器：deepeval-article-audit",
                 f"- 外部审核模式：{evaluation_mode}",
+                f"- 审核协议版本：{evaluation_protocol_version}",
+                "- 知识库正式指标：知识附件明确支撑率 = 明确支持 ÷（明确支持 + 尚未确认 + 明确冲突）",
+                "- 指标用途：没有目标值，不判定文章质量、发布资格或是否需要重写",
+                f"- 尚未确认主张数：{unknown_claims if unknown_claims != '' else 'N/A（旧协议未记录）'}",
+                f"- 明确冲突主张数：{contradicted_claims if contradicted_claims != '' else 'N/A（旧协议未记录）'}",
                 f"- 外部结果文件：{args.summary.resolve()}",
                 f"- 外部判断文件：{args.judgments.resolve()}",
                 f"- unsupported归组处置文件：{args.disposition.resolve() if args.disposition else '不适用（无unsupported）'}",
@@ -1488,9 +1855,9 @@ def main() -> None:
                 "",
                 "## 一、Faithfulness结果",
                 "",
-                "| 支持事实主张数 | 全部事实主张数 | 不支持事实主张数 | Faithfulness | 正式Claim映射数 | 未映射的支持主张数 |",
-                "|---:|---:|---:|---:|---:|---:|",
-                f"| {supported} | {total} | {unsupported} | {score_text} | {len(mapped_claim_ids)} | {len(unmapped_supported)} |",
+                "| 明确支持 | 全部可验证主张 | 尚未确认（证据不足） | 明确冲突 | 知识附件明确支撑率 | 正式Claim映射数 | 未映射的明确支持主张数 |",
+                "|---:|---:|---:|---:|---:|---:|---:|",
+                f"| {supported} | {total} | {unknown_claims if unknown_claims != '' else 'N/A（旧协议未记录）'} | {contradicted_claims if contradicted_claims != '' else 'N/A（旧协议未记录）'} | {score_text} | {len(mapped_claim_ids)} | {len(unmapped_supported)} |",
                 "",
                 "## 二、正式知识对文章事实的支撑",
                 "",
@@ -1502,7 +1869,7 @@ def main() -> None:
                 "",
                 "## 三、未被本次知识附件覆盖的内容",
                 "",
-                "全部unsupported claim_id已按稳定知识问题穷尽且互斥归组；终稿不作为证据。",
+                "全部尚未确认和明确冲突的claim_id已按稳定知识问题穷尽且互斥归组；终稿不作为证据。",
                 "",
                 "| 归组及claim_id | 知识问题/内容 | 分类 | 分类依据 | 本篇影响 | 关联事项/入口 | 当前处理 | 下一步 |",
                 "|---|---|---|---|---|---|---|---|",
@@ -1518,7 +1885,7 @@ def main() -> None:
                 "",
                 "| 日期 | 事件 | 结果/状态 | 相关文件 |",
                 "|---|---|---|---|",
-                f"| {imported_at} | 导入外部Faithfulness结果并核验unsupported归组 | 当前有效 | {args.summary.resolve()} |",
+                f"| {imported_at} | 导入外部Faithfulness结果并核验黄色/红色主张归组 | 当前有效 | {args.summary.resolve()} |",
                 "",
                 "本记录导入外部审核结论，本Skill没有重新执行Faithfulness语义判断。",
                 "",
@@ -1576,6 +1943,10 @@ def main() -> None:
     print(f"audit_id={audit_id}")
     print(f"article_id={article_id}")
     print(f"faithfulness={score_text}")
+    if import_warnings:
+        print(f"audit_quality=warning")
+        for warning in import_warnings:
+            print(f"audit_warning={warning}")
     print(f"mapped_formal_claims={len(mapped_claim_ids)}")
     print(f"unmapped_supported_claims={len(unmapped_supported)}")
     print(f"task={completed_task}")
