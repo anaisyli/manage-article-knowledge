@@ -1,0 +1,188 @@
+{
+  "contract_id": "manage-article-knowledge-handoff",
+  "handoff_contract_version": "MAK-HANDOFF-1.4",
+  "compatible_versions": [
+    "MAK-HANDOFF-1.4",
+    "MAK-HANDOFF-1.3",
+    "MAK-HANDOFF-1.2",
+    "MAK-HANDOFF-1.1"
+  ],
+  "faithfulness_executor": {
+    "skill_name": "deepeval-article-audit",
+    "mode": "manage-article-knowledge-v0.6"
+  },
+  "event_lifecycle": {
+    "non_terminal_events": [
+      "writing_request",
+      "writing_ready",
+      "writing_completed",
+      "writing_retry_required",
+      "faithfulness_request",
+      "faithfulness_completed"
+    ],
+    "success_terminal_event": "article_completed",
+    "pause_events": [
+      "handoff_error",
+      "needs_human"
+    ]
+  },
+  "revision_modes": {
+    "new_article": {
+      "knowledge_refresh_required": true,
+      "reuse_current_knowledge_package": false,
+      "requires_base_article": false,
+      "requires_same_outline": false,
+      "outline_version_pattern": "^v[1-9]\\d*$"
+    },
+    "outline_refresh": {
+      "knowledge_refresh_required": true,
+      "reuse_current_knowledge_package": false,
+      "requires_base_article": true,
+      "requires_same_outline": true,
+      "base_article_version_pattern": "^v[1-9]\\d*$",
+      "outline_version_pattern": "^v[1-9]\\d*$"
+    },
+    "knowledge_reuse_rewrite": {
+      "knowledge_refresh_required": false,
+      "reuse_current_knowledge_package": true,
+      "requires_base_article": true,
+      "requires_same_outline": true,
+      "base_article_version_pattern": "^v[1-9]\\d*$",
+      "outline_version_pattern": "^v[1-9]\\d*$"
+    }
+  },
+  "events": {
+    "writing_request": {
+      "sender": "writing_skill",
+      "receiver": "manage-article-knowledge",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "project",
+        "external_task_key",
+        "request_text",
+        "request_record_path",
+        "request_record_locator",
+        "title_or_topic",
+        "product_or_content_object",
+        "topic_direction",
+        "keywords",
+        "outline",
+        "outline_status",
+        "target_language",
+        "constraints",
+        "original_writing_requirements",
+        "current_status",
+        "writing_skill",
+        "outline_id",
+        "outline_version",
+        "rewrite_mode"
+      ],
+      "optional_fields": [
+        "revision_mode",
+        "base_article_id",
+        "base_article_version",
+        "base_outline_id",
+        "base_outline_version"
+      ]
+    },
+    "writing_ready": {
+      "sender": "manage-article-knowledge",
+      "receiver": "writing_skill",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "project_id",
+        "article_id",
+        "article_version",
+        "knowledge_file",
+        "final_delivery_target"
+      ],
+      "optional_fields": [
+        "writing_ready_receipt"
+      ]
+    },
+    "writing_completed": {
+      "sender": "writing_skill",
+      "receiver": "manage-article-knowledge",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "project_id",
+        "final_path",
+        "title",
+        "completed_at"
+      ]
+    },
+    "writing_retry_required": {
+      "sender": "manage-article-knowledge",
+      "receiver": "writing_skill",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "project_id",
+        "article_id",
+        "article_version",
+        "base_article_version",
+        "reason",
+        "next_action"
+      ]
+    },
+    "faithfulness_request": {
+      "sender": "manage-article-knowledge",
+      "receiver": "deepeval-article-audit",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "faithfulness_skill",
+        "article_file",
+        "knowledge_file",
+        "project_id",
+        "article_id",
+        "article_version",
+        "result_root",
+        "result_dir"
+      ]
+    },
+    "faithfulness_completed": {
+      "sender": "deepeval-article-audit",
+      "receiver": "manage-article-knowledge",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "result_dir",
+        "article_id",
+        "article_version"
+      ]
+    },
+    "article_completed": {
+      "sender": "manage-article-knowledge",
+      "receiver": "writing_orchestration",
+      "issuer": "import_faithfulness.py",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "issuer",
+        "article_id",
+        "article_version",
+        "task_dir",
+        "audit_id",
+        "faithfulness_imported_at"
+      ]
+    },
+    "handoff_error": {
+      "sender": "any",
+      "receiver": "previous_sender",
+      "required_fields": [
+        "handoff_event",
+        "handoff_contract_version",
+        "error_code",
+        "blocked_step",
+        "reason",
+        "resume_condition",
+        "human_message",
+        "next_action"
+      ]
+    }
+  }
+}

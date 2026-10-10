@@ -1,14 +1,14 @@
 # manage-article-knowledge
 
-面向文章生产的轻量企业知识库管理 Skill，当前活动版本为 `manage-article-knowledge v0.6`。维护目录保留 `manage-article-knowledge-v0.6` 名称以兼容既有项目；运行时版本以 `SKILL.md` 标题和项目版本门禁为准。
+面向文章生产的轻量企业知识库管理 Skill，当前活动版本为 `manage-article-knowledge v0.6.1`，位于 `manage-article-knowledge-v0.6.1/`。`v0.6` 已冻结到 `versions/`；运行时版本以实际安装目录中的 `SKILL.md` 标题和项目版本门禁为准。
 
 本 Skill 负责把写作需求转换成可治理的知识任务：检索和核验来源、维护正式 Claim、生成本篇唯一知识附件、接收终稿、导入独立 Faithfulness 结果，并维护文章和项目治理状态。它不写文章，不执行 SEO/GEO 评价，也不自行完成 Faithfulness 判断。
 
 ## 先看手册
 
-第一次使用、不清楚下一步怎么做，或需要人工操作提示时，先读：[内容运营操作手册](manage-article-knowledge-v0.6/references/operator-guide.md)。
+第一次使用、不清楚下一步怎么做，或需要人工操作提示时，先读：[内容运营操作手册](manage-article-knowledge-v0.6.1/references/operator-guide.md)。
 
-手册是面向日常使用的入口；字段、状态、版本兼容和机器交接的硬规则以 [v0.6 Skill](manage-article-knowledge-v0.6/SKILL.md)、[三方交接规范](manage-article-knowledge-v0.6/references/skill-integration-handoff.md) 和 [机器交接合同](manage-article-knowledge-v0.6/references/handoff-contract.json) 为准。
+手册是面向日常使用的入口；字段、状态、版本兼容和机器交接的硬规则以 [v0.6.1 Skill](manage-article-knowledge-v0.6.1/SKILL.md)、[三方交接规范](manage-article-knowledge-v0.6.1/references/skill-integration-handoff.md) 和 [机器交接合同](manage-article-knowledge-v0.6.1/references/handoff-contract.json) 为准。
 
 ## 最短用法
 
@@ -97,6 +97,8 @@ Faithfulness 结果采用审核 Skill 的协议 2.0：两轮独立阅读全文�
 - `scripts/discover_workspace.py`：只读盘点待接入项目。
 - `scripts/onboard_workspace.py`：按已确认范围批量初始化和接入项目。
 - `scripts/writing_bridge.py`：写作 Skill 的 `prepare` / `finalize` 交接桥。
+- `scripts/run_knowledge_workflow.py`：批次知识准备唯一编排入口；只接收项目路径和批次 ID，自动定位账本并写入可恢复运行回执。
+- `scripts/batch_knowledge_run.py`：批次证据账本的内部校验/整理组件，不应由调用方直接拼接参数运行。
 - `scripts/advance_ready_tasks.py`：通过门禁后移入等待终稿。
 - `scripts/create_faithfulness_record.py`：创建 `50`、锁定 `40/30` 哈希并发出审核请求。
 - `scripts/import_faithfulness.py`：导入结果、更新治理记录并迁移状态。
@@ -106,7 +108,7 @@ Faithfulness 结果采用审核 Skill 的协议 2.0：两轮独立阅读全文�
 
 客户原始资料、外部终稿、配图和 Faithfulness 结果由各自入口保存，知识库不覆盖原件。项目运行时默认只修改项目自己的 Obsidian 文件、机器数据和运行记录；发现通用规则或工具问题时记录 Skill 反馈，不在客户任务中顺手修改 Skill 本体。修改本 Skill、references、scripts 或 agents 配置前，需获得维护负责人或用户明确授权，并同步更新更新记录和测试。
 
-本仓库保存 Skill、参考文件、模板、脚本和更新记录，不保存客户项目或 Token。详细规则按需读取 `manage-article-knowledge-v0.6/references/` 下的运行清单、工作流、模板、交接、版本和治理文档。
+本仓库保存 Skill、参考文件、模板、脚本和更新记录，不保存客户项目或 Token。详细规则按需读取 `manage-article-knowledge-v0.6.1/references/` 下的运行清单、工作流、批次合同、模板、交接、版本和治理文档。
 
 ## 入口文件
 

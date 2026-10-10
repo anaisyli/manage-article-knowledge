@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "manage-article-knowledge-v0.6" / "scripts"
+SCRIPTS = ROOT / "manage-article-knowledge-v0.6.1" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_v06_project as validator  # noqa: E402

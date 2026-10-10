@@ -1,0 +1,4 @@
+interface:
+  display_name: "企业文章知识库管理 v0.6"
+  short_description: "衔接写作任务、知识资料、终稿和Faithfulness治理"
+  default_prompt: "使用 $manage-article-knowledge 接入或初始化客户知识库项目，衔接写作任务、30写作素材、终稿和Faithfulness结果，并维护Claim支撑与月度治理记录。"

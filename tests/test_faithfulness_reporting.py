@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "manage-article-knowledge-v0.6" / "scripts"
+SCRIPTS = ROOT / "manage-article-knowledge-v0.6.1" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import handoff_review  # noqa: E402

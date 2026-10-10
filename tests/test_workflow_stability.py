@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / "manage-article-knowledge-v0.6"
+SKILL = ROOT / "manage-article-knowledge-v0.6.1"
 SCRIPTS = SKILL / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -163,10 +163,15 @@ class WorkflowStabilityTests(unittest.TestCase):
         )
         cross_domain["fact_check"] = dict(contains_factual_judgment=True, reusable_across_articles=True, knowledge_domains=["method", "procurement_selection"], why_not_knowledge_issue="")
         cross_domain["classification_basis"] = "该主张属于一个可由同组方法证据回答的公共问题"
+        # This second case isolates the semantic-mapping rule. C001 was
+        # intentionally rejected above; the current contract still requires
+        # every unsupported claim in a result to be handled, so it must not be
+        # present in this isolated disposition fixture.
+        isolated_claims = [claims[1]]
         path = Path(tempfile.mktemp(suffix=".json"))
         try:
             path.write_text(json.dumps({"schema_version": "1.1", "article_id": "ART-001", "groups": [cross_domain]}, ensure_ascii=False), encoding="utf-8")
-            loaded = load_disposition(path, "ART-001", claims)
+            loaded = load_disposition(path, "ART-001", isolated_claims)
             self.assertEqual(loaded[0]["scope_review"]["knowledge_question"], cross_domain["scope_review"]["knowledge_question"])
 
             malformed = dict(cross_domain)
@@ -176,9 +181,29 @@ class WorkflowStabilityTests(unittest.TestCase):
             )
             path.write_text(json.dumps({"schema_version": "1.1", "article_id": "ART-001", "groups": [malformed]}, ensure_ascii=False), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "map every claim_id"):
-                load_disposition(path, "ART-001", claims)
+                load_disposition(path, "ART-001", isolated_claims)
         finally:
             path.unlink(missing_ok=True)
+
+    def test_public_gap_uses_project_customer_markers(self) -> None:
+        claims = [{"claim_id": "C001", "verdict": "unsupported", "claim": "Acme Packaging offers watch boxes."}]
+        group = dict(
+            group_id="UG-001", claim_ids=["C001"], topic="包装产品类别", category="new_public_gap",
+            classification_basis="这是可复用的公共知识", issue_key="GAP-001", status="观察中",
+            article_impact="影响文章", handling="等待处理", next_owner="Codex", entry="GAP-001",
+            close_condition="取得证据", fact_check=dict(contains_factual_judgment=True,
+                reusable_across_articles=True, knowledge_domains=["method"], why_not_knowledge_issue=""),
+            scope_review=dict(knowledge_question="包装产品类别如何确认", claim_matches={"C001": "说明类别"}),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = root / "01_工作台/10_项目基础信息.md"
+            info.parent.mkdir(parents=True)
+            info.write_text("- 项目英文名称: Acme Packaging\n- 官网: https://acme.example\n", encoding="utf-8")
+            path = root / "disposition.json"
+            path.write_text(json.dumps({"schema_version": "1.1", "article_id": "ART-001", "groups": [group]}, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Customer-specific claim"):
+                load_disposition(path, "ART-001", claims, root)
 
     def test_disposition_status_and_gap_references_must_match_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
