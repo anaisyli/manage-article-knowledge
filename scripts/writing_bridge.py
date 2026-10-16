@@ -1,0 +1,1940 @@
+#!/usr/bin/env python3
+"""Bridge an arbitrary writing workflow to the v0.6 article task contract.
+
+This helper does not write articles.  It creates the knowledge task before
+writing and normalizes an externally produced final article after writing.
+The normalized knowledge copy contains text/table content only; images remain
+in the external writer delivery package and are never copied into the task.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import re
+import shutil
+import sys
+import subprocess
+import tempfile
+import unicodedata
+import uuid
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import date, datetime
+from pathlib import Path
+
+from archive_project_version import create_archive
+from article_state import article_package_ready
+from handoff_contract import HandoffContractError, current_version, validate_event, validate_version
+from check_integration import project_id_for_root
+from check_skill_update import check_project as check_skill_version
+from record_writing_task import RELATIVE_LEDGER, load, record
+from template_contract import TEMPLATE_VERSION
+from prewrite_governance import pending_details
+from update_integration_status import update as update_integration_status
+
+
+ARTICLE_BODY_START = "<!-- ARTICLE_BODY_START -->"
+ARTICLE_BODY_END = "<!-- ARTICLE_BODY_END -->"
+EXTERNAL_BODY_HEADINGS = {"最终正文", "正文", "article body", "final article body"}
+EXTERNAL_ADMIN_HEADINGS = {"最终文章", "final article", "article package", "delivery package"}
+EXTERNAL_TRAILING_ADMIN_HEADINGS = {
+    "seo metadata", "tdk", "metadata", "image plan", "image list", "delivery notes",
+    "交付说明", "交付信息", "图片计划", "图片清单", "审核说明",
+}
+EXTERNAL_ADMIN_LABELS = {
+    "文章id", "article id", "文章版本", "article version", "文章标题", "article title",
+    "最终标题", "final title", "完成日期", "completed date", "completion date",
+    "目标语言", "target language", "关键词", "keywords", "keyword", "slug",
+    "meta title", "meta description", "交接合同版本", "handoff contract version",
+}
+DOCX_HEADING_STYLE_NAMES = {
+    "sectionlabel": 2,
+    "sectiontitle": 2,
+    "subheading": 2,
+    "subhead": 2,
+}
+
+
+class OutlineChangeRequiresConfirmation(SystemExit):
+    """An article-level outline change, not an integration outage."""
+
+
+def read_text(path: Path) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"无法解码文件：{path}")
+
+
+def read_article_text(path: Path) -> str:
+    """Read a text article without mutating the externally delivered file.
+
+    Most writing Skills return Markdown/TXT, but several deliver only a DOCX.
+    DOCX is a ZIP package, so extract visible paragraphs and table cells with
+    the standard library instead of requiring a project-specific dependency.
+    """
+    if path.suffix.lower() != ".docx":
+        value = read_text(path)
+        # Keep prose and Markdown tables, but remove embedded image syntax so
+        # the knowledge copy never treats article artwork as article content.
+        value = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", value)
+        value = re.sub(r"<img\b[^>]*>", "", value, flags=re.IGNORECASE)
+        return value
+    try:
+        with zipfile.ZipFile(path) as package:
+            xml = package.read("word/document.xml")
+    except (OSError, KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"无法读取DOCX正文：{path}") from exc
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as exc:
+        raise ValueError(f"DOCX正文XML无效：{path}") from exc
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    body = root.find(".//w:body", ns)
+    if body is None:
+        return ""
+    styles: dict[str, ET.Element] = {}
+    try:
+        with zipfile.ZipFile(path) as package:
+            styles_xml = package.read("word/styles.xml")
+        styles_root = ET.fromstring(styles_xml)
+        styles = {
+            style.get(f"{{{ns['w']}}}styleId", ""): style
+            for style in styles_root.findall(".//w:style", ns)
+            if style.get(f"{{{ns['w']}}}styleId")
+        }
+    except (KeyError, ET.ParseError):
+        styles = {}
+    blocks: list[str] = []
+
+    def paragraph_text(paragraph: ET.Element) -> str:
+        return "".join(node.text or "" for node in paragraph.findall(".//w:t", ns)).strip()
+
+    def word_value(node: ET.Element | None) -> str:
+        return node.get(f"{{{ns['w']}}}val", "") if node is not None else ""
+
+    def word_toggle(node: ET.Element | None) -> bool:
+        """Read an OOXML on/off element; presence without w:val means true."""
+        if node is None:
+            return False
+        value = word_value(node).strip().casefold()
+        return value not in {"0", "false", "off", "no"}
+
+    def word_boolean_attribute(node: ET.Element | None, name: str) -> bool:
+        if node is None:
+            return False
+        value = node.get(f"{{{ns['w']}}}{name}", "").strip().casefold()
+        return value in {"1", "true", "on", "yes"}
+
+    def normalized_style_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    def style_heading_level(style_id: str, seen: set[str] | None = None) -> int | None:
+        if not style_id:
+            return None
+        seen = seen or set()
+        if style_id in seen:
+            return None
+        seen.add(style_id)
+        style = styles.get(style_id)
+        style_name = word_value(style.find("./w:name", ns)) if style is not None else ""
+        normalized_names = {
+            normalized_style_name(style_id),
+            normalized_style_name(style_name),
+        }
+        if "title" in normalized_names:
+            return 1
+        for name in normalized_names:
+            match = re.fullmatch(r"heading([1-6])", name)
+            if match:
+                return int(match.group(1))
+            if name in DOCX_HEADING_STYLE_NAMES:
+                return DOCX_HEADING_STYLE_NAMES[name]
+        if style is not None:
+            outline = style.find("./w:pPr/w:outlineLvl", ns)
+            if outline is not None:
+                try:
+                    return min(6, max(1, int(word_value(outline)) + 1))
+                except ValueError:
+                    pass
+            based_on = word_value(style.find("./w:basedOn", ns))
+            return style_heading_level(based_on, seen)
+        return None
+
+    def paragraph_heading(paragraph: ET.Element) -> tuple[int, str] | None:
+        direct_outline = paragraph.find("./w:pPr/w:outlineLvl", ns)
+        if direct_outline is not None:
+            try:
+                return min(6, max(1, int(word_value(direct_outline)) + 1)), "outline"
+            except ValueError:
+                pass
+        style_id = word_value(paragraph.find("./w:pPr/w:pStyle", ns))
+        level = style_heading_level(style_id)
+        return (level, style_id) if level is not None else None
+
+    for child in list(body):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            value = paragraph_text(child)
+            if value:
+                heading = paragraph_heading(child)
+                if heading:
+                    level, style_id = heading
+                    safe_style = re.sub(r"[^A-Za-z0-9_. -]+", "", style_id).replace("--", "-")
+                    blocks.append(
+                        f"{'#' * level} {value} "
+                        f"<!-- MAK_DOCX_HEADING_STYLE:{safe_style or 'outline'} -->"
+                    )
+                else:
+                    blocks.append(value)
+        elif tag == "tbl":
+            # Preserve Word's header semantics and emit a complete Markdown
+            # table. A separator row is required both for Obsidian rendering
+            # and for downstream structural exclusion of table headers.
+            row_cells: list[list[str]] = []
+            row_headers: list[bool] = []
+            for row in child.findall("./w:tr", ns):
+                cells: list[str] = []
+                for cell in row.findall("./w:tc", ns):
+                    value = " ".join(
+                        paragraph_text(paragraph)
+                        for paragraph in cell.findall("./w:p", ns)
+                        if paragraph_text(paragraph)
+                    )
+                    cells.append(value.replace("|", "\\|"))
+                if cells:
+                    row_cells.append(cells)
+                    row_headers.append(word_toggle(row.find("./w:trPr/w:tblHeader", ns)))
+            if row_cells:
+                column_count = max(len(cells) for cells in row_cells)
+                normalized_rows = [cells + [""] * (column_count - len(cells)) for cells in row_cells]
+                table_look = child.find("./w:tblPr/w:tblLook", ns)
+                first_row_is_header = row_headers[0] or word_boolean_attribute(table_look, "firstRow")
+                if first_row_is_header:
+                    markdown_rows = [normalized_rows[0], ["---"] * column_count, *normalized_rows[1:]]
+                else:
+                    # Markdown requires a header even when the Word source has
+                    # none. Use an empty structural header so no data row is
+                    # silently promoted or excluded from factual review.
+                    markdown_rows = [[""] * column_count, ["---"] * column_count, *normalized_rows]
+                blocks.append(
+                    "\n".join("| " + " | ".join(cells) + " |" for cells in markdown_rows)
+                )
+    return "\n\n".join(blocks)
+
+
+def extract_external_body(value: str) -> str:
+    """Keep only the writer's article body before creating managed 40."""
+    start_count = value.count(ARTICLE_BODY_START)
+    end_count = value.count(ARTICLE_BODY_END)
+    if start_count or end_count:
+        if start_count != 1 or end_count != 1:
+            raise ValueError("外部终稿正文边界必须各出现一次")
+        before, tail = value.split(ARTICLE_BODY_START, 1)
+        body, after = tail.split(ARTICLE_BODY_END, 1)
+        if value.index(ARTICLE_BODY_START) >= value.index(ARTICLE_BODY_END):
+            raise ValueError("外部终稿正文边界顺序无效")
+        if not body.strip():
+            raise ValueError("外部终稿正文边界内没有正文")
+        return body.strip()
+
+    lines = value.splitlines()
+    body_heading_index: int | None = None
+    for index, raw in enumerate(lines):
+        match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", raw)
+        if match and re.sub(r"\s+", " ", match.group(1).strip().lower()) in EXTERNAL_BODY_HEADINGS:
+            body_heading_index = index
+            break
+    if body_heading_index is not None:
+        end_index = len(lines)
+        for index in range(body_heading_index + 1, len(lines)):
+            match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", lines[index])
+            heading = re.sub(r"\s+", " ", match.group(1).strip().lower()) if match else ""
+            if heading in EXTERNAL_TRAILING_ADMIN_HEADINGS:
+                end_index = index
+                break
+        body = "\n".join(lines[body_heading_index + 1:end_index]).strip()
+        if not body:
+            raise ValueError("外部终稿正文标题后没有正文")
+        return body
+
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    prefix: list[str] = []
+    if index < len(lines):
+        heading = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", lines[index])
+        normalized_heading = re.sub(r"\s+", " ", heading.group(1).strip().lower()) if heading else ""
+        if normalized_heading in EXTERNAL_ADMIN_HEADINGS:
+            index += 1
+        elif heading:
+            # Writer packages commonly put the real article H1 before a block
+            # of Article ID / version / language fields. Keep that H1 while
+            # removing the adjacent administrative block.
+            prefix = [lines[index].strip(), ""]
+            index += 1
+    saw_admin = False
+    while index < len(lines):
+        raw = lines[index]
+        stripped = raw.strip()
+        if not stripped:
+            index += 1
+            continue
+        match = re.match(r"^\s*(?:[-*]\s*)?([^：:]{1,40})[：:]\s*.*$", raw)
+        label = re.sub(r"\s+", " ", match.group(1).strip().lower()) if match else ""
+        if match and label in EXTERNAL_ADMIN_LABELS:
+            saw_admin = True
+            index += 1
+            continue
+        break
+    if saw_admin:
+        body_lines = lines[index:]
+        end_index = len(body_lines)
+        for candidate_index, raw in enumerate(body_lines):
+            match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", raw)
+            heading = re.sub(r"\s+", " ", match.group(1).strip().lower()) if match else ""
+            if heading in EXTERNAL_TRAILING_ADMIN_HEADINGS:
+                end_index = candidate_index
+                break
+        body = "\n".join(prefix + body_lines[:end_index]).strip()
+    else:
+        body = value.strip()
+    if not body:
+        raise ValueError("外部终稿只包含管理字段，没有可审核正文")
+    return body
+
+
+def field(text: str, label: str) -> str:
+    match = re.search(rf"^\s*[-*]\s*{re.escape(label)}[：:]\s*(.*?)\s*$", text, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def normalized_body_fingerprint(value: str) -> str:
+    """Fingerprint article wording while ignoring Unicode and whitespace-only changes."""
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def managed_article_body(path: Path) -> str:
+    """Read the explicit body from an archived managed 40 file."""
+    text = read_text(path)
+    if text.count(ARTICLE_BODY_START) != 1 or text.count(ARTICLE_BODY_END) != 1:
+        raise ValueError(f"归档基线40正文边界必须各出现一次：{path}")
+    start = text.index(ARTICLE_BODY_START)
+    end = text.index(ARTICLE_BODY_END)
+    if start >= end:
+        raise ValueError(f"归档基线40正文边界顺序无效：{path}")
+    body = text[start + len(ARTICLE_BODY_START):end].strip()
+    if not body:
+        raise ValueError(f"归档基线40正文为空：{path}")
+    return body
+
+
+def archived_base_article(project: Path, request: str, *, required: bool = True) -> tuple[Path, str] | None:
+    """Resolve an optional baseline; a knowledge refresh may have no prior 40."""
+    archive_entry = field(request, "旧版本归档入口")
+    base_version = field(request, "基线文章版本")
+    if not archive_entry or archive_entry == "不适用":
+        raise ValueError("重做任务缺少旧版本归档入口，不能核验文章身份")
+    relative = Path(archive_entry)
+    if relative.is_absolute():
+        raise ValueError("旧版本归档入口必须是项目内稳定相对路径")
+    archive = (project / relative).resolve()
+    try:
+        archive.relative_to(project.resolve())
+    except ValueError as exc:
+        raise ValueError("旧版本归档入口超出当前项目范围") from exc
+    if not archive.is_dir():
+        raise ValueError(f"旧版本归档入口不存在：{archive}")
+    baseline = archive / "40_最终文章.md"
+    if not baseline.is_file():
+        if required:
+            raise ValueError(f"旧版本归档缺少基线40，不能验证是否完成重写：{baseline}")
+        return None
+    return baseline, base_version
+
+
+def project_code(project: Path) -> str:
+    value = project_id_for_root(project)
+    value = re.sub(r"[^A-Za-z0-9-]+", "", value).upper()
+    return value or "PROJECT"
+
+
+def clean_title(value: str) -> str:
+    value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", " ", value).strip()
+    return re.sub(r"\s+", " ", value)[:80] if value else "未命名文章"
+
+
+REVISION_MODES = {"new_article", "outline_refresh", "knowledge_reuse_rewrite"}
+
+
+def register_batch_request(project: Path, batch_id: str, request: dict[str, object]) -> Path:
+    """Record article membership in one batch ledger without copying evidence."""
+    if not batch_id.strip():
+        raise ValueError("batch_id不能为空")
+    batch_root = project / "04_文章任务" / "批次运行"
+    batch_root.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", batch_id.strip())
+    path = batch_root / f"{safe_id}.json"
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    else:
+        payload = {
+            "schema": "MAK-BATCH-1.0", "batch_id": batch_id.strip(),
+            "status": "collecting_requests", "articles": [],
+            "questions": [], "evidence": [], "governance": [],
+        }
+    if payload.get("batch_id") != batch_id.strip():
+        raise ValueError("已有批次账本的batch_id不匹配")
+    # A revision is registered only from the committed task, not a guessed CSV
+    # version or a caller-supplied replacement run ID. Pure legacy members stay
+    # readable, but cannot overwrite a modern task with an older identity.
+    task = current_task(project, str(request.get("article_id", "")))
+    from sync_website_evidence import current_run
+    current_run(task, request, batch_id.strip())
+    from batch_revision import retire_previous_run
+    retire_previous_run(payload, request)
+    articles = [row for row in payload.get("articles", []) if row.get("article_id") != request.get("article_id")]
+    articles.append(request)
+    payload["articles"] = articles
+    questions = payload.get("questions", [])
+    question_key = hashlib.sha256(str(request.get("outline", "")).encode("utf-8")).hexdigest()[:16]
+    questions = [row for row in questions if row.get("question_id") != question_key]
+    questions.append({
+        "question_id": question_key,
+        "article_ids": [row.get("article_id") for row in articles if row.get("outline") == request.get("outline")],
+        "outline": request.get("outline", ""),
+    })
+    payload["questions"] = questions
+    payload["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def normalized_version(value: str) -> str:
+    value = value.strip() or "v1"
+    return value if value.lower().startswith("v") else "v" + value
+
+
+def batch_article_from_task(project: Path, article_id: str) -> dict[str, object]:
+    """Read the committed identity, never the pre-revision CSV snapshot."""
+    task = current_task(project, article_id)
+    request = read_text(task / "10_文章知识需求.md")
+    result: dict[str, object] = {
+        "article_id": article_id,
+        "batch_id": field(request, "批次ID"),
+        "article_version": normalized_version(field(request, "当前版本")),
+        "external_task_key": field(request, "外部任务唯一键"),
+        "title": field(request, "标题"),
+        "outline_id": field(request, "大纲ID"),
+        "outline_version": field(request, "大纲版本"),
+        "outline": request.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip(),
+        "revision_mode": field(request, "任务模式") or "new_article",
+        "target_language": field(request, "目标语言"),
+    }
+    runs = (() if result["revision_mode"] == "knowledge_reuse_rewrite" else
+            (("知识重整运行.json", "refresh_run_id"),) if result["revision_mode"] == "outline_refresh" else
+            (("知识检索运行.json", "research_run_id"),))
+    for filename, key in runs:
+        if (task / filename).is_file():
+            run = json.loads((task / filename).read_text(encoding="utf-8-sig"))
+            if run.get("article_id") != article_id or normalized_version(str(run.get("article_version", ""))) != result["article_version"]:
+                raise SystemExit(f"当前运行记录身份与10不一致：{task / filename}")
+            result[key] = run.get(key, "")
+    return result
+
+
+def revision_is_resume(args: argparse.Namespace, request: str, source: Path, title: str, outline: str) -> bool:
+    """A replay of a committed revision must not archive/increment it again."""
+    if field(request, "任务模式") != args.revision_mode:
+        return False
+    if normalized_version(str(args.base_article_version or "")) != field(request, "基线文章版本"):
+        return False
+    expected = {
+        "文章ID": args.article_id, "标题": title, "关键词": args.keywords or "待补充",
+        "目标语言": args.target_language, "特殊限制": args.constraints or "未提供",
+        "原始写作请求": args.request_text.strip(), "产品或内容对象": args.product_or_content_object.strip(),
+        "选题方向": args.topic_direction.strip(), "原始写作要求": args.original_writing_requirements.strip(),
+        "写作Skill": args.writing_skill.strip(), "大纲ID": args.outline_id, "大纲版本": args.outline_version,
+        "基线大纲ID": args.base_outline_id, "基线大纲版本": args.base_outline_version,
+        "原任务文件": str(source), "原任务SHA-256": sha256(source), "原任务位置或块键": args.source_locator.strip(),
+    }
+    changed = [label for label, value in expected.items() if field(request, label) != value]
+    recorded_outline = request.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip()
+    if recorded_outline != outline:
+        changed.append("大纲")
+    if args.batch_id and field(request, "批次ID") != args.batch_id:
+        changed.append("批次ID")
+    if changed:
+        raise SystemExit("同一重做请求的恢复参数变化：" + "、".join(changed) + "；未归档或覆盖当前任务")
+    return True
+
+
+def next_version(value: str) -> str:
+    match = re.fullmatch(r"v(\d+)", normalized_version(value), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"文章版本必须使用v加整数：{value}")
+    return f"v{int(match.group(1)) + 1}"
+
+
+def replace_field(text: str, label: str, value: str) -> str:
+    pattern = re.compile(rf"^(\s*[-*]\s*{re.escape(label)}[：:]\s*).*?$", re.MULTILINE)
+    if not pattern.search(text):
+        raise ValueError(f"文件缺少版本更新所需字段：{label}")
+    return pattern.sub(lambda match: match.group(1) + value, text, count=1)
+
+
+def append_request_field(text: str, label: str, value: str) -> str:
+    pattern = re.compile(rf"^\s*[-*]\s*{re.escape(label)}[：:]", re.MULTILINE)
+    if pattern.search(text):
+        return replace_field(text, label, value)
+    marker = "\n## 外部写作任务接入"
+    if marker not in text:
+        raise ValueError("10_文章知识需求.md缺少外部写作任务接入章节")
+    return text.replace(marker, f"\n- {label}：{value}\n{marker}", 1)
+
+
+def request_document(
+    args: argparse.Namespace,
+    *,
+    article_id: str,
+    article_version: str,
+    contract_version: str,
+    source: Path,
+    title: str,
+    revision_mode: str = "new_article",
+    rewrite_mode: str = "not_applicable",
+    base_article_id: str = "不适用",
+    base_version: str = "不适用",
+    base_outline_id: str = "不适用",
+    base_outline_version: str = "不适用",
+    archive_entry: str = "不适用",
+) -> str:
+    body = [
+        "# 文章知识需求", "", f"- 文章ID：{article_id}", f"- 当前版本：{article_version}",
+        f"- 模板版本：{TEMPLATE_VERSION}",
+        "- 证据模板版本：EC-1",
+        "- 来源核验模板版本：GC-1",
+        *(["- 知识准备记录协议：PR-1"] if revision_mode != "knowledge_reuse_rewrite" else []),
+        f"- 交接合同版本：{contract_version}",
+        f"- 批次ID：{args.batch_id or '不适用'}",
+        f"- 标题：{title}", f"- 关键词：{args.keywords or '待补充'}",
+        f"- 目标语言：{args.target_language}", f"- 特殊限制：{args.constraints or '未提供'}",
+        f"- 大纲状态：{args.outline_status}",
+        f"- 原始写作请求：{args.request_text}",
+        f"- 产品或内容对象：{args.product_or_content_object}",
+        f"- 选题方向：{args.topic_direction}",
+        f"- 原始写作要求：{args.original_writing_requirements}",
+        f"- 当前状态：{args.current_status}",
+        f"- 写作Skill：{args.writing_skill}",
+        f"- 任务模式：{revision_mode}",
+        f"- 大纲ID：{args.outline_id}",
+        f"- 大纲版本：{args.outline_version}",
+        f"- 重写模式：{rewrite_mode}",
+        f"- 基线文章ID：{base_article_id}",
+        f"- 基线文章版本：{base_version}",
+        f"- 基线大纲ID：{base_outline_id}",
+        f"- 基线大纲版本：{base_outline_version}",
+        f"- 旧版本归档入口：{archive_entry}",
+        "", "## 外部写作任务接入", "",
+        "- 接入方式：已确认写作任务入口",
+        f"- 外部任务唯一键：{args.external_task_key.strip()}",
+        f"- 原任务文件：{source}", f"- 原任务位置或块键：{args.source_locator}",
+        f"- 原任务SHA-256：{sha256(source) if source.is_file() else '未记录'}",
+        f"- 读取时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
+        "- 字段映射结果：标题、关键词、目标语言、限制和简要大纲由桥接参数写入",
+        "", "## 大纲", "", args.outline.strip(),
+        "", "## 随文章提交文件分类", "",
+        "| 文件名 | 原始路径 | SHA-256 | 文件性质 | 使用范围 | 处理结果 |",
+        "|---|---|---|---|---|---|",
+        "| 无 | 无 | 无 | 无随文文件 | 不适用 | 不适用 |",
+    ]
+    return "\n".join(body) + "\n"
+
+
+def next_article_id(project: Path, today: str) -> str:
+    prefix = f"{project_code(project)}-ART-{today.replace('-', '')}-"
+    numbers: list[int] = []
+    for path in (project / "04_文章任务").rglob("10_文章知识需求.md"):
+        value = field(read_text(path), "文章ID")
+        if value.startswith(prefix) and value[len(prefix):].isdigit():
+            numbers.append(int(value[len(prefix):]))
+    ledger = project / RELATIVE_LEDGER
+    if ledger.is_file():
+        with ledger.open("r", encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                value = str(row.get("article_id", ""))
+                if value.startswith(prefix) and value[len(prefix):].isdigit():
+                    numbers.append(int(value[len(prefix):]))
+    return prefix + f"{max(numbers, default=0) + 1:03d}"
+
+
+def sync_skill_version(project: Path) -> dict[str, object]:
+    """Run the project-start Skill fingerprint check used by the main Skill.
+
+    The writing bridge is a real machine entry used by connected writing Skills,
+    so it must not bypass the project's version/feedback synchronization.
+    """
+    try:
+        result = check_skill_version(project)
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            "无法执行项目启动Skill版本检查："
+            f"{exc}。请先用manage-article-knowledge v0.6初始化项目，生成01_工作台/30_版本与变更入口.md。"
+        ) from exc
+    print(
+        "skill_version_check="
+        + ("updated" if result.get("changed") else "current")
+    )
+    return result
+
+
+def current_task(project: Path, article_id: str) -> Path:
+    matches = [
+        path.parent
+        for path in (project / "04_文章任务").glob(f"*/{article_id}_*/10_文章知识需求.md")
+        if "90_归档" not in path.parts
+    ]
+    if len(matches) != 1:
+        raise SystemExit(
+            f"既有任务映射无法唯一定位文章目录：{article_id}（候选数：{len(matches)}）。"
+            "请修复任务身份后从当前节点重试；不得按标题猜测或临时覆盖定位逻辑。"
+        )
+    return matches[0]
+
+
+def cleanup_transient_directory(path: Path) -> str | None:
+    """Best-effort cleanup after a committed task switch.
+
+    OneDrive and other sync providers can deny deletion after a rename even
+    though the new current task is already committed. Cleanup failure must not
+    roll back or invalidate that committed state; the validator ignores the
+    named transient directory and a later maintenance run can remove it.
+    """
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        return f"临时目录清理失败（不影响已提交任务）：{path}；{exc}"
+    return None
+
+
+def prepare_revision(
+    args: argparse.Namespace,
+    *,
+    project: Path,
+    existing: dict[str, str],
+    contract_version: str,
+    source: Path,
+    title: str,
+    outline: str,
+) -> None:
+    mode = args.revision_mode
+    if mode not in {"outline_refresh", "knowledge_reuse_rewrite"}:
+        raise SystemExit(f"无效重做模式：{mode}")
+    article_id = existing["article_id"]
+    task = current_task(project, article_id)
+    request_path = task / "10_文章知识需求.md"
+    request_text = read_text(request_path)
+    current_article_id = field(request_text, "文章ID")
+    current_outline_id = field(request_text, "大纲ID")
+    current_outline_version = field(request_text, "大纲版本")
+    supplied_base_outline_id = str(args.base_outline_id or "").strip()
+    supplied_base_outline_version = str(args.base_outline_version or "").strip()
+    supplied_outline_id = str(args.outline_id or "").strip()
+    supplied_outline_version = str(args.outline_version or "").strip()
+    if current_article_id != article_id or str(args.article_id or "").strip() != article_id:
+        raise SystemExit("同大纲重写的基线文章ID与当前任务不匹配，归档前已拒绝")
+    if not current_outline_id or not re.fullmatch(r"v[1-9]\d*", current_outline_version):
+        raise SystemExit("当前任务缺少有效大纲ID或大纲版本，不能按同大纲重写")
+    if not (
+        supplied_outline_id == current_outline_id == supplied_base_outline_id
+        and supplied_outline_version == current_outline_version == supplied_base_outline_version
+    ):
+        raise SystemExit("同大纲重写的大纲ID或大纲版本与当前任务不匹配，归档前已拒绝")
+    old_outline = (
+        request_text.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip()
+        if "## 大纲" in request_text else ""
+    )
+    if old_outline != outline:
+        raise OutlineChangeRequiresConfirmation(
+            "两个重做模式都默认锁定原简要大纲；当前提交的大纲与基线版本不同。"
+            "请先单独确认大纲变更，再按知识重整模式建立新版本。"
+        )
+    if mode == "knowledge_reuse_rewrite":
+        locked_fields = {
+            "标题": title,
+            "关键词": args.keywords or "待补充",
+            "目标语言": args.target_language,
+            "特殊限制": args.constraints or "未提供",
+            "产品或内容对象": args.product_or_content_object,
+            "选题方向": args.topic_direction,
+        }
+        changed = [
+            label for label, value in locked_fields.items()
+            if field(request_text, label) != value
+        ]
+        if changed:
+            raise SystemExit(
+                "知识不变重写不能改变会影响知识范围的需求字段："
+                + "、".join(changed)
+                + "。请保持这些字段不变，或改用重新整理知识并重写模式。"
+            )
+    old_version = normalized_version(
+        field(request_text, "当前版本") or existing.get("article_version", "v1")
+    )
+    if normalized_version(str(args.base_article_version or "")) != old_version:
+        raise SystemExit("重做请求的基线文章版本与当前任务不匹配，归档前已拒绝")
+    new_version = next_version(old_version)
+    if existing.get("article_version") and normalized_version(existing["article_version"]) != old_version:
+        raise SystemExit("任务映射中的文章版本与当前10_文章知识需求.md不一致，不能开始重做")
+
+    if mode == "knowledge_reuse_rewrite":
+        from template_contract import validate_task_templates
+
+        required = [task / name for name in (
+            "10_文章知识需求.md", "15_检索与知识准备记录.md",
+            "20_文章前知识审核.md", "30_本篇知识库资料.md",
+            "35_写作素材来源索引.md",
+        )]
+        missing = [path.name for path in required if not path.is_file()]
+        if missing:
+            raise SystemExit("知识不变重写缺少可复用的当前文件：" + "、".join(missing))
+        template_errors = validate_task_templates(task)
+        if template_errors:
+            raise SystemExit(
+                "当前知识文件未通过模板与语义校验，不能按知识不变模式复用："
+                + "；".join(template_errors[:8])
+            )
+        if not article_package_ready(task):
+            raise SystemExit(
+                "当前30/35未通过正式Claim、证据正文、映射范围与SHA-256整包校验，"
+                "不能按知识不变模式复用；请改用重新整理知识并重写模式。"
+            )
+
+    archive = create_archive(
+        project=project,
+        target=task,
+        kind="article",
+        reason=("重新整理知识并按原大纲重写" if mode == "outline_refresh" else "知识不变，仅按原大纲重写文章"),
+        replacement_version=new_version,
+    )
+    # Every revision must pass the same machine writing gate.  Keep the new
+    # task in knowledge preparation until issue_writing_ready.py signs the
+    # current 30/35 package; prepare() must never imply a writing_ready event.
+    target_state = "10_进行中"
+    destination = project / "04_文章任务" / target_state / task.name
+    if destination.exists() and destination.resolve() != task.resolve():
+        raise SystemExit(f"重做目标目录已存在，未替换当前任务：{destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / f".revision-{uuid.uuid4().hex[:8]}"
+    retired = task.parent / f".retired-{uuid.uuid4().hex[:8]}"
+    staging.mkdir()
+    archive_entry = archive.relative_to(project).as_posix()
+    new_request = request_document(
+        args,
+        article_id=article_id,
+        article_version=new_version,
+        contract_version=contract_version,
+        source=source,
+        title=title,
+        revision_mode=mode,
+        rewrite_mode="same_outline",
+        base_article_id=article_id,
+        base_version=old_version,
+        base_outline_id=current_outline_id,
+        base_outline_version=current_outline_version,
+        archive_entry=archive_entry,
+    )
+    (staging / "10_文章知识需求.md").write_text(new_request, encoding="utf-8")
+
+    refresh_run_id = ""
+    if mode == "outline_refresh":
+        refresh_run_id = f"refresh-{article_id}-{new_version}-{uuid.uuid4().hex[:12]}"
+        # A refresh starts with no inherited GAP queue. The current outline
+        # and this run's five-layer retrieval must identify gaps anew.
+        pending_gap_ids: list[str] = []
+        evidence_manifest = "官网正文抓取凭证.json"
+        (staging / evidence_manifest).write_text("[]\n", encoding="utf-8")
+        (staging / "知识重整运行.json").write_text(
+            json.dumps(
+                {
+                    "refresh_run_id": refresh_run_id,
+                    "article_id": article_id,
+                    "article_version": new_version,
+                    "batch_id": args.batch_id or "不适用",
+                    "outline_id": args.outline_id,
+                    "outline_version": args.outline_version,
+                    "revision_mode": mode,
+                    "baseline_article_version": old_version,
+                    "baseline_archive": archive_entry,
+                    "website_evidence_manifest": evidence_manifest,
+                    "workflow_entry": "run_outline_refresh.py",
+                    "package_generation": "empty_until_current_run",
+                    "status": "pending_full_knowledge_rebuild",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+    if mode == "knowledge_reuse_rewrite":
+        for name in (
+            "15_检索与知识准备记录.md", "20_文章前知识审核.md",
+            "30_本篇知识库资料.md", "35_写作素材来源索引.md",
+        ):
+            shutil.copy2(task / name, staging / name)
+        for name in ("官网正文抓取凭证.json", "知识检索运行.json"):
+            if (task / name).is_file():
+                shutil.copy2(task / name, staging / name)
+        for name in ("15_检索与知识准备记录.md", "20_文章前知识审核.md", "30_本篇知识库资料.md", "35_写作素材来源索引.md"):
+            path = staging / name
+            text = replace_field(read_text(path), "文章版本", new_version)
+            if name in {"15_检索与知识准备记录.md", "20_文章前知识审核.md"}:
+                text = replace_field(text, "重写模式", "same_outline")
+            path.write_text(text, encoding="utf-8")
+        material_hash = sha256(staging / "30_本篇知识库资料.md")
+        source_index = staging / "35_写作素材来源索引.md"
+        source_index.write_text(
+            replace_field(read_text(source_index), "写作素材SHA-256", material_hash),
+            encoding="utf-8",
+        )
+        from template_contract import validate_task_templates
+
+        from governance_source_check import rebind_reused_scope
+        rebind_reused_scope(staging)
+        staged_errors = validate_task_templates(staging)
+        if staged_errors:
+            shutil.rmtree(staging)
+            raise SystemExit("知识不变重写的新版本文件校验失败：" + "；".join(staged_errors[:8]))
+        from governance_source_check import original_sources
+        with original_sources(project):
+            reused_ready = article_package_ready(staging)
+        if not reused_ready:
+            shutil.rmtree(staging)
+            raise SystemExit("知识不变重写的新版本30/35整包校验失败，未替换当前任务")
+    else:
+        # Refresh is a fresh knowledge-preparation run. Never carry prior
+        # retrieval, review, writing-material, mapping, or website evidence.
+        forbidden = (
+            "15_检索与知识准备记录.md", "20_文章前知识审核.md",
+            "30_本篇知识库资料.md", "35_写作素材来源索引.md",
+            "知识检索运行.json",
+        )
+        present = [name for name in forbidden if (staging / name).exists()]
+        if (staging / "官网正文抓取凭证.json").read_text(encoding="utf-8-sig").strip() != "[]":
+            present.append("非空的官网正文抓取凭证.json")
+        if present:
+            shutil.rmtree(staging)
+            raise SystemExit("知识重整新版本不得继承旧知识产物：" + "、".join(present))
+
+    task.rename(retired)
+    try:
+        staging.rename(destination)
+        item = dict(existing)
+        item.update(
+            source_path=str(source),
+            source_locator=args.source_locator.strip(),
+            source_sha256=sha256(source),
+            article_version=new_version.lstrip("vV"),
+            imported_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            current_status=("需重新准备知识" if mode == "outline_refresh" else "等待重写终稿"),
+        )
+        record(project / RELATIVE_LEDGER, item)
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        if retired.exists():
+            retired.rename(task)
+        raise
+    else:
+        cleanup_warning = cleanup_transient_directory(retired)
+
+    update_integration_status(
+        project,
+        "writing_task_success",
+        article_id=article_id,
+        article_version=new_version,
+        external_task_key=existing["external_task_key"],
+        detail=f"已按{mode}建立重做版本；旧版归档：{archive_entry}",
+    )
+    print(f"article_id={article_id}")
+    print(f"article_version={new_version}")
+    print(f"revision_mode={mode}")
+    print(f"archive={archive}")
+    print(f"task_dir={destination}")
+    if cleanup_warning:
+        print(f"cleanup_warning={cleanup_warning}")
+    print(f"handoff_contract_version={contract_version}")
+    if mode == "outline_refresh":
+        print(f"refresh_run_id={refresh_run_id}")
+        print(f"website_evidence_manifest={destination / '官网正文抓取凭证.json'}")
+        print("handoff_event=writing_request")
+        print("next=从当前大纲重新执行六层检索、候选事实和缺口调研，再生成15/20/30/35并通过writing_ready门禁")
+    else:
+        print("handoff_event=writing_request")
+        print("next=运行issue_writing_ready.py通过当前版本门禁后，再交给原写作Skill；不得绕过机器回执")
+
+
+def prepare(args: argparse.Namespace) -> None:
+    try:
+        contract_version = validate_version(args.handoff_contract_version)
+    except HandoffContractError as exc:
+        raise SystemExit(str(exc)) from exc
+    project = args.project.resolve()
+    sync_skill_version(project)
+    external_task_key = args.external_task_key.strip()
+    ledger = project / RELATIVE_LEDGER
+    existing = next((row for row in load(ledger) if row["external_task_key"] == external_task_key), None)
+    existing_request = read_text(current_task(project, existing["article_id"]) / "10_文章知识需求.md") if existing else ""
+    current_mode = field(existing_request, "任务模式") or "new_article"
+    revision_mode = (args.revision_mode or (current_mode if existing else "new_article")).strip()
+    if existing and revision_mode == "new_article" and current_mode != "new_article":
+        raise SystemExit("当前任务为" + current_mode + "，不能以new_article覆盖其重做身份；恢复时省略--revision-mode或沿用当前模式")
+    if existing and not args.revision_mode and current_mode != "new_article":
+        # Omitted mode means resume the committed request, not start a revision.
+        args.article_id = args.article_id or existing["article_id"]
+        args.base_article_version = args.base_article_version or field(existing_request, "基线文章版本")
+        args.base_outline_id = args.base_outline_id or field(existing_request, "基线大纲ID")
+        args.base_outline_version = args.base_outline_version or field(existing_request, "基线大纲版本")
+    args.revision_mode = revision_mode
+    if revision_mode not in REVISION_MODES:
+        raise SystemExit(f"无效revision_mode：{revision_mode}")
+    external_task_key = args.external_task_key.strip()
+    if not external_task_key:
+        raise SystemExit("提交 writing_request 前必须提供非空外部任务唯一键")
+    title = clean_title(args.title)
+    if title == "未命名文章":
+        raise SystemExit("提交 writing_request 前必须提供可识别的标题或主题")
+    outline = (args.outline or "").strip()
+    if not outline:
+        raise SystemExit("提交 writing_request 前必须提供非空简要大纲；不得使用待定大纲")
+    if args.outline_status != "已确认":
+        raise SystemExit("提交 writing_request 前必须将 --outline-status 设置为：已确认")
+    source = args.source_path.resolve()
+    if not source.is_file():
+        raise SystemExit(
+            "外部写作任务入口缺少可读取的任务记录，不能提交writing_request："
+            f"{source}；请先在已确认的写作任务入口创建或恢复该记录"
+        )
+    try:
+        source_hash = sha256(source)
+        read_text(source)
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(
+            "外部写作任务记录存在但无法读取，不能提交writing_request："
+            f"{source}；{exc}"
+        ) from exc
+    if not args.source_locator.strip() or args.source_locator.strip() == "未记录":
+        raise SystemExit("提交 writing_request 前必须提供需求记录定位信息，不能使用“未记录”")
+    request_payload = {
+        "handoff_event": "writing_request",
+        "handoff_contract_version": contract_version,
+        "project": str(project),
+        "external_task_key": external_task_key,
+        "request_text": args.request_text.strip(),
+        "request_record_path": str(source),
+        "request_record_locator": args.source_locator.strip(),
+        "title_or_topic": title,
+        "product_or_content_object": args.product_or_content_object.strip(),
+        "topic_direction": args.topic_direction.strip(),
+        "keywords": (args.keywords or "未提供").strip(),
+        "outline": outline,
+        "outline_status": args.outline_status,
+        "target_language": args.target_language.strip(),
+        "constraints": (args.constraints or "未提供").strip(),
+        "original_writing_requirements": args.original_writing_requirements.strip(),
+        "current_status": args.current_status.strip(),
+        "writing_skill": args.writing_skill.strip(),
+        "revision_mode": revision_mode,
+        "outline_id": str(args.outline_id or "").strip(),
+        "outline_version": str(args.outline_version or "").strip(),
+        "rewrite_mode": "same_outline" if revision_mode != "new_article" else "not_applicable",
+    }
+    if revision_mode != "new_article":
+        request_payload["base_article_id"] = (args.article_id or "").strip()
+        request_payload["base_article_version"] = (args.base_article_version or "").strip()
+        request_payload["base_outline_id"] = (args.base_outline_id or "").strip()
+        request_payload["base_outline_version"] = (args.base_outline_version or "").strip()
+        if not all(request_payload.get(field) for field in (
+            "base_article_id", "base_article_version", "base_outline_id", "base_outline_version",
+        )):
+            raise SystemExit(
+                "重做请求必须提供--article-id、--base-article-version、"
+                "--base-outline-id和--base-outline-version"
+            )
+    try:
+        validate_event("writing_request", request_payload)
+    except HandoffContractError as exc:
+        raise SystemExit(f"writing_request合同校验失败：{exc}") from exc
+    if revision_mode != "new_article":
+        if not existing:
+            raise SystemExit("重做请求没有找到既有外部任务映射；不得猜测文章身份")
+        if existing.get("article_id") != request_payload["base_article_id"]:
+            raise SystemExit("重做请求的article_id与既有任务映射不一致")
+        if revision_is_resume(args, existing_request, source, title, outline):
+            if args.batch_id:
+                register_batch_request(project, args.batch_id, batch_article_from_task(project, existing["article_id"]))
+            print(f"article_id={existing['article_id']}")
+            print(f"article_version={field(existing_request, '当前版本')}")
+            print(f"revision_mode={revision_mode}")
+            print(f"task_dir={current_task(project, existing['article_id'])}")
+            print("ledger_action=reused_revision")
+            print("handoff_event=writing_request")
+            return
+        prepare_revision(
+            args,
+            project=project,
+            existing=existing,
+            contract_version=contract_version,
+            source=source,
+            title=title,
+            outline=outline,
+        )
+        if args.batch_id:
+            register_batch_request(project, args.batch_id, batch_article_from_task(project, existing["article_id"]))
+        return
+    article_id = args.article_id.strip() if args.article_id else (existing or {}).get("article_id", "") or next_article_id(project, args.date)
+    item = {
+        "external_task_key": external_task_key,
+        "source_path": str(source), "source_locator": args.source_locator.strip(),
+        "source_sha256": source_hash,
+        "article_id": article_id, "article_version": (existing or {}).get("article_version", "1"),
+        "imported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "current_status": "已接收",
+    }
+    task_dir = project / "04_文章任务/10_进行中" / f"{article_id}_{title}"
+    if existing:
+        recorded_hash = (existing.get("source_sha256") or "").strip()
+        if recorded_hash and recorded_hash != source_hash:
+            raise SystemExit(
+                "外部写作任务记录SHA-256已变化，拒绝静默复用既有任务："
+                f"{source}；已登记={recorded_hash}；当前={source_hash}。"
+                "请按文章版本归档合同处理需求变化后重新提交。"
+            )
+        matches = [current_task(project, article_id) / "10_文章知识需求.md"]
+        existing_request = read_text(matches[0])
+        compared = {
+            "标题": title,
+            "关键词": args.keywords or "待补充",
+            "目标语言": args.target_language,
+            "特殊限制": args.constraints or "未提供",
+            "大纲状态": args.outline_status,
+            "原始写作请求": args.request_text.strip(),
+            "产品或内容对象": args.product_or_content_object.strip(),
+            "选题方向": args.topic_direction.strip(),
+            "原始写作要求": args.original_writing_requirements.strip(),
+            "当前状态": args.current_status.strip(),
+            "写作Skill": args.writing_skill.strip(),
+        }
+        changed = [label for label, value in compared.items() if field(existing_request, label) != value]
+        existing_outline = existing_request.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip() if "## 大纲" in existing_request else ""
+        if existing_outline != outline:
+            changed.append("大纲")
+        if changed:
+            message = (
+                "同一外部任务唯一键的已登记写作需求发生实质变化："
+                + "、".join(changed)
+                + "。不得静默覆盖10；请按文章版本归档合同更新需求后重新提交。"
+            )
+            if "大纲" in changed:
+                raise OutlineChangeRequiresConfirmation(message)
+            raise SystemExit(message)
+        record(ledger, item)
+        update_integration_status(
+            project,
+            "writing_task_success",
+            article_id=article_id,
+            article_version=item["article_version"],
+            external_task_key=item["external_task_key"],
+            detail="桥接入口复用既有文章任务",
+        )
+        print(f"article_id={article_id}")
+        print(f"task_dir={matches[0].parent}")
+        print("ledger_action=reused")
+        print(f"handoff_contract_version={contract_version}")
+        print("handoff_event=writing_request")
+        if args.batch_id:
+            register_batch_request(project, args.batch_id, batch_article_from_task(project, article_id))
+        return
+    if task_dir.exists():
+        raise SystemExit(f"文章任务目录已存在：{task_dir}")
+    task_dir.mkdir(parents=True)
+    new_run_id = f"research-{article_id}-v1-{uuid.uuid4().hex[:12]}"
+    evidence_manifest = "官网正文抓取凭证.json"
+    (task_dir / evidence_manifest).write_text("[]\n", encoding="utf-8")
+    (task_dir / "知识检索运行.json").write_text(
+        json.dumps(
+            {
+                "research_run_id": new_run_id,
+                "article_id": article_id,
+                "article_version": "v1",
+                "batch_id": args.batch_id or "不适用",
+                "outline_id": args.outline_id,
+                "outline_version": args.outline_version,
+                "revision_mode": "new_article",
+                "website_evidence_manifest": evidence_manifest,
+                "status": "pending_full_knowledge_preparation",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    (task_dir / "10_文章知识需求.md").write_text(
+        request_document(
+            args,
+            article_id=article_id,
+            article_version="v1",
+            contract_version=contract_version,
+            source=source,
+            title=title,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        action = record(ledger, item)
+    except Exception:
+        shutil.rmtree(task_dir)
+        raise
+    print(f"article_id={article_id}")
+    print(f"task_dir={task_dir}")
+    print(f"ledger_action={action}")
+    print(f"handoff_contract_version={contract_version}")
+    print(f"research_run_id={new_run_id}")
+    print(f"website_evidence_manifest={task_dir / evidence_manifest}")
+    if args.batch_id:
+        register_batch_request(project, args.batch_id, batch_article_from_task(project, article_id))
+    print("handoff_event=writing_request")
+    update_integration_status(
+        project,
+        "writing_task_success",
+        article_id=article_id,
+        article_version=item["article_version"],
+        external_task_key=item["external_task_key"],
+        detail="桥接入口已建立文章知识需求",
+    )
+
+
+def self_test() -> None:
+    """Exercise the bridge against an isolated task record and contract."""
+    real_writer_shape = (
+        "# Test Article\n\n"
+        "- Article ID: DEMO-ART-001\n"
+        "- Article Version: v2\n"
+        "- Article Title: Test Article\n"
+        "- Completed Date: 2026-09-07\n"
+        "- Target Language: English\n"
+        "- Keywords: test, article\n\n"
+        "Opening paragraph.\n\n## Main section\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n"
+        "## SEO Metadata\n\n- Meta Title: should not be audited\n"
+    )
+    cleaned = extract_external_body(real_writer_shape)
+    if "# Test Article" not in cleaned or "| 1 | 2 |" not in cleaned:
+        raise AssertionError("self-test failed: article H1 or body table was removed")
+    for admin_value in ("Article ID", "Article Version", "Target Language", "Keywords", "SEO Metadata"):
+        if admin_value in cleaned:
+            raise AssertionError(f"self-test failed: writer metadata remained in body: {admin_value}")
+    with tempfile.TemporaryDirectory(prefix="mak-writing-bridge-") as temp:
+        styled_docx = Path(temp) / "styled-headings.docx"
+        with zipfile.ZipFile(styled_docx, "w") as package:
+            package.writestr(
+                "word/document.xml",
+                """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Built-in heading</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="SectionLabel"/></w:pPr><w:r><w:t>Custom section label</w:t></w:r></w:p>
+<w:p><w:r><w:t>Ordinary body paragraph.</w:t></w:r></w:p>
+<w:tbl><w:tblPr><w:tblLook w:firstRow="1"/></w:tblPr>
+<w:tr><w:trPr><w:tblHeader w:val="true"/></w:trPr><w:tc><w:p><w:r><w:t>Area</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Decision</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>Size</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Confirm fit</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+</w:body></w:document>""",
+            )
+            package.writestr(
+                "word/styles.xml",
+                """<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style>
+<w:style w:type="paragraph" w:customStyle="1" w:styleId="SectionLabel"><w:name w:val="Section Label"/><w:basedOn w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+</w:styles>""",
+            )
+        styled_text = read_article_text(styled_docx)
+        if "## Built-in heading <!-- MAK_DOCX_HEADING_STYLE:Heading2 -->" not in styled_text:
+            raise AssertionError("self-test failed: Heading2 style was not preserved")
+        if "## Custom section label <!-- MAK_DOCX_HEADING_STYLE:SectionLabel -->" not in styled_text:
+            raise AssertionError("self-test failed: Section Label style was not preserved")
+        if "# Ordinary body paragraph" in styled_text:
+            raise AssertionError("self-test failed: ordinary body paragraph became a heading")
+        expected_table = "| Area | Decision |\n| --- | --- |\n| Size | Confirm fit |"
+        if expected_table not in styled_text:
+            raise AssertionError("self-test failed: DOCX table header was not normalized as Markdown")
+        root = Path(temp) / "DEMO_测试知识库_v0.6"
+        (root / "04_文章任务/10_进行中").mkdir(parents=True)
+        version_entry = root / "01_工作台/30_版本与变更入口.md"
+        version_entry.parent.mkdir(parents=True)
+        version_entry.write_text(
+            "# 版本与变更入口\n\n"
+            "- 当前Skill：manage-article-knowledge v0.6\n"
+            f"- Skill文件SHA-256：{'a' * 64}\n\n"
+            "## 项目级变更\n\n"
+            "| 日期 | 变更 | 依据 | 执行方 | 关联对象 | 影响范围 |\n"
+            "|---|---|---|---|---|---|\n\n"
+            "## 相关入口\n",
+            encoding="utf-8",
+        )
+        (root / "01_工作台/20_当前待办.md").write_text(
+            "# 当前待办\n\n"
+            "| 对象ID | 人能看懂的事项 | 当前阶段 | 是否阻塞 | 下一步由谁做 | 直达链接 | 更新/重开条件 | 最近更新 |\n"
+            "|---|---|---|---|---|---|---|---|\n\n",
+            encoding="utf-8",
+        )
+        feedback = root / "05_数据与审核/30_异常与待决定/40_Skill运行反馈/01_Skill反馈台账.md"
+        feedback.parent.mkdir(parents=True)
+        feedback.write_text(
+            "# Skill反馈台账\n\n## 当前反馈\n\n"
+            "| SKFB ID | 提出来源 | 类型 | 通俗说明 | 复现依据 | 当前阶段 | 维护负责人 | 关联项目对象入口 | 最近更新 |\n"
+            "|---|---|---|---|---|---|---|---|---|\n\n"
+            "## 反馈详情\n",
+            encoding="utf-8",
+        )
+        request_record = Path(temp) / "写作需求.md"
+        request_record.write_text("# 写作需求\n\n- 任务：DEMO-001\n", encoding="utf-8")
+        args = argparse.Namespace(
+            handoff_contract_version=current_version(),
+            project=root,
+            external_task_key="DEMO-001",
+            source_path=request_record,
+            source_locator="第1个任务块",
+            title="测试文章",
+            request_text="请写一篇测试文章",
+            product_or_content_object="测试产品",
+            topic_direction="测试方向",
+            keywords="测试关键词",
+            outline="- 说明测试问题\n- 给出安全建议",
+            outline_status="已确认",
+            target_language="中文",
+            constraints="无",
+            original_writing_requirements="测试写作规则",
+            current_status="可准备知识",
+            writing_skill="测试写作Skill",
+            revision_mode="new_article",
+            outline_id="DEMO-OUT-001",
+            outline_version="v1",
+            base_outline_id=None,
+            base_outline_version=None,
+            base_article_version=None,
+            article_id=None,
+            date="2026-09-04",
+            batch_id="",
+        )
+        prepare(args)
+        task_files = list((root / "04_文章任务/10_进行中").rglob("10_文章知识需求.md"))
+        if len(task_files) != 1:
+            raise AssertionError("self-test failed: task was not created exactly once")
+        from template_contract import validate_file
+        if validate_file(task_files[0]):
+            raise AssertionError("self-test failed: generated 10 does not meet template contract")
+        prepare(args)
+        changed = argparse.Namespace(**vars(args))
+        changed.outline = "- 已改变的基本结构"
+        try:
+            prepare(changed)
+        except SystemExit as exc:
+            if "实质变化" not in str(exc):
+                raise
+        else:
+            raise AssertionError("self-test failed: changed request was silently reused")
+        missing_record = argparse.Namespace(**vars(args))
+        missing_record.external_task_key = "DEMO-002"
+        missing_record.source_path = Path(temp) / "不存在.md"
+        try:
+            prepare(missing_record)
+        except SystemExit as exc:
+            if "外部写作任务入口缺少可读取的任务记录" not in str(exc):
+                raise
+        else:
+            raise AssertionError("self-test failed: missing request record was accepted")
+        original_request_text = request_record.read_text(encoding="utf-8")
+        request_record.write_text(original_request_text + "\n- 变更：不应静默复用\n", encoding="utf-8")
+        try:
+            prepare(args)
+        except SystemExit as exc:
+            if "SHA-256已变化" not in str(exc):
+                raise
+        else:
+            raise AssertionError("self-test failed: changed external task record was silently reused")
+        request_record.write_text(original_request_text, encoding="utf-8")
+        task = task_files[0].parent
+        article_id = field(read_text(task_files[0]), "文章ID")
+        claim_id = "CLM-DEMO-PROD-001"
+        formal = root / "03_正式知识/20_产品介绍/测试正式知识.md"
+        formal.parent.mkdir(parents=True)
+        demo_evidence = "Example Company provides custom packaging services."
+        demo_evidence_sha = hashlib.sha256(demo_evidence.encode("utf-8")).hexdigest()
+        formal.write_text(
+            f"# 测试正式知识\n\n### {claim_id}｜测试正式知识\n\n- Claim ID：{claim_id}\n- Claim：{demo_evidence}\n- 适用范围：Example Company的定制包装服务\n- 来源类型：客户官网\n- 来源链接：https://example.com/about-us/\n- 原文证据：本区块最小原文证据\n- 调研核验：已回读官网正文\n- 精确位置：Company Introduction第1段\n- 日期或版本：2026-09-07\n- 归类模块：产品介绍\n- 归类依据：回答定制包装服务事实\n- 使用边界：不得外推具体材料、数量或效果\n- 证据模板版本：EC-1\n- 证据归属主体：Example Company\n- 证据归属对象：定制包装服务\n- 指代解析：无\n- 归属核验依据：官网页面标题与正文主体一致\n- 归属核验日期：2026-09-07\n- 归属核验状态：已核验\n- 归属证据SHA-256：{demo_evidence_sha}\n- 竞品信息筛查：通过\n- 状态：可用\n\n### 最小原文证据\n\n> {demo_evidence}\n",
+            encoding="utf-8",
+        )
+        outline_rows = ("标题", "主问题", "说明测试问题", "给出安全建议")
+        retrieval_rows = "\n".join(
+            f"| {label} | 已逐层检查正式Claim、源资料、官网、关联网站、外部Claim和新调研 | 03_正式知识/20_产品介绍/测试正式知识.md | CF-001 | 1 | 1 | 无 | 纳入30 |"
+            for label in outline_rows
+        )
+        website_rows = "\n".join(
+            f"| {label} | About Us；https://example.com/about-us/ | 2026-09-21 | Company Introduction第1段 | Example Company provides custom packaging services. | CF-001 | 已读取并复用当前Formal Claim；同一候选事实明确支持多个问题 |"
+            for label in outline_rows
+        )
+        (task / "15_检索与知识准备记录.md").write_text(
+            "# 检索与知识准备记录\n\n"
+            f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n"
+            "- 最近更新：2026-09-07\n- MAT依赖处理：无\n- 知识准备模式：new_article\n- 基线文章版本：不适用\n"
+            "- 本轮知识检索运行ID：research-self-test-001\n- 官网正文抓取凭证：官网正文抓取凭证.json\n\n"
+            "- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
+            "## 固定检索层状态\n\n| 检索层 | 当前状态 | 结果或未查原因 | 下一步 |\n|---|---|---|---|\n"
+            "| 已有正式Claim | 已检索并命中 | 命中测试正式知识 | 进入候选事实核验 |\n"
+            "| 客户官网 | 已检索但未命中本篇新增事实 | About Us正文 https://example.com/about-us/ | 已记录正文，现有Claim证据更直接 |\n\n"
+            "## 来源命中记录\n\n| 知识问题 | 命中Claim/资料名称与入口 | 相关理由 | 处理结果 |\n|---|---|---|---|\n"
+            f"| 测试文章所需事实 | {claim_id}；03_正式知识/20_产品介绍/测试正式知识.md | 直接回答大纲问题 | 复用当前Claim |\n"
+            "| 官网核验 | https://example.com/about-us/ Company Introduction第1段 | 已读取相关正文 | 与现有Claim重复，不新增 |\n\n"
+            "## 官网正文核验\n\n| 大纲章节/知识问题 | 页面名称与最终具体URL | 获取日期 | 正文位置 | 最小连续原文 | 候选事实ID或未命中 | 处置结果 |\n|---|---|---|---|---|---|---|\n"
+            f"{website_rows}\n\n"
+            "## 候选事实处置明细\n\n| 候选事实ID | 独立事实摘要 | 来源与精确位置 | 处置结果 | Formal Claim或排除/治理入口 |\n|---|---|---|---|---|\n"
+            f"| CF-001 | Example Company provides custom packaging services. | https://example.com/about-us/ Company Introduction第1段 | 复用已有Formal Claim | {claim_id} |\n\n"
+            "## 本轮事实与Claim盘点\n\n| 本轮候选事实ID/当前Claim ID | 本轮重新打开的来源与精确位置 | 本轮证据结论 | 当前归类模块 | 本轮处置 | 依据 |\n|---|---|---|---|---|---|\n"
+            "| CF-001 / " + claim_id + " | 不适用（新文章） | 03_正式知识/20_产品介绍/测试正式知识.md正文 | 本轮复核 | 客户知识 | 复用 | 本轮来源核验通过 |\n\n"
+            "## 大纲逐项检索与候选事实覆盖\n\n| 大纲章节 | 六层检索范围与结果 | 命中来源与精确入口 | 候选事实ID | 候选事实数 | 已沉淀Claim数 | 未采用事实/缺口及原因 | 下一步 |\n|---|---|---|---|---:|---:|---|---|\n"
+            f"{retrieval_rows}\n\n"
+            "## MAT依赖与资料选择\n\n| MAT ID | 候选SRC ID | 文件名与稳定路径 | 关系/处理问题 | 决定 | 选取或排除范围 | 决定依据 | 决定方 | 当前状态 |\n|---|---|---|---|---|---|---|---|---|\n"
+            "| 无 | 无 | 无 | 本篇无版本候选 | 无 | 无 | 无需选择 | Codex自动处理 | 不适用 |\n\n"
+            "## 复杂资料处理与原件核对\n\n| 资料ID | 文件名与稳定路径 | 未索引内容/处理原因 | 与本篇关系判断 | 实际处理范围与方法 | MinerU/提取稿入口 | 原件核对位置与结论 | MAT/ANM/CUS入口 | 最终状态 |\n|---|---|---|---|---|---|---|---|---|\n"
+            "| 无 | 无 | 本篇没有可能相关复杂资料 | 不适用 | 不适用 | 不适用 | 不适用 | 无 | 不适用 |\n",
+            encoding="utf-8",
+        )
+        _excerpt = "Example Company provides custom packaging services."
+        (task / "官网正文抓取凭证.json").write_text(
+            json.dumps([
+                {
+                    "refresh_run_id": "research-self-test-001", "question": question,
+                    "final_url": "https://example.com/about-us/", "fetched_date": "2026-09-21",
+                    "position": "Company Introduction第1段", "excerpt": _excerpt,
+                    "website_id": "PRIMARY-WEBSITE", "source_type": "客户官网",
+                    "block_id": "B001", "block_tag": "p",
+                    "heading_path": ["About Us", "Company Introduction"], "block_text": _excerpt,
+                    "excerpt_sha256": hashlib.sha256(_excerpt.encode()).hexdigest(),
+                    "response_sha256": "self-test-response",
+                }
+                for question in outline_rows
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        review_rows = "\n".join(
+            f"| {label} | 1 | 1 | 1 | 充分 | 无 |" for label in outline_rows
+        )
+        coverage_rows = "\n".join(
+            f"| {label} | {label}成立所需测试事实 | 已覆盖 | {claim_id} | 无 | 使用 |"
+            for label in outline_rows
+        )
+        (task / "20_文章前知识审核.md").write_text(
+            "# 文章前知识审核\n\n"
+            f"- 文章ID：{article_id}\n- 文章版本：v1\n- 审核模板版本：{TEMPLATE_VERSION}\n"
+            "- 审核日期：2026-09-07\n- 结论：自动通过\n- 可用Claim数：1\n- 客户来源：1\n- 外部来源：0\n"
+            "- 明确排除：无\n- 未解决但不阻塞事项：无\n- 计划写作素材：30_本篇知识库资料.md\n- 计划写作素材来源索引：35_写作素材来源索引.md\n"
+            "- 知识准备模式：new_article\n- 基线文章版本：不适用\n\n"
+            "- 大纲ID：DEMO-OUT-001\n- 大纲版本：v1\n- 重写模式：not_applicable\n"
+            "## 本轮知识准备复核\n\n| 复核项 | 15记录入口 | 审核结论 | 阻塞或排除 |\n|---|---|---|---|\n"
+            "| 本轮六层检索 | [[15_检索与知识准备记录.md#固定检索层状态]] | 新文章从空白上下文执行 | 无 |\n"
+            "| 本轮官网正文与凭证 | [[15_检索与知识准备记录.md#官网正文核验]] | 标题、主问题和每个大纲问题均有当前凭证 | 无 |\n"
+            "| 本轮Claim盘点 | [[15_检索与知识准备记录.md#本轮claim盘点与历史参考仅作审计不作本轮输入]] | 逐候选事实记录复用或新建 | 无 |\n"
+            "| 30/35重新生成 | [[15_检索与知识准备记录.md#候选事实处置明细]] | 已按本轮事实生成 | 无 |\n\n"
+            "## 大纲知识覆盖检查\n\n| 大纲章节 | 知识问题 | 覆盖状态 | 已有证据/Claim | 缺口或治理事项 | 本篇处理 |\n|---|---|---|---|---|---|\n"
+            f"{coverage_rows}\n\n"
+            "## 知识准备充分性复核\n\n| 大纲章节 | 候选事实数 | 已沉淀Claim数 | 计划纳入30的事实块数 | 覆盖结论 | 未采用事实/缺口及入口 |\n|---|---:|---:|---:|---|---|\n"
+            f"{review_rows}\n\n"
+            "## 复杂资料与原件核对复核\n\n| 资料ID | 15处理记录入口 | 最终状态 | 对当前事实/Claim影响 | 本篇审核结论 |\n|---|---|---|---|---|\n"
+            "| 无 | [[15_检索与知识准备记录.md#复杂资料处理与原件核对]] | 不适用 | 本篇无复杂资料 | 已复核，本篇无复杂资料 |\n\n"
+            "## CUS / ANM检测结果\n\n| 检测对象 | 已检查信号与来源 | 分类结论 | 事项与证据入口 | 本篇处理 |\n|---|---|---|---|---|\n"
+            "| CUS候选检测 | 已核对客户能力、规格、认证、案例、商业条件、公开授权，以及Formal Claim和来源范围 | 未触发 | 无 | 无需处理 |\n"
+            "| ANM异常检测 | 已核对版本、定位、提取、数值、单位和外推信号 | 未触发 | 无 | 无需处理 |\n\n"
+            "## CUS / ANM逐项核对明细\n\n"
+            "| 检测对象 | 检测类别 | 本篇事实或适用范围 | 已核对来源与定位 | 核对依据原文 | 核对结论 | 判断依据 | 事项与证据入口 | 本篇处理 |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            "| CUS候选检测 | 客户能力 | 本篇不涉及客户能力承诺 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前大纲无客户能力事实 | 无 | 不涉及本篇客户专属事实 |\n"
+            "| CUS候选检测 | 规格 | 本篇不涉及客户规格承诺 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前大纲无客户规格事实 | 无 | 不涉及本篇客户专属事实 |\n"
+            "| CUS候选检测 | 认证 | 本篇不涉及客户认证承诺 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前大纲无客户认证事实 | 无 | 不涉及本篇客户专属事实 |\n"
+            "| CUS候选检测 | 案例 | 本篇不涉及客户案例承诺 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前大纲无客户案例事实 | 无 | 不涉及本篇客户专属事实 |\n"
+            "| CUS候选检测 | 商业条件 | 本篇不涉及客户商业条件承诺 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前大纲无客户商业条件事实 | 无 | 不涉及本篇客户专属事实 |\n"
+            "| CUS候选检测 | 公开授权 | 本篇不涉及客户公开授权承诺 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前大纲无客户公开授权事实 | 无 | 不涉及本篇客户专属事实 |\n"
+            + "\n".join(
+                f"| ANM异常检测 | {category} | 本篇无该异常信号 | [[15_检索与知识准备记录.md#固定检索层状态]] | 已检索并命中 | 不适用 | 当前来源核对未见该异常 | 无 | 不涉及该异常 |"
+                for category in ("版本", "定位", "提取", "数值与单位", "OCR", "翻译与规范化", "来源冲突", "残缺与外推")
+            ) + "\n",
+            encoding="utf-8",
+        )
+        material = task / "30_本篇知识库资料.md"
+        material.write_text(
+             "# 本篇写作素材包\n\n"
+            f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n- 资料视图：写作素材包\n- 证据模板版本：EC-1\n"
+            "- 资料版本：v1\n- 生成日期：2026-09-07\n- 目标语言：中文\n- 对应大纲：10_文章知识需求.md\n- 使用对象：本篇写作Skill\n\n"
+             "## 一、可直接用于正文的事实\n\n### 测试事实\n\n- 事实素材：Example Company provides custom packaging services.\n- 使用条件：仅适用于Example Company的定制包装服务。\n\n#### 证据归属（仅用于指代解析）\n- 内容提供方：Example Company\n- 对应对象：定制包装服务\n- 指代关系：无\n- 核验状态：已核验\n\n#### 证据正文（供Faithfulness核验）\n\n> Example Company provides custom packaging services.\n\n"
+            "## 二、可直接采用的英文表达\n\n| 使用场景/大纲章节 | 可采用表达 | 使用条件 |\n|---|---|---|\n| 无 | 无 | 本篇目标语言为中文 |\n\n"
+            "## 三、可使用的数据表\n\n无\n\n"
+            "## 四、按大纲使用\n\n| 大纲章节 | 可用事实/表达/数据表 | 推荐写作角度 |\n|---|---|---|\n"
+            + "\n".join(f"| {label} | 测试事实 | 围绕已核验事实展开 |" for label in outline_rows)
+            + "\n\n## 五、仅供生成控制（不得写入正文）\n\n不得扩写未提供的参数。\n\n"
+            "## 六、缺少资料的章节及建议处理方式\n\n| 原大纲章节 | 建议处理 | 可保留的安全写作方向 |\n|---|---|---|\n| 无 | 无需处理 | 使用现有事实 |\n",
+            encoding="utf-8",
+        )
+        evidence_line = read_text(material).splitlines().index("> Example Company provides custom packaging services.") + 1
+        (task / "35_写作素材来源索引.md").write_text(
+            "# 写作素材来源索引\n\n"
+            f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n- 索引版本：v1\n- 生成日期：2026-09-07\n"
+            f"- 对应写作素材：30_本篇知识库资料.md\n- 写作素材SHA-256：{sha256(material)}\n- 用途：内部来源映射，不交给写作Skill\n\n"
+            "## 写作素材到正式知识映射\n\n| 证据正文行开始 | 证据正文行结束 | 素材主题 | 正式Claim ID | Claim通俗标题 | 正式知识文件 | 原始来源与精确位置 |\n|---:|---:|---|---|---|---|---|\n"
+            f"| {evidence_line} | {evidence_line} | 测试事实 | {claim_id} | 测试正式知识 | 03_正式知识/20_产品介绍/测试正式知识.md | 测试正式知识正文 |\n\n"
+            "## 写作事实输入确认\n\n- 当前30是本篇唯一知识库事实附件。\n",
+            encoding="utf-8",
+        )
+        from template_contract import validate_task_templates
+        # Exercise the current source protocol with real managed fixture
+        # records, including direct website checks and category-specific scope.
+        from governance_source_check import HEADER as source_header, HEADING as source_heading
+        from prewrite_governance import CATEGORIES, DETAIL_HEADER, DETAIL_HEADING
+        manifest = task / "官网正文抓取凭证.json"
+        captures = json.loads(read_text(manifest))
+        for capture in captures:
+            capture["response_sha256"] = hashlib.sha256(b"self-test-http-response").hexdigest()
+        manifest.write_text(json.dumps(captures, ensure_ascii=False), encoding="utf-8")
+        source_lines = [source_heading, "", "| " + " | ".join(source_header) + " |", "|" + "---|" * len(source_header)]
+        detail_lines = [DETAIL_HEADING, "", "| " + " | ".join(DETAIL_HEADER) + " |", "|" + "---|" * len(DETAIL_HEADER)]
+        number = 0
+        for detector, categories in CATEGORIES.items():
+            for category in categories:
+                number += 1
+                key = f"GC-{number:03d}"
+                applicable = category in {"客户能力", "版本", "定位", "提取", "翻译与规范化", "残缺与外推", "来源冲突"}
+                scope = f"本篇定制包装服务的{category}核对" if applicable else f"本篇不涉及{category}"
+                quote = demo_evidence if applicable else "- 说明测试问题"
+                source_row = [key, detector, category, scope, "官网正文" if applicable else "需求范围",
+                              "PRIMARY-WEBSITE" if applicable else "不适用",
+                              "https://example.com/about-us/" if applicable else "[[10_文章知识需求.md#大纲]]",
+                              "B001" if applicable else "大纲",
+                              demo_evidence_sha if applicable else sha256(task / "10_文章知识需求.md"),
+                              quote, "research-self-test-001",
+                              f"核对{category}：当前事实仅有该官网连续区块，不外推参数；本夹具无第二冲突来源" if applicable else f"当前需求不要求{category}，本轮未采用该类事实"]
+                source_lines.append("| " + " | ".join(source_row) + " |")
+                detail = [detector, category, scope, f"[[15_检索与知识准备记录.md#CUS / ANM来源核验记录]] {key}", quote,
+                          "已核验" if applicable else "不适用", source_row[-1], "无",
+                          "按证据使用，不扩展来源范围" if applicable else f"不涉及本篇{category}"]
+                detail_lines.append("| " + " | ".join(detail) + " |")
+        retrieval = task / "15_检索与知识准备记录.md"
+        retrieval.write_text(read_text(retrieval) + "\n" + "\n".join(source_lines) + "\n", encoding="utf-8")
+        preaudit = task / "20_文章前知识审核.md"
+        preaudit.write_text(read_text(preaudit).split(DETAIL_HEADING)[0] + "\n".join(detail_lines) + "\n", encoding="utf-8")
+        # This is synthetic fixture data, not a production conversion.
+        from preparation_record import section as pr_section, table as pr_table, CANDIDATE_HEADER, counts as pr_counts
+        old = read_text(retrieval)
+        meta = old.split("## 固定检索层状态")[0] + "- 知识准备记录协议：PR-1\n"
+        prepared_fixture = meta + "\n## 固定检索层状态\n\n" + pr_section(old, "固定检索层状态")
+        prepared_fixture += "\n\n### 官网正文核验\n\n" + pr_section(old, "官网正文核验")
+        prepared_fixture += "\n\n## 大纲逐项检索与候选事实覆盖\n\n" + pr_section(old, "大纲逐项检索与候选事实覆盖")
+        candidate = ["CF-001", demo_evidence, "https://example.com/about-us/ Company Introduction第1段", "复用已有Formal Claim", claim_id, "本轮官网连续原文核验通过", "客户知识", "复用", "本轮证据直接支持定制包装服务"]
+        prepared_fixture += "\n\n## 候选事实处置明细\n\n" + pr_table(CANDIDATE_HEADER, [candidate])
+        prepared_fixture += "\n\n## CUS / ANM来源核验记录\n\n" + pr_section(old, "CUS / ANM来源核验记录")
+        prepared_fixture += "\n\n## 缺口与特殊资料处理\n\n### 本轮待调研缺口复核\n\n" + pr_table(("GAP ID", "当前台账入口与状态", "本轮具体公共知识问题", "与当前大纲关系", "本轮处理和证据"), [["无"] * 5])
+        for title in ("MAT依赖与资料选择", "复杂资料处理与原件核对"):
+            prepared_fixture += "\n\n### " + title + "\n\n" + pr_section(old, title)
+        prepared_fixture += "\n\n## 本轮知识准备结论\n\n" + pr_table(("项目", "本轮结果"), [[k, str(v)] for k, v in pr_counts(prepared_fixture).items()] + [["中文结论", "本轮仅采用官网连续原文支持的定制包装服务，无公共知识缺口。"]]) + "\n"
+        retrieval.write_text(prepared_fixture, encoding="utf-8")
+        bundle_errors = validate_task_templates(task)
+        if bundle_errors or not article_package_ready(task):
+            raise AssertionError(f"self-test failed: valid reusable bundle was rejected: {bundle_errors}")
+
+        # Finalize now consumes a machine-issued writing_ready receipt.  Issue
+        # it through the real gate so this fixture exercises the same handoff
+        # contract as production instead of manufacturing a stale receipt.
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("issue_writing_ready.py")),
+                "--handoff-contract-version", current_version(),
+                "--project", str(root),
+                "--article-id", article_id,
+            ],
+            check=True,
+        )
+        task = next((root / "04_文章任务/20_等待终稿").rglob("10_文章知识需求.md")).parent
+
+        baseline_final = Path(temp) / "baseline-final.md"
+        baseline_final.write_text("测试基线正文。\n", encoding="utf-8")
+        final_args = argparse.Namespace(
+            handoff_contract_version=current_version(),
+            project=root,
+            final_path=baseline_final,
+            article_id=article_id,
+            external_task_key=None,
+        )
+        gate_file = task / "writing_gate_result.json"
+        ready_gate = gate_file.read_bytes()
+        for changed_gate in (
+            {"writing_gate_status": "blocked", "terminal": False},
+            {"writing_gate_status": "ready", "article_id": "OTHER", "article_version": "v1"},
+            None,
+        ):
+            if changed_gate is None:
+                gate_file.unlink()
+            else:
+                gate_file.write_text(json.dumps(changed_gate), encoding="utf-8")
+            try:
+                finalize(final_args)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("self-test failed: stale receipt bypassed current gate")
+            if (task / "40_最终文章.md").exists():
+                raise AssertionError("self-test failed: blocked final wrote 40")
+            gate_file.write_bytes(ready_gate)
+        finalize(final_args)
+        # finalize() normalizes 40 in the waiting-for-final task.  The
+        # subsequent create_faithfulness_record.py step owns the move to
+        # 30_等待Faithfulness, so the bridge self-test must inspect 20 here.
+        task = next((root / "04_文章任务/20_等待终稿").rglob("10_文章知识需求.md")).parent
+        baseline_managed = task / "40_最终文章.md"
+        if not baseline_managed.is_file():
+            raise AssertionError("self-test failed: new article did not accept its first final")
+
+        rewrite = argparse.Namespace(**vars(args))
+        rewrite.revision_mode = "knowledge_reuse_rewrite"
+        rewrite.article_id = article_id
+        rewrite.base_article_version = "v1"
+        rewrite.base_outline_id = "DEMO-OUT-001"
+        rewrite.base_outline_version = "v1"
+        rewrite.request_text = "知识不变，只按原大纲重写"
+        prepare(rewrite)
+        rewritten = list((root / "04_文章任务/10_进行中").rglob("10_文章知识需求.md"))
+        if len(rewritten) != 1 or field(read_text(rewritten[0]), "当前版本") != "v2":
+            raise AssertionError("self-test failed: article-only rewrite did not create v2")
+        rewritten_task = rewritten[0].parent
+        for name in ("15_检索与知识准备记录.md", "20_文章前知识审核.md", "30_本篇知识库资料.md", "35_写作素材来源索引.md"):
+            if field(read_text(rewritten_task / name), "文章版本") != "v2":
+                raise AssertionError(f"self-test failed: {name} version was not updated")
+        expected_hash = sha256(rewritten_task / "30_本篇知识库资料.md")
+        actual_hash = field(read_text(rewritten_task / "35_写作素材来源索引.md"), "写作素材SHA-256")
+        if actual_hash != expected_hash:
+            raise AssertionError("self-test failed: reused 35 does not match current 30 hash")
+        if (rewritten_task / "40_最终文章.md").exists() or (rewritten_task / "50_文章知识使用与Faithfulness记录.md").exists():
+            raise AssertionError("self-test failed: old final or Faithfulness current state leaked into rewrite")
+
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("issue_writing_ready.py")),
+                "--handoff-contract-version", current_version(),
+                "--project", str(root),
+                "--article-id", article_id,
+            ],
+            check=True,
+        )
+        rewritten_task = next((root / "04_文章任务/20_等待终稿").rglob("10_文章知识需求.md")).parent
+
+        identical_final = Path(temp) / "identical-final.md"
+        identical_final.write_text("测试基线正文。\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=identical_final, article_id=article_id, external_task_key=None,
+        ))
+        if (rewritten_task / "40_最终文章.md").exists():
+            raise AssertionError("self-test failed: identical rewrite created current 40")
+
+        whitespace_final = Path(temp) / "whitespace-final.md"
+        whitespace_final.write_text("  测试基线正文。\n\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=whitespace_final, article_id=article_id, external_task_key=None,
+        ))
+        if (rewritten_task / "40_最终文章.md").exists():
+            raise AssertionError("self-test failed: whitespace-only rewrite created current 40")
+
+        changed_final = Path(temp) / "changed-final.md"
+        changed_final.write_text("测试基线正文已经完成实质重写。\n", encoding="utf-8")
+        finalize(argparse.Namespace(
+            handoff_contract_version=current_version(), project=root,
+            final_path=changed_final, article_id=article_id, external_task_key=None,
+        ))
+        rewritten_task = next((root / "04_文章任务/20_等待终稿").rglob("10_文章知识需求.md")).parent
+        if not (rewritten_task / "40_最终文章.md").is_file():
+            raise AssertionError("self-test failed: changed rewrite did not create current 40")
+        changed_scope = argparse.Namespace(**vars(rewrite))
+        changed_scope.base_article_version = "v2"
+        changed_scope.title = "已改变知识范围的标题"
+        try:
+            prepare(changed_scope)
+        except SystemExit as exc:
+            if "知识范围" not in str(exc):
+                raise
+        else:
+            raise AssertionError("self-test failed: article-only rewrite accepted changed knowledge scope")
+
+        refresh = argparse.Namespace(**vars(args))
+        refresh.revision_mode = "outline_refresh"
+        refresh.article_id = article_id
+        refresh.base_article_version = "v2"
+        refresh.base_outline_id = "DEMO-OUT-001"
+        refresh.base_outline_version = "v1"
+        refresh.request_text = "按原大纲重新整理知识并重写"
+        prepare(refresh)
+        refreshed = list((root / "04_文章任务/10_进行中").rglob("10_文章知识需求.md"))
+        if len(refreshed) != 1 or field(read_text(refreshed[0]), "当前版本") != "v3":
+            raise AssertionError("self-test failed: knowledge refresh revision did not create v3")
+        if field(read_text(refreshed[0]), "任务模式") != "outline_refresh":
+            raise AssertionError("self-test failed: revision mode was not persisted")
+        if any((refreshed[0].parent / name).exists() for name in (
+            "15_检索与知识准备记录.md", "20_文章前知识审核.md",
+            "30_本篇知识库资料.md", "35_写作素材来源索引.md",
+        )):
+            raise AssertionError("self-test failed: knowledge refresh reused old knowledge files")
+        refreshed_task = refreshed[0].parent
+        run = json.loads((refreshed_task / "知识重整运行.json").read_text(encoding="utf-8"))
+        if "initial_pending_gap_ids" in run:
+            raise AssertionError("self-test failed: fresh refresh run must not snapshot historical GAPs")
+        if run.get("workflow_entry") != "run_outline_refresh.py":
+            raise AssertionError("self-test failed: refresh run did not bind the unique outline-refresh entry")
+        if run.get("package_generation") != "empty_until_current_run":
+            raise AssertionError("self-test failed: refresh run did not start with an empty package")
+        from run_outline_refresh import check_task as check_outline_refresh
+        refresh_check = check_outline_refresh(refreshed_task)
+        if refresh_check.get("ok") or len(refresh_check.get("present", [])) >= 4:
+            raise AssertionError("self-test failed: incomplete outline refresh was not kept blocked")
+        refresh_identical = Path(temp) / "refresh-identical-final.md"
+        refresh_identical.write_text("测试基线正文已经完成实质重写。\n", encoding="utf-8")
+        try:
+            finalize(argparse.Namespace(
+                handoff_contract_version=current_version(), project=root,
+                final_path=refresh_identical, article_id=article_id, external_task_key=None,
+            ))
+        except SystemExit as exc:
+            if "writing_ready" not in str(exc):
+                raise
+        else:
+            raise AssertionError("self-test failed: knowledge refresh bypassed writing_ready gate")
+        if (refreshed_task / "40_最终文章.md").exists():
+            raise AssertionError("self-test failed: identical knowledge-refresh rewrite created current 40")
+        archives = list((root / "04_文章任务/90_归档/10_文章历史版本").rglob("00_版本说明.md"))
+        if len(archives) != 2:
+            raise AssertionError("self-test failed: both rewrite modes did not archive prior versions")
+
+        # A current task must win over same-ID historical snapshots.
+        archived_task = root / "04_文章任务/90_归档/10_文章历史版本/DEMO-ART-001/v1_20260904-120000"
+        archived_task.mkdir(parents=True)
+        (archived_task / "10_文章知识需求.md").write_text(
+            "# 文章知识需求\n\n- 文章ID：DEMO-ART-001\n- 外部任务唯一键：DEMO-001\n",
+            encoding="utf-8",
+        )
+        current = root / "04_文章任务/40_已完成/DEMO-ART-001_测试文章"
+        current.mkdir(parents=True)
+        (current / "10_文章知识需求.md").write_text(
+            "# 文章知识需求\n\n- 文章ID：DEMO-ART-001\n- 外部任务唯一键：DEMO-001\n",
+            encoding="utf-8",
+        )
+        if locate_task(root, "DEMO-ART-001", "") != current:
+            raise AssertionError("self-test failed: current task did not outrank archived task")
+
+        # Sync-provider deletion denial is a warning, not a failed commit.
+        denied = root / "04_文章任务/40_已完成/.retired-denied"
+        denied.mkdir(parents=True)
+        original_rmtree = shutil.rmtree
+        try:
+            def deny_retired(path, *args, **kwargs):
+                if Path(path).name == denied.name:
+                    raise PermissionError(5, "access denied")
+                return original_rmtree(path, *args, **kwargs)
+            shutil.rmtree = deny_retired
+            warning = cleanup_transient_directory(denied)
+        finally:
+            shutil.rmtree = original_rmtree
+        if not warning or not denied.is_dir():
+            raise AssertionError("self-test failed: transient cleanup denial was not downgraded to warning")
+    print(f"self-test=passed\nhandoff_contract_version={current_version()}")
+
+
+def locate_task(project: Path, article_id: str, external_key: str) -> Path:
+    candidates = []
+    archived = []
+    for path in (project / "04_文章任务").rglob("10_文章知识需求.md"):
+        text = read_text(path)
+        if article_id and field(text, "文章ID") == article_id:
+            target = archived if "90_归档" in path.parts else candidates
+            target.append(path.parent)
+        elif external_key and field(text, "外部任务唯一键") == external_key:
+            target = archived if "90_归档" in path.parts else candidates
+            target.append(path.parent)
+    if not candidates:
+        candidates = archived
+    if len(candidates) != 1:
+        raise SystemExit(f"无法唯一确定文章任务（候选数：{len(candidates)}），不按标题猜测")
+    return candidates[0]
+
+
+def finalize(args: argparse.Namespace) -> None:
+    try:
+        contract_version = validate_version(args.handoff_contract_version)
+    except HandoffContractError as exc:
+        raise SystemExit(str(exc)) from exc
+    project = args.project.resolve()
+    sync_skill_version(project)
+    source = args.final_path.resolve()
+    if not source.is_file():
+        raise SystemExit(f"终稿绝对路径必须指向文章正文文件（不能是目录）：{source}")
+    if source.suffix.lower() in {".zip", ".7z", ".rar"}:
+        raise SystemExit(
+            f"final_path不能指向压缩交付包：{source}；请把文章正文文件作为final_path，"
+            "压缩包另报final_package_path"
+        )
+    task = locate_task(project, args.article_id or "", args.external_task_key or "")
+    request = read_text(task / "10_文章知识需求.md")
+    recorded_contract_version = field(request, "交接合同版本")
+    if recorded_contract_version and recorded_contract_version != contract_version:
+        raise SystemExit(
+            "writing_completed合同版本与10_文章知识需求.md不一致："
+            f"{contract_version} != {recorded_contract_version}"
+        )
+    article_id = field(request, "文章ID")
+    version = field(request, "当前版本") or field(request, "文章版本") or "v1"
+    if not version.lower().startswith("v"):
+        version = "v" + version
+    ready_receipt = task / "writing_ready.json"
+    gate_path = task / "writing_gate_result.json"
+    if not gate_path.is_file():
+        raise SystemExit("缺少当前writing_ready门禁回执；交回知识库重跑门禁，不得接收终稿")
+    if gate_path.is_file():
+        try:
+            gate = json.loads(read_text(gate_path))
+        except (ValueError, OSError) as exc:
+            raise SystemExit(f"当前writing_ready门禁回执不可读取；交回知识库重跑门禁：{exc}") from exc
+        if (not isinstance(gate, dict) or gate.get("writing_gate_status") != "ready"
+                or gate.get("article_id") != article_id or gate.get("article_version") != version):
+            raise SystemExit("当前writing_ready门禁未通过；交回知识库自动恢复并重跑门禁，不得接收终稿")
+    if not ready_receipt.is_file():
+        raise SystemExit(
+            "当前文章没有知识库签发的writing_ready机器回执；"
+            "请先运行scripts/issue_writing_ready.py并等待writing_gate_status=ready，"
+            "不得接收未经过写作门禁的终稿"
+        )
+    try:
+        receipt = json.loads(ready_receipt.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"writing_ready机器回执无法读取：{ready_receipt}：{exc}") from exc
+    expected_material = task / "30_本篇知识库资料.md"
+    if (
+        receipt.get("article_id") != article_id
+        or receipt.get("article_version") != version
+        or receipt.get("knowledge_sha256") != sha256(expected_material)
+    ):
+        raise SystemExit(
+            "writing_ready机器回执与当前文章身份、版本或30哈希不一致；"
+            "请归档并重新生成当前版本的知识材料，不得继续接收终稿"
+        )
+    raw_source_text = read_article_text(source)
+    if not raw_source_text.strip():
+        raise SystemExit(f"终稿正文为空或无法提取：{source}")
+    title = (
+        field(raw_source_text, "文章标题") or field(raw_source_text, "最终标题")
+        or field(raw_source_text, "Article Title") or field(raw_source_text, "Final Title")
+        or field(request, "标题") or field(request, "文章标题") or source.stem
+    )
+    completed = (
+        field(raw_source_text, "完成日期") or field(raw_source_text, "Completed Date")
+        or datetime.fromtimestamp(source.stat().st_mtime).date().isoformat()
+    )
+    try:
+        source_text = extract_external_body(raw_source_text)
+    except ValueError as exc:
+        raise SystemExit(f"无法确定终稿正文边界：{exc}") from exc
+    if ARTICLE_BODY_START in source_text or ARTICLE_BODY_END in source_text:
+        raise SystemExit("终稿正文中残留嵌套正文边界，不能生成40_最终文章.md")
+    revision_mode = field(request, "任务模式") or "new_article"
+    if revision_mode in {"outline_refresh", "knowledge_reuse_rewrite"}:
+        try:
+            baseline = archived_base_article(
+                project, request, required=revision_mode == "knowledge_reuse_rewrite"
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if baseline is not None:
+            baseline_path, base_version = baseline
+            baseline_text = managed_article_body(baseline_path)
+        else:
+            baseline_text = ""
+            base_version = field(request, "基线文章版本") or "未知"
+        if baseline_text and normalized_body_fingerprint(source_text) == normalized_body_fingerprint(baseline_text):
+            retry_payload = {
+                "handoff_event": "writing_retry_required",
+                "handoff_contract_version": contract_version,
+                "project_id": project_id_for_root(project),
+                "article_id": article_id,
+                "article_version": version,
+                "base_article_version": base_version,
+                "reason": "新终稿正文与基线版本完全相同，尚未完成重写",
+                "next_action": "使用当前30和原大纲重新执行原写作流程",
+            }
+            try:
+                validate_event("writing_retry_required", retry_payload)
+            except HandoffContractError as exc:
+                raise SystemExit(f"writing_retry_required合同校验失败：{exc}") from exc
+            update_integration_status(
+                project,
+                "writing_retry_required",
+                article_id=article_id,
+                article_version=version,
+                detail=f"基线版本：{base_version}；未生成当前40，退回原写作Skill",
+            )
+            for key in (
+                "handoff_event", "handoff_contract_version", "project_id", "article_id",
+                "article_version", "base_article_version", "reason", "next_action",
+            ):
+                print(f"{key}={retry_payload[key]}")
+            return
+    try:
+        validate_event(
+            "writing_completed",
+            {
+                "handoff_event": "writing_completed",
+                "handoff_contract_version": contract_version,
+                "project_id": project_id_for_root(project),
+                "final_path": str(source),
+                "title": title,
+                "completed_at": completed,
+            },
+        )
+    except HandoffContractError as exc:
+        raise SystemExit(f"writing_completed合同校验失败：{exc}") from exc
+    # Keep the external file untouched; the normalized file is the sole input
+    # to Faithfulness and always contains the knowledge identity metadata.
+    normalized = [
+        "# 最终文章", "", f"- 文章ID：{article_id}", f"- 文章版本：{version}",
+        f"- 模板版本：{TEMPLATE_VERSION}",
+        f"- 交接合同版本：{contract_version}",
+        f"- 文章标题：{title}", f"- 完成日期：{completed}",
+        f"- 外部终稿原路径：{source}", f"- 外部终稿SHA-256：{sha256(source)}", "",
+        "## 最终正文", "", ARTICLE_BODY_START, source_text, ARTICLE_BODY_END,
+    ]
+    target = task / "40_最终文章.md"
+    target.write_text("\n".join(normalized) + "\n", encoding="utf-8")
+    update_integration_status(
+        project,
+        "final_received_success",
+        article_id=article_id,
+        article_version=version,
+        detail=f"已规范化终稿：{source.name}",
+    )
+    print(f"article_id={article_id}")
+    print(f"article_version={version}")
+    print(f"handoff_contract_version={contract_version}")
+    print("handoff_event=writing_completed")
+    print(f"normalized_article={target}")
+    print("next=run create_faithfulness_record.py with this 40 and the current 30/35")
+
+
+def main() -> None:
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        return
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("prepare")
+    p.add_argument(
+        "--handoff-contract-version",
+        required=True,
+        help=f"必须与当前安装合同一致；当前为 {current_version()}",
+    )
+    p.add_argument("--project", type=Path, required=True)
+    p.add_argument("--external-task-key", required=True)
+    p.add_argument("--source-path", type=Path, required=True)
+    p.add_argument("--source-locator", default="未记录")
+    p.add_argument("--title", required=True)
+    p.add_argument("--request-text", required=True, help="本次原始写作请求；不得只留在对话上下文")
+    p.add_argument("--product-or-content-object", default="未提供")
+    p.add_argument("--topic-direction", default="未提供")
+    p.add_argument("--keywords", default="")
+    p.add_argument("--outline", default="")
+    p.add_argument("--outline-id", required=True)
+    p.add_argument("--outline-version", required=True)
+    p.add_argument("--outline-status", default="")
+    p.add_argument("--target-language", default="待补充")
+    p.add_argument("--constraints", default="未提供")
+    p.add_argument("--original-writing-requirements", required=True, help="本组当前有效的原始写作要求")
+    p.add_argument("--current-status", default="可准备知识")
+    p.add_argument("--writing-skill", required=True)
+    p.add_argument("--batch-id", default="", help="同批文章共用的批次ID")
+    p.add_argument(
+        "--revision-mode",
+        choices=sorted(REVISION_MODES),
+        default=None,
+        help="新文章或两种明确重做模式；重做时还要提供article-id和base-article-version",
+    )
+    p.add_argument("--base-article-version")
+    p.add_argument("--base-outline-id")
+    p.add_argument("--base-outline-version")
+    p.add_argument("--article-id")
+    p.add_argument("--date", default=date.today().isoformat())
+    p.set_defaults(func=prepare)
+    f = sub.add_parser("finalize")
+    f.add_argument(
+        "--handoff-contract-version",
+        required=True,
+        help=f"必须与当前安装合同一致；当前为 {current_version()}",
+    )
+    f.add_argument("--project", type=Path, required=True)
+    f.add_argument("--final-path", type=Path, required=True)
+    f.add_argument("--article-id")
+    f.add_argument("--external-task-key")
+    f.set_defaults(func=finalize)
+    args = parser.parse_args()
+    if args.command == "finalize" and not (args.article_id or args.external_task_key):
+        parser.error("finalize 至少需要 --article-id 或 --external-task-key")
+    try:
+        args.func(args)
+    except SystemExit as exc:
+        # The bridge uses SystemExit for user-facing validation failures.
+        # Mirror those failures into the project summary before re-raising.
+        if args.command == "prepare" and isinstance(exc, OutlineChangeRequiresConfirmation):
+            event = "writing_task_outline_confirmation_required"
+        else:
+            event = "writing_task_failure" if args.command == "prepare" else "final_received_failure"
+        update_integration_status(
+            args.project,
+            event,
+            article_id=getattr(args, "article_id", "") or "",
+            external_task_key=getattr(args, "external_task_key", "") or "",
+            error=str(exc),
+        )
+        raise
+    except Exception as exc:
+        event = "writing_task_failure" if args.command == "prepare" else "final_received_failure"
+        update_integration_status(
+            args.project,
+            event,
+            article_id=getattr(args, "article_id", "") or "",
+            external_task_key=getattr(args, "external_task_key", "") or "",
+            error=str(exc),
+        )
+        raise
+
+
+if __name__ == "__main__":
+    main()
