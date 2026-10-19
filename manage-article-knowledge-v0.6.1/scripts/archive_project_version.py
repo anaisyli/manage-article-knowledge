@@ -54,7 +54,9 @@ def relative_inside(path: Path, root: Path, label: str) -> Path:
 
 def skill_identity() -> tuple[str, str]:
     skill = Path(__file__).resolve().parent.parent / "SKILL.md"
-    return "manage-article-knowledge v0.6", sha256_file(skill)
+    from check_skill_update import current_skill
+    version, digest = current_skill(skill)
+    return f"manage-article-knowledge {version}", digest
 
 
 def archive_destination(
@@ -179,6 +181,7 @@ def create_archive(
             f"- 替代版本：{replacement_version}",
             f"- 当前入口：{current_entry}",
             f"- 执行Skill：{skill_name}",
+            f"- Skill路径：{Path(__file__).resolve().parent.parent / 'SKILL.md'}",
             f"- Skill SHA-256：{skill_hash}",
             "",
             "## 归档文件与指纹",

@@ -15,6 +15,7 @@ from pathlib import Path
 from build_coverage_view import MODULES, coverage_fingerprint, formal_files, knowledge_gaps
 from check_integration import validate as validate_integration_config
 from monthly_issue_grouping import validate_report_grouping
+from record_project_run import LEDGER_RELATIVE, validate_ledger as validate_run_records
 from template_contract import (
     ARTICLE_AUDIT_TEMPLATE_VERSION,
     BLOCKING_COMPLEX_MATERIAL_STATES,
@@ -154,7 +155,7 @@ CANONICAL_ARTICLE_FILES = {
 }
 ARTICLE_STATES = ("10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成")
 # Source IDs may include meaningful hyphenated namespaces, e.g. SRC-EXT-P005-001.
-SOURCE_ID_RE = re.compile(r"\bSRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b")
+SOURCE_ID_RE = re.compile(r"\bSRC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b(?![A-Za-z0-9_*?-])")
 
 
 def extract_source_ids(text: str) -> set[str]:
@@ -391,7 +392,7 @@ def formal_claim_theme_mismatch(
 def writing_material_evidence_scope(lines: list[str]) -> tuple[list[bool], int]:
     """Return lines inside explicit evidence bodies in sections 1-3."""
     evidence_metadata = re.compile(
-        r"^\s*[-*]\s*(?:来源(?:链接|类型|与精确位置)?|原始来源|精确位置|"
+        r"^\s*[-*]\s*(?:来源(?:链接|类型|与精确位置)?|原始来源|精确位置|主体归属说明|"
         r"source(?:\s+url|\s+type|\s+and\s+location)?|location)\s*[：:]?",
         re.IGNORECASE,
     )
@@ -424,7 +425,8 @@ def writing_material_evidence_scope(lines: list[str]) -> tuple[list[bool], int]:
 
 
 def markdown_table(path: Path, section: str) -> tuple[list[str], list[list[str]]]:
-    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    from preparation_record import validation_view
+    lines = validation_view(path.read_text(encoding="utf-8-sig")).splitlines()
     try:
         start = lines.index(section) + 1
     except ValueError:
@@ -889,11 +891,29 @@ def validate_source_references(root: Path, errors: list[str]) -> None:
     for path in root.rglob("*.md"):
         if any(part in {".obsidian", ".git", "90_归档", "40_Skill运行反馈"} for part in path.parts):
             continue
+        # Control/machine snapshots preserve historical administrative text,
+        # not current fact references. Their manifest/hash checks stay active.
+        if any(path.is_relative_to(root / relative) for relative in (
+            "05_数据与审核/60_版本归档/20_控制文件迁移历史",
+            "05_数据与审核/60_版本归档/30_机器文件迁移快照",
+        )):
+            continue
         text = path.read_text(encoding="utf-8-sig")
         for line_number, line in enumerate(text.splitlines(), 1):
             for source_id in marker.findall(line):
                 if source_id not in source_ids and source_id not in external_source_ids:
                     errors.append(f"来源ID不存在或被截断：{source_id}（{path}:{line_number}）")
+
+
+def validate_run_ledger(root: Path, errors: list[str]) -> None:
+    """Use the same schema/legacy-read validation as the ledger writer."""
+    path = root / LEDGER_RELATIVE
+    if not path.is_file():
+        return  # Older projects need not have a run ledger until their first run.
+    try:
+        errors.extend(f"项目运行账本：{error}" for error in validate_run_records(path))
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"无法读取项目运行账本：{exc}")
 
 
 def load_source_mat_map(root: Path) -> dict[str, str]:
@@ -1438,6 +1458,38 @@ def formal_claim_index(root: Path) -> dict[str, tuple[Path, str]]:
             end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
             index.setdefault(match.group(1), (path, text[match.start():end]))
     return index
+
+
+def is_imported_completed_package(material_path: Path, audit_path: Path) -> bool:
+    """Whether this is a completed, imported historical article snapshot.
+
+    A later edit to a reusable Formal Claim must not retroactively invalidate a
+    frozen 30/35/40/50 set that was already audited and imported. Identity and
+    version binding are required before applying this compatibility rule.
+    """
+    task_dir = material_path.parent
+    if task_dir.parent.name != "40_已完成":
+        return False
+    final_path = task_dir / "40_最终文章.md"
+    faithfulness_path = task_dir / "50_文章知识使用与Faithfulness记录.md"
+    if not final_path.is_file() or not faithfulness_path.is_file():
+        return False
+
+    texts = (
+        material_path.read_text(encoding="utf-8-sig"),
+        audit_path.read_text(encoding="utf-8-sig"),
+        final_path.read_text(encoding="utf-8-sig"),
+        faithfulness_path.read_text(encoding="utf-8-sig"),
+    )
+    article_ids = {parse_field(text, "文章ID") for text in texts}
+    versions = {parse_field(text, "文章版本") for text in texts}
+    return (
+        len(article_ids) == 1
+        and "" not in article_ids
+        and len(versions) == 1
+        and "" not in versions
+        and parse_field(texts[3], "当前状态").startswith("已导入")
+    )
 
 
 def validate_external_claim_links(
@@ -2213,6 +2265,9 @@ def validate_article_knowledge_packages(
             errors.append(f"新写作素材包缺少35_写作素材来源索引.md：{material_path.parent}")
             continue
         audit_text = audit_path.read_text(encoding="utf-8-sig")
+        imported_completed_snapshot = is_imported_completed_package(
+            material_path, audit_path
+        )
         required_audit_metadata = {
             "文章ID": None,
             "文章版本": None,
@@ -2347,6 +2402,11 @@ def validate_article_knowledge_packages(
                         errors.append(f"35映射引用的正式知识文件不存在：{formal_ref}（{audit_path}）")
                 if formal_path and formal_path.is_file() and request_text:
                     claim_block_for_theme = claim_index.get(claim_id, (formal_path, ""))[1]
+                    from evidence_identity import mapping_identity_errors
+                    errors.extend(f"{audit_path} {claim_id}：{error}" for error in mapping_identity_errors(
+                        material_text, start, end, claim_block_for_theme,
+                        parse_field(request_text, "证据模板版本") == "EC-1",
+                    ))
                     mismatch = formal_claim_theme_mismatch(
                         request_text, formal_path, claim_block_for_theme
                     )
@@ -2381,17 +2441,26 @@ def validate_article_knowledge_packages(
                         )
                     expected_text = translation_text if contains_chinese(original_text) else original_text
                     if expected_text and expected_text not in mapped_text:
+                        message = ""
                         if contains_chinese(original_text) and not translation_text:
-                            errors.append(
+                            message = (
                                 f"英文30未找到Claim {claim_id} 已保存的经核验英文严格翻译"
                                 f"（{start}-{end}）：{audit_path}"
                             )
                         else:
-                            errors.append(
+                            message = (
                                 f"{'英文30未完整复用Claim' if english_target else '30未完整复用Formal Claim'}"
                                 f" {claim_id} 的连续证据正文"
                                 f"（{start}-{end}）：{audit_path}"
                             )
+                        if imported_completed_snapshot:
+                            warnings.append(
+                                f"已完成文章的历史30/35与当前Formal Claim证据文本不同，"
+                                f"保留已导入的文章版本，不按当前Claim回写历史附件；"
+                                f"新文章仍须完整满足当前Claim证据要求。{message}"
+                            )
+                        else:
+                            errors.append(message)
                 mapping_ranges.append((start, end))
             for index, in_evidence in enumerate(evidence_scope, 1):
                 if not in_evidence or not material_lines[index - 1].strip():
@@ -3427,6 +3496,8 @@ def main() -> None:
     metrics = load_metrics(metrics_path, errors, warnings)
     check_csv_schema(support_path, SUPPORT_FIELDS, errors, warnings)
     validate_knowledge_gaps(gap_path, errors)
+    from external_research_links import validate_research_links
+    validate_research_links(root, errors)
     validate_writing_task_imports(writing_import_path, errors)
     integration = validate_integration_config(
         root / "01_工作台/40_写作与Faithfulness接入配置.md"
@@ -3445,6 +3516,7 @@ def main() -> None:
     validate_claims(root, errors, warnings)
     validate_external_claim_links(root, errors, warnings)
     validate_ledgers(root, errors)
+    validate_run_ledger(root, errors)
     validate_feedback_details(root, errors)
     for markdown_path in root.rglob("*.md"):
         if any(part in {".obsidian", ".git", "90_归档"} for part in markdown_path.parts):

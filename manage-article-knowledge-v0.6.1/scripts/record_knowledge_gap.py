@@ -30,6 +30,16 @@ def normalized_topic(value: str) -> str:
     return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", value.casefold())
 
 
+def next_gap_key(rows: list[dict[str, str]], project_id: str) -> str:
+    """Keep historical keys; allocate above every occupied numeric suffix."""
+    code = re.sub(r"[^A-Za-z0-9]", "", project_id)
+    if not code:
+        raise ValueError("无法确定项目短码，不能自动分配GAP ID")
+    numbers = [int(match.group(1)) for row in rows
+               if (match := re.search(r"-(\d+)$", row.get("gap_key", "")))]
+    return f"GAP-{code}-{max(numbers, default=0) + 1:03d}"
+
+
 def topic_specificity(value: str) -> None:
     """Reject labels that cannot tell an operator what knowledge is missing."""
     text = " ".join(value.split())
@@ -142,7 +152,7 @@ def default_next_action(status: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
-    parser.add_argument("--gap-key", required=True, help="Stable normalized question key, not an atomic article claim.")
+    parser.add_argument("--gap-key", default="auto", help="New gaps use auto; an existing historical key may be updated without renaming.")
     parser.add_argument("--topic", required=True, help="Human-readable public knowledge question.")
     parser.add_argument("--article-id", required=True)
     parser.add_argument("--article-date", required=True, help="YYYY-MM-DD")
@@ -182,9 +192,15 @@ def main() -> None:
     if args.next_action.strip():
         require_human_chinese(args.next_action, "next_action")
 
-    rows = merge_duplicate_rows(read_rows(args.csv))
+    original_rows = read_rows(args.csv)
+    rows = merge_duplicate_rows(original_rows)
     requested_key = args.gap_key.strip()
+    if requested_key == "auto":
+        from build_coverage_view import parse_project_id
+        requested_key = next_gap_key(original_rows, parse_project_id(args.csv.resolve().parents[2]))
     existing = next((row for row in rows if row["gap_key"] == requested_key), None)
+    if args.gap_key.strip() != "auto" and existing is None:
+        raise SystemExit("新GAP必须使用--gap-key auto自动分配；显式编号只允许更新已有历史事项")
     merged_key = ""
     if existing is None:
         # A writer may invent a new key for the same public problem on another

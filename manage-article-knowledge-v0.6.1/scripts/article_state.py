@@ -16,13 +16,14 @@ from validate_v06_project import (
     normalized_evidence_text,
 )
 from prewrite_governance import governance_errors
+from evidence_identity import mapping_identity_errors
 
 
 ARTICLE_STATES = ("10_进行中", "20_等待终稿", "30_等待Faithfulness", "40_已完成")
 TODO_RELATIVE = Path("01_工作台/20_当前待办.md")
 DELIVERABLE_AUDIT_RESULTS = {"自动通过", "带明确排除通过"}
 _EVIDENCE_METADATA_RE = re.compile(
-    r"^\s*[-*]\s*(?:来源(?:链接|类型|与精确位置)?|原始来源|精确位置|"
+    r"^\s*[-*]\s*(?:来源(?:链接|类型|与精确位置)?|原始来源|精确位置|主体归属说明|"
     r"source(?:\s+url|\s+type|\s+and\s+location)?|location)\s*[：:]?",
     re.IGNORECASE,
 )
@@ -144,7 +145,8 @@ def retrieval_claim_source_errors(task_dir: Path) -> list[str]:
     retrieval_path = task_dir / "15_检索与知识准备记录.md"
     if not retrieval_path.is_file():
         return []
-    text = retrieval_path.read_text(encoding="utf-8-sig")
+    from preparation_record import validation_view
+    text = validation_view(retrieval_path.read_text(encoding="utf-8-sig"))
     website_rows = _table_rows(text, "## 官网正文核验")
     candidate_rows = {
         row[0].strip(): row
@@ -256,7 +258,7 @@ def article_package_errors(task_dir: Path) -> list[str]:
         batch_path = task_dir.parents[2] / "04_文章任务" / "批次运行" / f"{batch_safe}.json"
         try:
             from batch_knowledge_run import ledger_errors
-            errors.extend(ledger_errors(batch_path, batch_id))
+            errors.extend(ledger_errors(batch_path, batch_id, article_id=parse_field(request_text, "文章ID")))
         except (ImportError, OSError, ValueError) as exc:
             errors.append(f"批次证据门禁无法执行：{exc}")
     english_target = is_english_target(parse_field(material_text, "目标语言"))
@@ -401,6 +403,10 @@ def article_package_errors(task_dir: Path) -> list[str]:
                     if quoted and not all(line in formal_text for line in quoted):
                         errors.append(f"{label}的30证据正文未逐字出现在正式Claim文件中，疑似临时段落或被改写")
                     claim_block = _claim_block(formal_text, claim_id)
+                    errors.extend(f"{label}：{error}" for error in mapping_identity_errors(
+                        material_text, start, end, claim_block,
+                        parse_field(request_text, "证据模板版本") == "EC-1",
+                    ))
                     if request_text:
                         mismatch = formal_claim_theme_mismatch(
                             request_text, formal_path, claim_block
@@ -630,7 +636,8 @@ def task_ready_for_delivery(task_dir: Path) -> bool:
     if validate_task_templates(task_dir):
         return False
     retrieval = task_dir / "15_检索与知识准备记录.md"
-    retrieval_text = retrieval.read_text(encoding="utf-8-sig")
+    from preparation_record import validation_view
+    retrieval_text = validation_view(retrieval.read_text(encoding="utf-8-sig"))
     mat_dependency = parse_field(retrieval_text, "MAT依赖处理")
     if mat_dependency not in {"无", "已决定"}:
         return False

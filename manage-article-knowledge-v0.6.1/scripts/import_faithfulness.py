@@ -91,7 +91,7 @@ def write_completion_receipt(
     return receipt
 DISPOSITION_CATEGORIES = {
     "existing_gap", "new_public_gap", "cus", "mat", "anm",
-    "package_omission", "writing_only",
+    "package_omission", "evidence_context_gap", "audit_process_limitation", "writing_only",
 }
 GOVERNANCE_LEDGERS = {
     "cus": Path("05_数据与审核/30_异常与待决定/10_待客户补充/01_待客户补充事项.md"),
@@ -340,7 +340,11 @@ def source_scope(lines: list[str], path: Path) -> list[bool]:
                     evidence_level = level
                     found_evidence = True
                 continue
-            if evidence_level is not None:
+            if evidence_level is not None and not re.match(
+                r"^\s*[-*]\s*(?:主体归属说明|来源(?:链接|类型|与精确位置)?|原始来源|精确位置|"
+                r"source(?:\s+url|\s+type|\s+and\s+location)?|location)\s*[：:]?",
+                line, re.IGNORECASE,
+            ):
                 selected[index] = True
         if not found_evidence:
             raise ValueError(
@@ -377,6 +381,52 @@ def source_scope(lines: list[str], path: Path) -> list[bool]:
         if in_source_block and in_evidence_body:
             selected[index] = True
     return selected
+
+
+def writing_material_evidence_scope(lines: list[str]) -> tuple[list[bool], int]:
+    """Return the exact 30 lines that are evidence bodies in sections 1-3.
+
+    This is intentionally local to the importer.  Import-time validation must
+    not import the project validator (which has a different CLI/runtime), and
+    metadata such as ``主体归属说明`` is never evidence even when it sits
+    below an evidence heading.
+    """
+    evidence_metadata = re.compile(
+        r"^\s*[-*]\s*(?:来源(?:链接|类型|与精确位置)?|原始来源|精确位置|主体归属说明|"
+        r"source(?:\s+url|\s+type|\s+and\s+location)?|location)\s*[：:]?",
+        re.IGNORECASE,
+    )
+    selected = [False] * len(lines)
+    evidence_sections = {
+        "一、可直接用于正文的事实",
+        "二、可直接采用的英文表达",
+        "三、可使用的数据表",
+    }
+    in_evidence_section = False
+    evidence_level: int | None = None
+    found = 0
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            if level == 2:
+                in_evidence_section = title in evidence_sections
+                evidence_level = None
+            elif evidence_level is not None and level <= evidence_level:
+                evidence_level = None
+            if in_evidence_section and title == "证据正文（供Faithfulness核验）":
+                evidence_level = level
+                found += 1
+            continue
+        if evidence_level is not None and not evidence_metadata.match(line):
+            selected[index] = True
+    if not found:
+        raise ValueError(
+            "Writing material has no recognizable evidence bodies; "
+            "use a 证据正文（供Faithfulness核验） heading in sections 1-3."
+        )
+    return selected, found
 
 
 def extract_knowledge_chunks(path: Path) -> list[dict[str, Any]]:
@@ -876,6 +926,7 @@ def load_disposition(
     article_id: str,
     claims: list[dict[str, Any]],
     project_root: Path | None = None,
+    knowledge_files: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     unsupported_ids = {
         str(claim.get("claim_id", "")).strip()
@@ -958,6 +1009,82 @@ def load_disposition(
             seen_claim_ids.add(claim_id)
             normalized_ids.append(claim_id)
         group["claim_ids"] = normalized_ids
+        if category == "audit_process_limitation":
+            if schema_version != "1.1":
+                raise ValueError("audit_process_limitation requires schema 1.1")
+            review = group.get("process_review")
+            records = review.get("claim_records") if isinstance(review, dict) else None
+            if not isinstance(records, dict) or set(records) != set(normalized_ids):
+                raise ValueError("audit_process_limitation must map every claim_id to a process record")
+            for claim_id in normalized_ids:
+                claim = claim_by_id[claim_id]
+                reconciliation = claim.get("reconciliation") or {}
+                record = records[claim_id]
+                reasons = reconciliation.get("reasons")
+                # Only double-supported records rejected for recorded validation
+                # defects qualify. Genuine unknown, conflict or reviewer disagreement
+                # must use evidence/governance routes, never this category.
+                if (claim.get("semantic_status") != "unknown"
+                        or reconciliation.get("first_pass_semantic_status") != "entailed"
+                        or reconciliation.get("independent_semantic_status") != "entailed"
+                        or reconciliation.get("final_semantic_status") != "unknown"
+                        or not isinstance(reasons, list) or not reasons
+                        or not isinstance(record, dict)
+                        or record.get("cause") != "component_record_incomplete"
+                        or record.get("validation_reasons") != reasons
+                        or len(str(record.get("source_review", "")).strip()) < 20):
+                    raise ValueError(f"audit_process_limitation lacks a verified process cause: {claim_id}")
+                record_signals = ("没有对应证据原文片段", "没有对应主张原文片段", "未被证据覆盖",
+                                  "检查缺失", "检查字段不完整", "状态无效", "理由过短", "重复模板")
+                if any(not isinstance(reason, str) or not any(token in reason for token in record_signals)
+                       for reason in reasons):
+                    raise ValueError(f"Semantic uncertainty cannot be classified as audit_process_limitation: {claim_id}")
+            if issue_key and "-SKFB-" not in issue_key:
+                raise ValueError("audit_process_limitation may link an existing SKFB, never ANM/GAP")
+        if category == "evidence_context_gap":
+            # This category is only for an actual quotation delivered in 30
+            # whose referent/source attribution cannot be resolved. It must
+            # never become a fallback for claims with no package evidence.
+            package_files = [
+                item.resolve() for item in (knowledge_files or [])
+                if item.name == "30_本篇知识库资料.md"
+            ]
+            if len(package_files) != 1 or not package_files[0].is_file():
+                raise ValueError(
+                    f"evidence_context_gap requires the current 30 file as an import input: {group_id}"
+                )
+            package_lines = read_text(package_files[0]).splitlines()
+            package_scope = writing_material_evidence_scope(package_lines)[0]
+            for claim_id in normalized_ids:
+                evidence_items = claim_by_id[claim_id].get("evidence") or []
+                matching_quote = False
+                for item in evidence_items:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        source = Path(str(item.get("source_file", ""))).resolve()
+                        start = int(item.get("line_start") or 0)
+                        end = int(item.get("line_end") or start)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    quote = str(item.get("quote", ""))
+                    if (
+                        source != package_files[0]
+                        or not quote.strip()
+                        or start < 1
+                        or end < start
+                        or end > len(package_lines)
+                        or not all(package_scope[index - 1] for index in range(start, end + 1))
+                    ):
+                        continue
+                    source_excerpt = "\n".join(package_lines[start - 1:end])
+                    if quote in source_excerpt:
+                        matching_quote = True
+                        break
+                if not matching_quote:
+                    raise ValueError(
+                        f"evidence_context_gap requires a verbatim quote from the current 30 evidence body and its exact line range: {group_id}/{claim_id}"
+                    )
         if category in {"existing_gap", "new_public_gap", "cus", "mat", "anm"} and not issue_key:
             raise ValueError(f"Disposition category {category} requires issue_key: {group_id}")
         if category in {"existing_gap", "new_public_gap"}:
@@ -993,7 +1120,7 @@ def load_disposition(
                 if any(len(str(reason).strip()) < 12 for reason in matches.values()):
                     raise ValueError(f"Public gap has an unexplained claim-to-question mapping: {group_id}")
                 group["scope_review"] = {"knowledge_question": question, "claim_matches": matches}
-        if category in {"package_omission", "writing_only"} and issue_key:
+        if category in {"package_omission", "evidence_context_gap", "writing_only"} and issue_key:
             raise ValueError(f"Disposition category {category} must not invent issue_key: {group_id}")
 
         if schema_version == "1.0":
@@ -1173,6 +1300,11 @@ def validate_disposition_links(
             if group["category"] == "new_public_gap" and status not in {"观察中", "待外部调研", "部分解决"}:
                 raise ValueError(f"New public gap has invalid active status: {group['issue_key']}")
 
+    for group in groups:
+        if group["category"] == "audit_process_limitation" and group.get("issue_key"):
+            ledger = project_root / "05_数据与审核/30_异常与待决定/40_Skill运行反馈/01_Skill反馈台账.md"
+            if not ledger.is_file() or group["issue_key"] not in read_text(ledger):
+                raise ValueError("audit_process_limitation SKFB reference must already exist")
     catalog = formal_claim_catalog(project_root)
     for group in groups:
         if group["category"] != "package_omission":
@@ -1523,7 +1655,7 @@ def main() -> None:
     try:
         disposition_project_root = args.metrics_csv.resolve().parents[2]
         disposition_groups = load_disposition(
-            args.disposition, article_id, claims, disposition_project_root
+            args.disposition, article_id, claims, disposition_project_root, args.knowledge
         )
     except (ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -1798,6 +1930,8 @@ def main() -> None:
         "mat": "MAT源资料处理",
         "anm": "ANM源文与事实异常",
         "package_omission": "资料包覆盖遗漏",
+        "evidence_context_gap": "资料包证据归属不清",
+        "audit_process_limitation": "审核过程记录限制（不证明事实缺失）",
         "writing_only": "无需治理的写作内容",
     }
     disposition_table_rows: list[str] = []

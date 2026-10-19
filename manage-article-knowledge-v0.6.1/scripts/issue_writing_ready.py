@@ -63,6 +63,9 @@ def blocked(task: Path, reasons: list[str]) -> int:
     payload = _blocked_payload(task, reasons)
     result_path = task / GATE_RESULT_NAME
     task.mkdir(parents=True, exist_ok=True)
+    # A failed recheck revokes an older permission even if its 30 hash still
+    # matches. The same canonical receipt can be reissued after real recovery.
+    (task / RECEIPT_NAME).unlink(missing_ok=True)
     temporary = result_path.with_suffix(result_path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(result_path)
@@ -187,6 +190,10 @@ def issue(args: argparse.Namespace) -> int:
         elif payload.get("knowledge_sha256") != sha256(task / "30_本篇知识库资料.md"):
             errors.append("已有写作就绪回执与当前30哈希不一致")
         if errors:
+            if any((task / name).is_file() for name in ("40_最终文章.md", "50_文章知识使用与Faithfulness记录.md")):
+                return blocked(task, list(dict.fromkeys(errors + [
+                    "当前版本已有终稿或审核结果，不得用新30静默重签旧稿；知识库按版本合同归档并重建后重新写作/审核",
+                ])))
             errors, recovery = _recover_and_recheck(task, errors)
             if not errors:
                 payload = _ready_payload(project, task, contract_version, article_id, version)

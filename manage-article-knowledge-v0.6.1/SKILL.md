@@ -21,9 +21,11 @@ description: 面向文章生产的轻量企业知识库管理Skill。用于初�
 
 ### 批次运行唯一入口
 
-批次知识准备必须使用 `scripts/run_knowledge_workflow.py --project <Obsidian项目路径> --batch-id <批次ID>` 作为编排入口。该入口根据项目路径和批次 ID 自动定位 `04_文章任务/批次运行/<批次ID>.json`，兼容旧账本时只接受 `batch_id` 完全匹配的唯一文件；调用方不得手工拼接 `batch_knowledge_run.py` 命令或自行填写 `--ledger`。入口负责记录批次状态、校验结果、文章级恢复结果和下一动作到同目录的 `<批次ID>.workflow.json`，并将参数错误、账本缺失、空证据、可恢复工具失败、门禁失败和单篇 `15/20/30/35` 问题统一标记为 `terminal=false`。这些状态必须按回执中的下一动作继续处理，不能作为本批最终回复。
+批次知识准备必须使用 `scripts/run_knowledge_workflow.py --project <Obsidian项目路径> --batch-id <批次ID>` 作为编排入口。该入口根据项目路径和批次 ID 自动定位 `04_文章任务/批次运行/<批次ID>.json`，兼容旧账本时只接受 `batch_id` 完全匹配的唯一文件；调用方不得手工拼接 `batch_knowledge_run.py` 命令或自行填写 `--ledger`。入口先运行 `scripts/sync_website_evidence.py`，从本批当前文章目录读取 `refresh_run_id` 与该篇当前 `research_run_id` 或 `refresh_run_id` 一致的官网凭证（批次ID另行核对），幂等登记到批次账本；只有来源URL唯一匹配、连续摘录已逐字存在且Claim当前可用时，才自动复用既有Claim。其余记录进入`capture_inbox`，不得伪装成已核验事实。入口负责记录批次状态、同步结果、校验结果、文章级恢复结果和下一动作到同目录的 `<批次ID>.workflow.json`，并将参数错误、账本缺失、空证据、未决Claim、可恢复工具失败、门禁失败和单篇 `15/20/30/35` 问题统一标记为 `terminal=false`。调用中的Codex必须按回执继续自己的知识准备步骤，处理完候选事实和Formal Claim后重跑同一入口；不得把“需要补账本/需要Claim闭环”转交人工或作为本批最终回复。
 
-`batch_knowledge_run.py` 是账本校验/整理的内部组件，不是完整采集编排器；它不负责网页抓取或 Formal Claim 沉淀。只有批次证据真实完成后，入口才继续文章级门禁和 `writing_ready` 签发。来源访问失败、来源冲突、无法唯一确定 Claim 或需要业务决定时，入口保留文章级阻塞并继续处理其他无共享依赖文章；不得用空账本或普通退出码代替终止事件。
+`batch_knowledge_run.py` 是账本校验/整理的内部组件，不是完整采集编排器；它不负责网页抓取或 Formal Claim 沉淀。`capture_inbox`中的未闭环凭证会阻止整批`evidence_ready`，而且每条凭证须有明确的候选事实处置；无法与唯一当前Formal Claim严格匹配的内容必须由知识库流程继续核验、沉淀或治理，不要求人工再次发送“继续”。每篇关联的本轮证据真实完成后，入口独立执行该篇门禁和 `writing_ready` 签发；`partial_writing_ready`保留未完成文章的`pending_steps`并继续处理。来源访问失败、来源冲突、无法唯一确定 Claim 或需要业务决定时，入口保留文章级阻塞并继续处理其他无共享依赖文章；不得用空账本或普通退出码代替终止事件。批次ID不替代文章运行ID，重写重试沿用当前10的版本和模式，来源读取立即保存检查点；具体接续及首次生成30/35的条件见[批次级知识准备合同](references/batch-knowledge-workflow.md#重试与幂等)。
+
+同一批次升版或更换检索运行时，由`writing_bridge.py prepare`按已提交的当前10和运行JSON完成登记；旧运行的证据、候选和来源读取关联移入账本`run_history`，共享记录保留其他文章关联。成员已更新但遗留旧证据时，重放同一请求也须补做隔离；当前运行检查点继续保留。不得手改版本/运行ID、清空账本或另建批次绕过冲突。无当前凭证的`source_collection`由Codex继续真实检索、保存凭证和核验Claim后重跑，不能把重复校验当作采集。详细条件见[批次切换与恢复](references/batch-knowledge-workflow.md#同批次版本切换与历史隔离)。
 
 ## 接入术语统一
 
@@ -51,7 +53,11 @@ Skill本体（`SKILL.md`）、references、scripts、agents配置和changelog是
 
 执行任何阶段前，读取[内部运行清单](references/runtime-checklist.md)中对应部分。该清单只用于后台防漏，不形成新的人工步骤。批次文章还必须先建立并校验批次证据账本。
 
+文章前CUS/ANM核验固定落在15来源核验表，20按核验ID逐类复核；新请求使用[项目结构与模板](references/project-structure-and-templates.md)的GC-1来源模板并真实回源，禁止新增任务核验笔记作为事实依据。记录缺失或指纹漂移由知识库继续核验和修复，不能编造通过。门禁重检阻塞会撤销旧writing_ready；写作前及终稿提交前按[交接说明](references/skill-integration-handoff.md)核对当前许可，资料变化后由知识库恢复或按版本合同重建。
+
 ### 统一知识库维护入口
+
+项目门禁与专用运行账本校验使用同一验证器：schema 1 历史 `partial_success` 只读兼容为 `partial`，新记录仍只写当前合法枚举，不重写历史JSONL。控制/机器历史快照中的管理说明不作为当前事实来源引用重验，归档完整性仍校验；真实正式知识及当前文章的来源引用继续核对，来源通配说明不得截断为不存在的来源ID。
 
 需要整理或修复既有项目时，直接使用[知识库维护入口与维护清单](references/knowledge-base-maintenance.md)中的口令。每次运行都先读取现有维护清单并按当前Skill规则逐项复核，不得只发现新问题而遗留已经失效的旧问题。能由现有证据确定的结构性问题直接修复；不能确定的事实、证据、映射或业务决定不得猜测，统一登记到项目维护清单。旧事项若因明确的Skill规则更新已不再构成错误，保留历史行，记录规则变更依据和当前验证结果后标记`已关闭`，不得继续计入开放事项，也不得为迎合旧规则改写项目；一次未报错、未扫描到或仅版本/代码变化不能作为关闭依据。人工补充判断或证据后，再用“根据维护清单继续整理并维护这个知识库”复核，只有明确可执行的事项才能回写、关闭并重建覆盖视图。维护入口不重算历史Faithfulness，不改变历史文章版本、旧GAP或历史报告。普通文章、终稿和Faithfulness流程仍只对当前实际触及的文件做确定性微调；知识库维护、月度审核和交接审核在正式工作前各执行一次项目级确定性结构整理，统一核对当前模板固定字段/小节、稳定入口与导航、台账主表/详情配对、占位内容和覆盖视图。该整理只修复有固定规则可唯一判断的结构，不新增迁移台账或迁移编号，不自动删除兼容历史页，也不迁移事实、Claim、证据、旧GAP或历史审核结果；不确定项继续进入维护清单或审核结论。
 
@@ -74,7 +80,7 @@ v0.6完整继承v0.5，并继续满足[v0.4稳定性兼容清单](references/v04
 
 写作完成后，写作 Skill必须把终稿写入接入配置中的终稿入口并返回同一`handoff_contract_version`和终稿绝对路径；能保留文章ID和版本时一并返回，没有也不阻塞。`writing_completed`只表示终稿已交付，不是整条流程结束。知识库收到终稿绝对路径后确定文章归属，按自己的命名合同补齐内部`40_最终文章.md`的文章ID、版本、完成日期和标题，创建`50`，随后按唯一合同固定调用`deepeval-article-audit`，发出`faithfulness_request`审核当前`40`和`30`。Faithfulness调用前必须检查当前Codex是否能发现名为`deepeval-article-audit`的已安装Skill：发现后立即在当前任务中调用；发现不到时保持`30_等待Faithfulness`，记录`faithfulness_skill_not_found`，并向内容运营显示固定安装提示，不回退为其他审核器或模糊的“外部流程”。如果内容运营提供了本地Skill目录，Codex只在本次运行中校验该目录的`SKILL.md`名称为`deepeval-article-audit`并使用它，不把该机器路径写入通用合同。收到同版本`faithfulness_completed`后立即导入结果并完成文章收尾；只有任务进入`40_已完成`后才返回同版本`article_completed`。正常路径不要求内容运营重复发送“好了可以写”“请读取30”“请调用Faithfulness”或“请导入结果”。
 
-重做既有文章时选择且只选择一种模式，保留文章ID、递增文章版本并先归档完整旧任务。`outline_refresh`与新文章使用同一批次知识准备流程：唯一差别是它直接使用当前`10_文章知识需求.md`中已确认的大纲，不重新生成大纲。两种模式都必须从本批次证据清单开始，统一读取来源、核验正式 Claim、识别缺口并重建`15/20/30/35`。旧版`15/20/30/35/50`及其他归档内容不读取、不复制，也不作为问题提示、来源、结论或排除理由。旧版缺少`40_最终文章.md`不阻塞知识重建或首次终稿接收；只有`knowledge_reuse_rewrite`要求旧版有`40`，以比较新旧文章是否完全相同。`outline_refresh`只能通过`scripts/run_outline_refresh.py`逐篇接续；该入口要求当前运行记录、文章版本、四份知识文件和同一`refresh_run_id`一致，并在每生成一份文件后立即重新校验，不能由临时脚本直接把旧文件改版本后推进。执行细节见[文章知识工作流](references/article-knowledge-workflow.md)和[批次级知识准备合同](references/batch-knowledge-workflow.md)。
+重做既有文章时选择且只选择一种模式，保留文章ID、递增文章版本并先归档完整旧任务。`outline_refresh`与新文章使用同一批次知识准备流程：唯一差别是它直接使用当前`10_文章知识需求.md`中已确认的大纲，不重新生成大纲。两种模式都必须从本批次证据清单开始，统一读取来源、核验正式 Claim、识别缺口并重建`15/20/30/35`。当前包独立完成并通过校验前，旧版`15/20/30/35/50`及其他归档内容不读取、不复制，也不作为问题提示、来源、结论或排除理由。旧版缺少`40_最终文章.md`不阻塞知识重建或首次终稿接收；只有`knowledge_reuse_rewrite`要求旧版有`40`，以比较新旧文章是否完全相同。`outline_refresh`只能通过`scripts/run_outline_refresh.py`逐篇接续；该入口要求当前运行记录、文章版本、四份知识文件和同一`refresh_run_id`一致，并在每生成一份文件后立即重新校验，不能由临时脚本直接把旧文件改版本后推进。执行细节见[文章知识工作流](references/article-knowledge-workflow.md)和[批次级知识准备合同](references/batch-knowledge-workflow.md)。
 
 只有当前项目不明确、任务或终稿无法唯一归属、路径/字段失效、客户事实冲突或需要业务决定时，才向人工展示具体问题；问题解决后从记录的阻塞节点自动继续，不要求人工另说“继续”。外部编排器读取 `writing_gate_result.json` 时必须以结构化 `terminal` 为准，不能把进程退出码 `2` 当成终止。Skill本身不是常驻后台服务；本节描述的是一次写作请求被调用后的连续执行顺序，延迟文件和中断恢复仍需由外部调度器再次唤醒。
 
@@ -250,11 +256,11 @@ MAT生命周期固定分为四个可独立判断的维度：`当前文章依赖`
 
 当某段资料能够回答具体文章问题时，回到原始证据，只建立或复用本篇实际需要的最小正式Claim。未被文章命中的可搜索材料继续保持未整理状态。
 
-每条正式Claim必须包含稳定Claim ID、Claim正文、适用范围、来源类型、来源链接、精确位置、最小原文证据、日期或版本、使用边界和状态。最小原文证据保留来源语言；其中含中文时，同一Claim区块必须另存经核验的英文严格翻译。英文严格翻译保持型号、数字、单位、专名、否定、条件、范围、频率、不确定性和确定程度，不增加营销表达、因果、承诺或源文没有的事实，也不得冒充客户英文原话。原始证据本身为英文时不重复增加译文。来源类型使用：客户源文件 / 客户官网 / 客户关联网站（内容运营提交） / 客户确认 / 外部公共来源。只有企业关系已由内容运营明确说明或由网页证据核实时，才能使用“客户关联网站”；否则保持“关系待确认”且不形成客户专属Claim。状态只使用：可用 / 受限使用 / 待知识库专员确认 / 已失效。
+每条正式Claim必须按`references/project-structure-and-templates.md`的固定区块生成，并包含稳定Claim ID、Claim正文、适用范围、来源类型、来源链接、精确位置、最小原文证据、日期或版本、使用边界和状态。新建Claim必须在同一事务中加入EC-1字段：证据模板版本、证据归属主体、证据归属对象、指代解析、归属核验依据、归属核验日期、归属核验状态、归属证据SHA-256；缺一项不得进入`evidence_ready`。复用已有Claim前必须回源核验主体、对象、指代和范围，旧Claim缺EC-1时先补齐再生成`30/35`。最小原文证据保留来源语言；其中含中文时，同一Claim区块必须另存经核验的英文严格翻译。英文严格翻译保持型号、数字、单位、专名、否定、条件、范围、频率、不确定性和确定程度，不增加营销表达、因果、承诺或源文没有的事实，也不得冒充客户英文原话。原始证据本身为英文时不重复增加译文。来源类型使用：客户源文件 / 客户官网 / 客户关联网站（内容运营提交） / 客户确认 / 外部公共来源。只有企业关系已由内容运营明确说明或由网页证据核实时，才能使用“客户关联网站”；否则保持“关系待确认”且不形成客户专属Claim。状态只使用：可用 / 受限使用 / 待知识库专员确认 / 已失效。
 
 外部公共Claim必须使用`CLM-EXT-[项目]-[主题]-NNN`命名空间，客户Claim使用`CLM-[项目]-[主题]-NNN`命名空间并分别连续编号；创建外部Claim时不得读取或占用客户Claim流水号。每条Claim自身区块必须包含`### 最小原文证据`和连续引用块，不能只写元数据、RES回链或AI摘要；原文证据含中文时还必须包含`### 经核验英文严格翻译`和英文连续引用块。项目校验器会拦截外部Claim缺证据、中文证据缺译文、错误命名空间和同一外部主题跳号。
 
-检索、Claim核验、外部调研和文章前审核前，完整读取[文章知识工作流](references/article-knowledge-workflow.md)。创建项目文件或Claim前，完整读取[项目结构与模板](references/project-structure-and-templates.md)和[目录、命名与模板合同](references/naming-and-layout-contract.md)。
+检索、Claim核验、外部调研和文章前审核前，完整读取[文章知识工作流](references/article-knowledge-workflow.md)。创建项目文件或Claim前，完整读取[项目结构与模板](references/project-structure-and-templates.md)和[目录、命名与模板合同](references/naming-and-layout-contract.md)。新建或复用Claim、生成或恢复`30`时，还须读取[Formal Claim与证据归属固定模板](references/formal-claim-and-evidence-context.md)，按固定字段、标题层级和顺序生成，不得自行变换板块。
 
 ### 4. 自动执行文章前知识审核
 
@@ -284,6 +290,8 @@ MAT生命周期固定分为四个可独立判断的维度：`当前文章依赖`
 每篇固定生成两个职责分离的文件：
 
 - `30_本篇知识库资料.md`标题固定为“本篇写作素材包”，是唯一交给写作Codex或作者的知识附件。按固定六节提供可直接写入正文的事实、可采用的英文表达、可使用的数据表、按大纲使用建议、仅供生成控制且不得写入正文的边界、缺少资料章节的处理方式。第一至第三节中的每个可核验事实或数据块必须保留相应的连续来源正文，或经核验的目标语言忠实翻译，作为简洁的“证据正文”块；它可以按大纲筛选、重排和配合写作表达，但不能只留下无从核验的AI总结。英文文章使用中文来源Claim时，证据正文必须直接复制该正式Claim中已经保存的完整英文严格翻译，不得在生成`30`时临时重译或改写；中文文章可以使用Claim中的中文最小原文证据。
+- `30`第一至第三节每个事实块必须严格使用固定的EC-1顺序：`#### 证据归属（仅用于指代解析）`四字段（内容提供方、对应对象、指代关系、核验状态）后紧接同级`#### 证据正文（供Faithfulness核验）`引用块。证据归属板块不得含URL、Claim ID或新事实，不能进入`35`映射；缺少或格式不一致时由模板门禁阻塞。
+- 证据正文应保留确定主体、对象和适用范围所必需的连续来源上下文。原文中的`we/our`若依赖被截掉的上下文，先回读来源并将必要上下文或核验过的忠实目标语言翻译保存到Formal Claim，再逐字交付到`30`；不得在`30`临时把代词改成客户名，也不得用“主体归属说明”代替正向证据。来源仍无法唯一归属时按ANM/CUS处理，不能猜主体或扩充客户能力。主体归属说明属于管理元数据，不进入证据正文或`35`映射，但审核可在同一事实块普通证据已存在时用它解析指代。
 - `35_写作素材来源索引.md`是紧凑的内部追溯索引，不交给写作模型。它只记录当前`30`的SHA-256、`30`中明确标记的“证据正文”行范围到Formal Claim ID的确定性映射和原始来源定位；不复制完整Claim、审计推理、边界或问题清单。标准v0.6流程的唯一事实输入是`30`，随文事实文件必须先进入来源、Claim和`30/35`，不得作为平行事实附件绕过知识流程。
 
 任务成功进入`20_等待终稿`后，向写作Skill交付项目ID、文章ID、文章版本、当前`30`文件绝对路径和配置中的终稿入口。写作Skill按自己的SEO/GEO、文风和交付流程写作，只把当前`30`作为本篇知识库事实附件；能做到时在终稿中带回文章ID和版本，但没有也不阻塞。知识库会通过外部任务映射或终稿绝对路径唯一确定归属，并按`[项目短码]-ART-[YYYYMMDD]-[三位流水]`和`v1`规则补齐内部身份。自然语言“好了可以写了”可以触发写作动作，不能替代`20_等待终稿`和当前`30`存在的交付门禁。
@@ -330,7 +338,7 @@ MAT生命周期固定分为四个可独立判断的维度：`当前文章依赖`
 
 协议2.0导入还必须逐行核对`unit_id + article_quote + 完整规范化claim`命题身份；`claim_id`只是显示编号，`claim_fragment`只是可重复的解释片段，二者都不能替代完整身份或用于跨命题绑定。普通语义不确定继续按黄色导入；只有最终产物仍缺少完整身份或存在跨命题映射时，才拒绝该结果进入知识库。
 
-`package_omission`用于项目已有经核验的客户或公共正式Claim确能覆盖主张却漏进当前`30`的具体情况；公共知识必须指明Formal Claim ID，不把主题相近当作证据。归组按一个可由同一组证据解决的稳定知识问题组织，Claim数量不设机械上限；同属“通用包装方法”不足以合组。真正缺证的行业常识、一般原理、选型、方法和运营判断仍须登记或复用公共缺口。
+`package_omission`用于项目已有经核验的客户或公共正式Claim确能覆盖主张却漏进当前`30`的具体情况；必须列出具体且存在的Formal Claim ID、核验范围和遗漏位置，公共知识不能把主题相近、同一材料或同一网页标题当作证据。`evidence_context_gap`只用于当前`30`已经有逐字“证据正文（供Faithfulness核验）”，但`we/our`、品牌或产品线主体无法唯一归属的情况；处置必须带当前`30`的精确行号和逐字引文。“主体归属说明”、来源链接和管理元数据不算证据，当前`30`没有相关证据时不得使用该分类，应转MAT、ANM、CUS或公共知识缺口。两类分类都保留原Faithfulness的`unknown`，不把它改成支持。归组按一个可由同一组证据解决的稳定知识问题组织，Claim数量不设机械上限；同属“通用包装方法”不足以合组。真正缺证的行业常识、一般原理、选型、方法和运营判断仍须登记或复用公共缺口。
 
 公共缺口处置逐claim_id写入`scope_review`，解释它与该知识问题的关系；导入器校验映射完整性并拒绝把黄色/红色主张直接归到`已解决/已关闭`缺口。已解决仅覆盖对应RES与正式Claim的明确范围；新问题另建gap_key，同一问题新增未覆盖边界则明确重开为`部分解决`或`待外部调研`，保留已覆盖范围与重开理由。后续调研只有在剩余必要范围均被正式知识回答后才能标`已解决`。完整门禁见[治理协议](references/governance-detection-and-lifecycle.md)。
 
@@ -399,7 +407,7 @@ Faithfulness导入后的每项未覆盖事实，必须按[知识缺口与CUS/ANM
 - 初始化、重复与版本、压缩包、Office图片、音视频、MinerU和MAT：[source-index-and-materials.md](references/source-index-and-materials.md)
 - 文章检索、外部调研、文章前审核、Claim建立和本篇资料：[article-knowledge-workflow.md](references/article-knowledge-workflow.md)
 - 单篇写作就绪门禁：运行`scripts/issue_writing_ready.py --handoff-contract-version <当前合同版本> --project <Obsidian项目路径> --article-id <文章ID>`；项目级盘点仍可运行`scripts/advance_ready_tasks.py --project <Obsidian项目路径>`，但不得把其输出当作`writing_ready`；专项自测使用`--self-test`。
-- 外部调研证据获取、失败处理、来源冲突/时效、原文与核验记录、正式Claim沉淀门禁：[external-research-contract.md](references/external-research-contract.md)
+- 外部调研证据获取、失败处理、来源冲突/时效、原文与核验记录、正式Claim沉淀门禁：[external-research-contract.md](references/external-research-contract.md)；新建或复用RES时按GR-1固定关联表用`scripts/external_research_links.py`登记GAP、已回答/尚缺范围及Claim回链，覆盖页自动直达；完整覆盖才关闭缺口，历史命名保持兼容。
 - 标题/大纲覆盖、CUS与ANM主动检测、分类边界、固定落盘和完整生命周期：[governance-detection-and-lifecycle.md](references/governance-detection-and-lifecycle.md)
 - 目录、文件结构、Claim块和四类台账模板：[project-structure-and-templates.md](references/project-structure-and-templates.md)
 - 写作任务、`30`、终稿和Faithfulness三方输入输出及接入异常：[skill-integration-handoff.md](references/skill-integration-handoff.md)
@@ -417,3 +425,8 @@ Faithfulness导入后的每项未覆盖事实，必须按[知识缺口与CUS/ANM
 - 人工可读字段、同类事项归组、主表与详情边界：[human-readable-control-artifacts.md](references/human-readable-control-artifacts.md)
 - v0.4人工模板逐项保留、适配或废弃清单：[v04-template-inventory.md](references/v04-template-inventory.md)
 - 当前文章、正式知识、源资料变化、控制文件和机器数据的版本与归档：[version-and-archive-contract.md](references/version-and-archive-contract.md)
+
+
+## PR-1本轮知识准备执行
+
+新建和outline_refresh由10声明PR-1，15仅六个主节（固定检索层状态、大纲逐项检索与候选事实覆盖、候选事实处置明细、CUS / ANM来源核验记录、缺口与特殊资料处理、本轮知识准备结论），具体表头以project-structure-and-templates.md为准。官网主动发现并实际访问相关正文页，15官网子表保存逐字连续原文、精确位置、日期、最终URL和处置/未命中说明；不能只访问首页或复制无关凭证。来源凭证、CUS/ANM、MAT和特殊资料核验保持严格。20逐问题验证采用的CF/Claim及当前30/35，不以同主题冒充事实覆盖。零候选不编造CF，GAP无关联时五列写无；新建GAP只用auto，旧编号保持。outline_refresh独立完成当前检索和整包校验后才按需只读对照旧包：run_outline_refresh.py在已有运行JSON签发绑定当前需求及四文件哈希的许可，查看前核对comparison_permitted；变更后重新校验。正常流程不新增版本变化表，不把旧包作为本轮输入；内部模板不完整由知识库重建并继续原门禁。

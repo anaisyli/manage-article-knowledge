@@ -73,9 +73,9 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
       "group_id": "UG-001",
       "claim_ids": ["C001", "C002"],
       "topic": "可复用的知识问题或内容主题",
-      "category": "existing_gap | new_public_gap | cus | mat | anm | package_omission | writing_only",
+      "category": "existing_gap | new_public_gap | cus | mat | anm | package_omission | evidence_context_gap | writing_only",
       "classification_basis": "完成了哪些检测，为什么归到这里",
-      "issue_key": "gap_key、CUS/MAT/ANM ID；package_omission和writing_only写空字符串",
+      "issue_key": "gap_key、CUS/MAT/ANM ID；package_omission、evidence_context_gap和writing_only写空字符串",
       "status": "当前真实状态",
       "article_impact": "对本篇的影响",
       "handling": "已经完成或确定的处理",
@@ -103,7 +103,13 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
 
 `writing_only`还执行独立硬门禁：`contains_factual_judgment`和`reusable_across_articles`都必须为`false`，`knowledge_domains`必须恰好为`["none"]`，`why_not_knowledge_issue`必须具体说明其纯结构、过渡、CTA、修辞或一次性观点作用。任一claim含事实而同组另有纯写作内容时必须拆组。法规、标准、认证、安全、限值、检测有效性、采购选型或动态事实的实质判断禁止归为`writing_only`；导入器对judgments原文中的明显高风险信号再做一层拒绝检查。其他类别必须至少声明“含事实判断”或“可跨文章复用”，且`knowledge_domains`不能为`none`。
 
+`package_omission`的客户和公共知识都必须在`classification_basis`列出具体且存在的Formal Claim ID，并由Codex核对其完整语义覆盖；没有正式Claim、只有相近主题或仅覆盖部分关系时不能使用。归属检查与遗漏检查应先于新公共缺口登记，不依靠关键词批量分类。
+
+`evidence_context_gap`仅用于当前 `30` 已有真实证据正文、但主体或来源归属无法唯一确认的情况。每个 claim 必须带当前 `30` 证据正文的逐字 `quote`、有效行号和当前 `30` 文件路径；`主体归属说明`、来源链接或其他管理元数据不能满足该条件。没有当前 `30` 证据时必须改走 MAT、ANM、CUS 或公共知识缺口。该分类不会把原 `unknown` 改成 `supported`。
+
 新处置文件必须使用schema `1.1`。为兼容已经生成但尚未导入的旧结果，导入器只在schema `1.0`完全不含`writing_only`时接受；旧文件一旦使用`writing_only`就必须按`1.1`重新分类。
+
+处置分类或证据定位校验失败时，Codex应回读当前证据和正式知识，修正处置JSON后使用同一文章ID、版本和原审核结果重试导入；不能为通过校验编造引文、改动原判断或当前`30/40`，也不能把可以自行核对的分类工作交给人工。只有真实权限、身份冲突或不可替代材料/业务决定才按合同请求人工恢复。
 
 ## 6. Claim文章支撑映射
 
@@ -129,3 +135,24 @@ judgments中的claim_id，例如C001，是文章原子事实ID，不是正式知
 unsupported只表示给定知识上下文没有支持该文章事实。它可能来自知识缺口、写作者使用了未交接来源、范围扩张或评价限制，不能自动判定为假。导入前按[知识缺口与CUS/ANM检测协议](governance-detection-and-lifecycle.md)对全部unsupported claim_id做穷尽且互斥的归组：每个ID恰好进入一组，优先匹配文章前已有事项，再判断资料包覆盖遗漏、CUS、MAT、ANM、公共知识缺口或无需治理的写作内容。不得按原子事实逐条建缺口；公共问题写入唯一`10_知识缺口记录.csv`并按不同文章ID去重。核心章节指删去后文章标题、主问题或一级/二级主要章节无法完成；高风险公共事实指法规、标准、认证、安全、限值、检测有效性、采购选型或随地区、时间变化的事实。纯过渡、结构、CTA、修辞、不可复用观点或非事实写作通过`writing_only`硬门禁后只记录排除理由。一般原理、行业常识、技术解释、方法判断和采购建议只要可以判断真假或跨文章复用，就不是纯写作内容，必须进入公共知识缺口、资料包覆盖遗漏或其他适用治理类别。
 
 不得用终稿作为证据，也不得从终稿建立Claim。只有完成信号检测且理由明确时才建立后续：客户确认用CUS、复杂客户资料用MAT、冲突或危险范围扩张用ANM、公共事实先复查前五层再登记稳定`gap_key`。普通非关键公共问题首次仍为`观察中`；核心/高风险首次或第二篇不同文章重复时进入`待外部调研`。Faithfulness导入和登记完成后，新增`待外部调研`项进入独立知识维护队列；`观察中`不调研。`待外部调研`尚未有RES是正常状态，不能被报告为证据缺失、文章错误或导入失败；只有`部分解决`或`已解决`才必须关联RES。后续调研更新RES证据、正式公共Claim、缺口、覆盖视图、运行账本和`50`中的治理状态/回链；不得改变原Faithfulness判断、分数、哈希或当前`30/40`，也不自动改写文章。只有通过`writing_only`硬门禁的纯写作内容可以只记录排除理由。`50`必须逐组把分类、分类依据、关联事项/入口、当前处理和下一步拆列显示，不得把全部unsupported合并成默认“无后续动作”。
+
+
+### 审核过程记录限制（audit_process_limitation）
+
+逐条区分真实证据缺口、语义分歧与审核记录缺陷，不把unknown本身登记为ANM。schema 1.1可使用`audit_process_limitation`，该类别只保留黄色结果、说明记录限制，不签发事实支持，也不据此自动创建GAP/CUS/ANM。适用范围：两轮原始语义均为entailed，最终unknown，收敛原因仅为组件记录校验问题。首轮unknown、双轮分歧、真实missing、冲突或无来源一律不得使用此类别；混合组必须拆开。
+
+沿用处置group的全部固定字段及fact_check；追加固定模板：
+
+```json
+"process_review": {
+  "claim_records": {
+    "C001": {
+      "cause": "component_record_incomplete",
+      "validation_reasons": ["quantity_time_version未被证据覆盖"],
+      "source_review": "逐字定位当前允许证据和原两轮记录，说明哪一组件字段缺失；不声称本次已重新判绿。"
+    }
+  }
+}
+```
+
+claim_records须精确覆盖组内全部claim_id；validation_reasons必须逐字等于该主张reconciliation.reasons，且仅含记录校验原因。`issue_key`可空；已复现通用缺陷可链接已登记的SKFB，禁止沿用ANM/GAP作程序问题入口。`entry`定位当前版本judgments/review及具体claim；`handling`写明后续新版本复核、历史黄色和分数不变；`close_condition`区分程序修复与事实支持。源文实际异常仍走ANM，缺当前事实证据仍按原GAP/CUS/MAT/证据上下文规则处理。相同类别的人读解释写入标准50既有处置表，不新增项目说明页。

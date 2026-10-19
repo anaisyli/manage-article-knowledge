@@ -18,6 +18,7 @@ small atomic set only when the staged package is no worse than the original.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import tempfile
@@ -47,6 +48,7 @@ from validate_v06_project import (
     normalized_evidence_text,
 )
 from prewrite_governance import pending_details
+from evidence_identity import formal_context, render_context
 
 
 PACKAGE_FILES = (
@@ -66,6 +68,7 @@ class ClaimInfo:
     position: str
     original_lines: list[str]
     translation_lines: list[str]
+    identity_context: dict[str, str] | None = None
 
     @property
     def expected_lines(self) -> list[str]:
@@ -141,6 +144,7 @@ def _sync_metadata(task: Path) -> tuple[dict[str, str], list[tuple[str, str]]]:
         "文章ID": article_id,
         "文章版本": version,
         "模板版本": template,
+        "证据模板版本": parse_field(request, "证据模板版本"),
         "知识准备模式": parse_field(request, "任务模式"),
         "大纲ID": parse_field(request, "大纲ID"),
         "大纲版本": parse_field(request, "大纲版本"),
@@ -192,6 +196,7 @@ def _task_metadata(task: Path) -> dict[str, str]:
         "article_id": parse_field(request, "文章ID"),
         "version": _normalized_version(parse_field(request, "当前版本") or parse_field(request, "文章版本")) or "v1",
         "template": parse_field(request, "模板版本") or TEMPLATE_VERSION,
+        "evidence_template": parse_field(request, "证据模板版本"),
         "language": parse_field(request, "目标语言") or "English",
         "mode": parse_field(request, "任务模式") or "new_article",
         "outline_id": parse_field(request, "大纲ID") or "OUTLINE-UNKNOWN",
@@ -246,12 +251,17 @@ def _render_minimal_material(task: Path, project: Path, result: RecoveryResult) 
         return None
     blocks: list[str] = []
     for claim in claims:
+        if metadata["evidence_template"] == "EC-1" and not claim.identity_context:
+            result.unresolved.append(f"Formal Claim {claim.claim_id}缺少已核验EC-1归属；先回源核验补齐，不能猜主体重建30")
+            return None
         if not claim.expected_lines:
             result.unresolved.append(f"Formal Claim {claim.claim_id}没有可直接复用的连续证据，未重建30")
             continue
         blocks.append(
             f"### {claim.title}\n\n"
-            "##### 证据正文（供Faithfulness核验）\n\n"
+            + (render_context(claim.identity_context, 4) if claim.identity_context else "")
+            +
+            "#### 证据正文（供Faithfulness核验）\n\n"
             + "\n".join(f"> {line}" for line in claim.expected_lines)
         )
     if not blocks:
@@ -267,13 +277,30 @@ def _render_minimal_material(task: Path, project: Path, result: RecoveryResult) 
         (task / "10_文章知识需求.md").read_text(encoding="utf-8-sig")
         if (task / "10_文章知识需求.md").is_file() else ""
     ) or ["标题"]
+    retrieval_path = task / "15_检索与知识准备记录.md"
+    from preparation_record import validation_view
+    retrieval = validation_view(retrieval_path.read_text(encoding="utf-8-sig")) if retrieval_path.is_file() else ""
+    candidates = {row[0]: set(re.findall(r"CLM-[A-Za-z0-9-]+", row[4]))
+                  for row in table_rows(retrieval, "## 候选事实处置明细") if len(row) >= 5}
+    scoped: dict[str, set[str]] = {}
+    for row in table_rows(retrieval, "## 大纲逐项检索与候选事实覆盖"):
+        if len(row) >= 4:
+            scoped[row[0]] = {cid for cf in re.findall(r"CF-\d{3}", row[3]) for cid in candidates.get(cf, set())}
     outline_rows = "\n".join(
-        f"| {label} | " + (claims[0].title if claims else "无") + " | 仅围绕当前证据写作 |" for label in outline
+        f"| {label} | " + ("；".join(claim.title for claim in claims if claim.claim_id in scoped.get(label, set())) or "无")
+        + " | 仅围绕当前问题已核验的证据写作 |" for label in outline
     )
+    run_metadata = ""
+    if metadata["mode"] == "outline_refresh" and (task / "知识重整运行.json").is_file():
+        run = json.loads((task / "知识重整运行.json").read_text(encoding="utf-8-sig"))
+        run_metadata = f"- 本轮知识重整运行ID：{run.get('refresh_run_id', '')}\n"
     return (
         "# 本篇写作素材包\n\n"
         f"- 文章ID：{metadata['article_id']}\n- 文章版本：{metadata['version']}\n"
         f"- 模板版本：{metadata['template']}\n- 资料视图：写作素材包\n"
+        + run_metadata
+        + (f"- 证据模板版本：{metadata['evidence_template']}\n" if metadata['evidence_template'] else "")
+        +
         f"- 资料版本：{metadata['version']}\n- 生成日期：自动恢复\n"
         f"- 目标语言：{language}\n- 对应大纲：10_文章知识需求.md\n- 使用对象：本篇写作Skill\n\n"
         "## 一、可直接用于正文的事实\n\n" + "\n\n".join(blocks) + "\n\n"
@@ -285,6 +312,65 @@ def _render_minimal_material(task: Path, project: Path, result: RecoveryResult) 
         "## 六、缺少资料的章节及建议处理方式\n\n| 原大纲章节 | 建议处理 | 可保留的安全写作方向 |\n|---|---|---|\n"
         "| 无 | 无 | 仅使用已核验事实 |\n"
     )
+
+
+def _seed_index_from_batch(task: Path, project: Path, result: RecoveryResult) -> None:
+    """Bootstrap absent 30/35 from current, verified ledger and 15 mappings.
+
+    No archived package is opened. Missing retrieval/review decisions remain
+    unresolved; this only renders facts already persisted and checked.
+    """
+    if any((task / name).is_file() for name in ("30_本篇知识库资料.md", "35_写作素材来源索引.md")):
+        return
+    request = (task / "10_文章知识需求.md").read_text(encoding="utf-8-sig")
+    batch_id = parse_field(request, "批次ID")
+    retrieval_path = task / "15_检索与知识准备记录.md"
+    if not batch_id or batch_id == "不适用" or not retrieval_path.is_file():
+        return
+    from batch_knowledge_run import ledger_errors
+    from preparation_record import validation_view
+    from template_contract import validate_file
+    ledger = project / "04_文章任务/批次运行" / (re.sub(r"[^A-Za-z0-9_.-]+", "-", batch_id) + ".json")
+    if ledger_errors(ledger, batch_id, article_id=parse_field(request, "文章ID")) or validate_file(retrieval_path):
+        result.unresolved.append("首次生成30/35须先完成当前批次证据和15真实检索记录；未用恢复占位记录替代来源核验")
+        return
+    payload = json.loads(ledger.read_text(encoding="utf-8-sig"))
+    article_id = parse_field(request, "文章ID")
+    evidence = [row for row in payload.get("evidence", []) if article_id in row.get("article_ids", []) and row.get("disposition") == "本轮核验通过"]
+    claims = _claim_infos(project)
+    retrieval = validation_view(retrieval_path.read_text(encoding="utf-8-sig"))
+    candidates = {row[0]: set(re.findall(r"CLM-[A-Za-z0-9-]+", row[4]))
+                  for row in table_rows(retrieval, "## 候选事实处置明细") if len(row) >= 5}
+    matrix = table_rows(retrieval, "## 大纲逐项检索与候选事实覆盖")
+    valid_ids: set[str] = set()
+    rows: list[dict[str, str]] = []
+    for item in evidence:
+        claim = claims.get(item.get("claim_id", ""))
+        excerpt = str(item.get("verified_target_excerpt") or "")
+        quoted_excerpt = "\n".join("> " + line for line in excerpt.splitlines())
+        if not claim or normalized_evidence_text(quoted_excerpt) != claim.expected_text or claim.claim_id not in candidates.get(item.get("candidate_id", ""), set()):
+            result.unresolved.append(f"{item.get('candidate_id')}的本轮证据、15映射与Formal Claim完整正文尚未一致，未生成30/35")
+            return
+        valid_ids.add(claim.claim_id)
+        rows.append({"start": "1", "end": "1", "topic": claim.title, "claim_id": claim.claim_id,
+                     "title": claim.title, "path": f"[[{claim.path.relative_to(project).as_posix()}]]",
+                     "source": "；".join((claim.source, claim.position))})
+    required = outline_labels(request)
+    covered = {row[0] for row in matrix if len(row) >= 4 and
+               any(candidates.get(cf, set()) & valid_ids for cf in re.findall(r"CF-\d{3}", row[3]))}
+    if not rows or any(label not in covered for label in required):
+        result.unresolved.append("本轮批次证据尚未逐问题映射到15；缺口/部分覆盖由知识准备继续处理，不把全部Claim机械挂到所有大纲")
+        return
+    metadata = _task_metadata(task)
+    text = (f"# 写作素材来源索引\n\n- 文章ID：{article_id}\n- 文章版本：{metadata['version']}\n"
+            f"- 模板版本：{metadata['template']}\n- 索引版本：v1\n- 生成日期：自动恢复\n"
+            "- 对应写作素材：[[30_本篇知识库资料.md]]\n- 写作素材SHA-256：待计算\n"
+            "- 用途：内部来源映射，不交给写作Skill\n\n## 写作事实输入确认\n\n- 唯一事实输入：[[30_本篇知识库资料.md]]\n")
+    if metadata["mode"] == "outline_refresh":
+        run = json.loads((task / "知识重整运行.json").read_text(encoding="utf-8-sig"))
+        text = _replace_or_insert(text, "本轮知识重整运行ID", str(run.get("refresh_run_id", "")))[0]
+    _write_recovered_file(task / "35_写作素材来源索引.md", _replace_mapping_section(text, rows), result,
+                          "从当前批次已核验证据和15逐问题映射建立35，再生成30；未读取旧包")
 
 
 def _render_minimal_audit(task: Path, result: RecoveryResult) -> str:
@@ -344,6 +430,10 @@ def _rebuild_missing_package_files(task: Path, project: Path, result: RecoveryRe
     if not metadata["article_id"]:
         result.unresolved.append("10缺少文章ID，不能安全重建文章包")
         return
+    index_path = task / "35_写作素材来源索引.md"
+    seeded = not index_path.is_file()
+    _seed_index_from_batch(task, project, result)
+    seeded = seeded and index_path.is_file()
     retrieval = task / "15_检索与知识准备记录.md"
     if not retrieval.is_file():
         _write_recovered_file(
@@ -381,6 +471,16 @@ def _rebuild_missing_package_files(task: Path, project: Path, result: RecoveryRe
         material = _render_minimal_material(task, project, result)
         if material:
             _write_recovered_file(task / "30_本篇知识库资料.md", material, result, "缺少30，已从当前35映射的Formal Claim证据重建30")
+            if seeded:
+                # Replace temporary seed spans before the ordinary recovery
+                # pass, which deliberately preserves unmatched existing rows.
+                index_text = index_path.read_text(encoding="utf-8-sig")
+                seed_rows = _mapping_rows(index_text)
+                blocks = _evidence_blocks(material.splitlines())
+                if len(seed_rows) == len(blocks):
+                    for row, block in zip(seed_rows, blocks):
+                        row.update(start=str(block.start), end=str(block.end))
+                    index_path.write_text(_replace_mapping_section(index_text, seed_rows), encoding="utf-8")
     if not (task / "35_写作素材来源索引.md").is_file() and (task / "30_本篇知识库资料.md").is_file():
         # The normal material/index rebuild below will derive the exact ranges.
         result.actions.append("缺少35，待根据当前30证据行重建来源索引")
@@ -428,6 +528,7 @@ def _claim_infos(project: Path) -> dict[str, ClaimInfo]:
                 position=_claim_field(block, "精确位置"),
                 original_lines=_quoted_section(block, "最小原文证据"),
                 translation_lines=_quoted_section(block, "经核验英文严格翻译"),
+                identity_context=formal_context(block),
             )
     return claims
 
@@ -514,13 +615,13 @@ def _evidence_matches_claim(excerpt: str, claim: ClaimInfo) -> bool:
 def _table_rows_with_indexes(lines: list[str], heading: str, minimum_cells: int) -> list[tuple[int, list[str]]]:
     """Return data rows and their source indexes for one fixed Markdown table."""
     try:
-        start = next(index for index, line in enumerate(lines) if line.strip() == heading) + 1
+        start = next(index for index, line in enumerate(lines) if line.strip() in {heading, heading.replace("## ", "### ", 1)}) + 1
     except StopIteration:
         return []
     rows: list[tuple[int, list[str]]] = []
     for index in range(start, len(lines)):
         line = lines[index]
-        if line.startswith("## "):
+        if re.match(r"^#{2,3} ", line):
             break
         if not line.strip().startswith("|"):
             if rows:
@@ -738,6 +839,29 @@ def _rebuild_material_and_index(task: Path, project: Path, result: RecoveryResul
             unresolved_indexes.add(block_index)
             continue
         claim = claims[candidate_ids[0]]
+        request_path = task / "10_文章知识需求.md"
+        request_text = request_path.read_text(encoding="utf-8-sig") if request_path.is_file() else ""
+        if (parse_field(material_text, "证据模板版本") == "EC-1" or parse_field(request_text, "证据模板版本") == "EC-1") and not claim.identity_context:
+            result.unresolved.append(f"Formal Claim {claim.claim_id}缺少已核验EC-1归属；先回源核验补齐，未改写证据或猜主体")
+            unresolved_indexes.add(block_index)
+            continue
+        # Insert/update a context only from a persisted, verified Claim. Never
+        # infer a customer name from a URL or from the current article.
+        if claim.identity_context:
+            heading_index = block.quote_start - 2
+            while heading_index >= 0 and not re.match(r"^\s*#{3,6}\s+证据正文", original_lines[heading_index]):
+                heading_index -= 1
+            if heading_index >= 0:
+                level = 4
+                previous = heading_index - 1
+                while previous >= 0 and not re.match(r"^\s*#{1,6}\s+", original_lines[previous]):
+                    previous -= 1
+                context_text = render_context(claim.identity_context, level).rstrip().splitlines() + [""]
+                context_text.append("#### 证据正文（供Faithfulness核验）")
+                if previous >= 0 and "证据归属（仅用于指代解析）" in original_lines[previous]:
+                    replacements.append((previous + 1, heading_index + 1, context_text))
+                else:
+                    replacements.append((heading_index + 1, heading_index + 1, context_text))
         expected_lines = claim.expected_lines
         if not expected_lines:
             result.unresolved.append(f"Formal Claim {claim.claim_id}没有连续原文证据，无法自动重建30")
@@ -754,6 +878,7 @@ def _rebuild_material_and_index(task: Path, project: Path, result: RecoveryResul
         assignments.append((block_index, ClaimInfo(
             claim.claim_id, claim.path, topic, claim.source, claim.position,
             claim.original_lines, claim.translation_lines,
+            claim.identity_context,
         )))
 
     # A semantic blocker must not prevent routine repairs for the other blocks.
@@ -886,8 +1011,29 @@ def recover_task(task_dir: Path, *, max_passes: int = 2) -> RecoveryResult:
             _rebuild_missing_package_files(staged_task, staged_project, pass_result)
             _normalize_package_markdown(staged_task, pass_result)
             _repair_retrieval_provenance(staged_task, staged_project, pass_result)
+            from preparation_record import normalize
+            if normalize(staged_task):
+                pass_result.changed.append("15_检索与知识准备记录.md")
+                pass_result.actions.append("按PR-1合并本轮记录；未读取历史资料包")
             _rebuild_material_and_index(staged_task, staged_project, pass_result)
-            staged_errors = article_package_errors(staged_task)
+            from governance_source_check import original_sources
+            with original_sources(project):
+                staged_errors = article_package_errors(staged_task)
+                # Historical Claims may have valid evidence in their main
+                # text without the newer dedicated original-quote section.
+                # When every semantic/mapping gate already passes, updating
+                # the sole stale fingerprint does not require rewriting 30.
+                if staged_errors and all(error.startswith("35记录的30哈希不匹配") for error in staged_errors):
+                    index = staged_task / "35_写作素材来源索引.md"
+                    material = staged_task / "30_本篇知识库资料.md"
+                    text = index.read_text(encoding="utf-8-sig")
+                    updated, changed = _replace_or_insert(
+                        text, "写作素材SHA-256", hashlib.sha256(material.read_bytes()).hexdigest())
+                    if changed:
+                        index.write_text(updated, encoding="utf-8")
+                        pass_result.changed.append(index.name)
+                        pass_result.actions.append("30证据与35映射均已通过，仅同步35的当前30指纹")
+                        staged_errors = article_package_errors(staged_task)
             # Never commit a pass that introduces a new gate failure.  A pass
             # may leave an unresolved semantic blocker, but it must not make
             # the package less valid than the input.

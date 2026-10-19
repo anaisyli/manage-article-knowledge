@@ -148,6 +148,8 @@ def run_batch_validation(ledger: Path, batch_id: str, retry_limit: int) -> dict[
     attempts = 0
     output = ""
     last_error = ""
+    # Retrying unchanged validation data cannot repair it. Only transient IO
+    # failures are retried; semantic blockers produce one actionable receipt.
     while attempts <= max(0, retry_limit):
         attempts += 1
         try:
@@ -159,8 +161,12 @@ def run_batch_validation(ledger: Path, batch_id: str, retry_limit: int) -> dict[
             break
         except SystemExit as exc:
             last_error = str(exc)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            break
+        except OSError as exc:
             last_error = str(exc)
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+            break
     payload = parse_json(ledger)
     if payload is None:
         return {
@@ -174,13 +180,39 @@ def run_batch_validation(ledger: Path, batch_id: str, retry_limit: int) -> dict[
     # build() only raises on its own structural validation path.
     errors = batch_knowledge_run.ledger_errors(ledger, batch_id)
     return {
-        "ok": not errors,
+        "ok": not errors and not last_error,
         "attempts": attempts,
         "error": last_error,
         "errors": errors,
         "payload": payload,
         "output": output,
     }
+
+
+def sync_current_website_captures(project: Path, ledger: Path, batch_id: str) -> dict[str, Any]:
+    """Route current task capture manifests before validating the ledger.
+
+    Website capture is an input step, not a human handoff.  The synchronizer
+    is deliberately conservative: it promotes only an exact source plus
+    continuous excerpt match to an existing Claim and leaves ambiguous facts
+    in ``capture_inbox`` for normal Claim resolution.
+    """
+    import sync_website_evidence
+
+    try:
+        return sync_website_evidence.sync(project, batch_id, ledger)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "batch_id": batch_id,
+            "discovered": 0,
+            "promoted": 0,
+            "pending": 0,
+            "unchanged": 0,
+            "unresolved_count": 0,
+            "unresolved": [],
+            "errors": [f"官网凭证同步失败：{exc}"],
+            "ledger": str(ledger),
+        }
 
 
 def recover_and_gate(project: Path, task: Path, retry_limit: int) -> dict[str, Any]:
@@ -250,7 +282,6 @@ def advance_and_issue_ready(project: Path, articles: list[dict[str, Any]]) -> di
     from handoff_contract import current_version
     from issue_writing_ready import issue
 
-    outcome = advance_project_detailed(project)
     issued: list[dict[str, Any]] = []
     failures: list[str] = []
     article_ids = {
@@ -258,7 +289,13 @@ def advance_and_issue_ready(project: Path, articles: list[dict[str, Any]]) -> di
         for item in articles
         if isinstance(item, dict) and item.get("article_id")
     }
-    for task in outcome.get("moved", []):
+    outcome = advance_project_detailed(project, article_ids=article_ids)
+    # A previous call may have moved a task before issuing its permit. Resume
+    # both newly moved and already waiting tasks; moved_count=0 is not a gate.
+    tasks = [find_task(project, article_id) for article_id in sorted(article_ids)]
+    for task in tasks:
+        if task is None or task.parent.name != "20_等待终稿":
+            continue
         request = task / "10_文章知识需求.md"
         article_id = article_id_from_request(request)
         if article_ids and article_id not in article_ids:
@@ -331,6 +368,16 @@ def run_workflow(project: Path, batch_id: str, *, retry_limit: int = 2) -> dict[
         persist_receipt(state_path, receipt)
         return receipt
 
+    from batch_knowledge_run import current_binding_errors
+    binding_errors = current_binding_errors(ledger, payload)
+    if binding_errors:
+        receipt.update({"workflow_state": "identity_error", "errors": binding_errors,
+                        "next_action": "重放当前已提交的writing_request以完成批次登记及旧运行隔离；不得清空证据或手改运行ID"})
+        persist_receipt(state_path, receipt)
+        return receipt
+
+    capture_sync = sync_current_website_captures(project, ledger, batch_id)
+    receipt["capture_sync"] = capture_sync
     validation = run_batch_validation(ledger, batch_id, retry_limit)
     receipt["retry_count"] = int(validation.get("attempts", 0)) - 1
     receipt["batch"] = {
@@ -348,7 +395,23 @@ def run_workflow(project: Path, batch_id: str, *, retry_limit: int = 2) -> dict[
         return receipt
 
     evidence = validation.get("payload", payload).get("evidence", []) or []
-    if not evidence:
+    unresolved_captures = capture_sync.get("unresolved", [])
+    if capture_sync.get("errors"):
+        receipt.update({
+            "workflow_state": "source_collection",
+            "errors": list(dict.fromkeys(list(capture_sync["errors"]) + list(validation.get("errors", [])))),
+            "next_action": "修复当前批次官网凭证同步问题后重新运行本入口；不要把抓取成功当作证据已核验",
+        })
+    elif unresolved_captures:
+        receipt.update({
+            "workflow_state": "claim_resolution",
+            "errors": [
+                f"{row.get('article_id')} / {row.get('candidate_id')}：{row.get('reason', '候选事实尚未完成Claim闭环')}"
+                for row in unresolved_captures
+            ],
+            "next_action": "继续处理capture_inbox中的候选事实；可唯一确定的文章继续生成15/20/30/35，冲突或范围不明的事项保留文章级terminal=false",
+        })
+    elif not evidence:
         receipt.update({
             "workflow_state": "source_collection",
             "errors": ["批次账本尚未形成证据记录；不能生成30/35或进入写作"],
@@ -360,37 +423,40 @@ def run_workflow(project: Path, batch_id: str, *, retry_limit: int = 2) -> dict[
             "errors": list(validation["errors"]),
             "next_action": "按每条来源/Claim错误修复来源闭环，再重新运行本入口；不得把批次错误当作终点",
         })
-    else:
-        articles = payload.get("articles", [])
-        if not isinstance(articles, list):
-            articles = []
-        receipt["articles"] = [article_snapshot(project, item, retry_limit) for item in articles if isinstance(item, dict)]
-        blockers = [
-            error
-            for article in receipt["articles"]
-            for error in article.get("errors", [])
-        ]
-        if blockers:
-            receipt.update({
-                "workflow_state": "article_knowledge_preparation",
-                "errors": blockers,
-                "next_action": "按文章级回执逐篇继续生成或恢复15/20/30/35；一篇阻塞不停止其他文章",
-            })
-        else:
+    # Always evaluate independent articles. Global evidence_incomplete describes
+    # the batch; it is not a reason to withhold a ready article's permission.
+    if evidence:
+        from batch_knowledge_run import ledger_errors
+        articles = validation.get("payload", payload).get("articles", [])
+        snapshots: list[dict[str, Any]] = []
+        for item in articles if isinstance(articles, list) else []:
+            if not isinstance(item, dict):
+                continue
+            article_id = str(item.get("article_id", ""))
+            source_errors = ledger_errors(ledger, batch_id, article_id=article_id)
+            if source_errors:
+                snapshots.append({"article_id": article_id, "state": "claim_resolution", "terminal": False,
+                                  "errors": source_errors, "next_action": "只处理本篇未闭环候选或来源；已读取的当前来源不重复抓取"})
+            else:
+                snapshots.append(article_snapshot(project, item, retry_limit))
+        receipt["articles"] = snapshots
+        ready = [item for item in snapshots if not item.get("errors")]
+        blockers = [error for item in snapshots for error in item.get("errors", [])]
+        if ready:
             try:
-                handoff = advance_and_issue_ready(project, receipt["articles"])
+                handoff = advance_and_issue_ready(project, ready)
             except (OSError, ValueError, RuntimeError) as exc:
                 handoff = {"moved": [], "blocked": [], "issued": [], "errors": [str(exc)]}
             receipt["handoff"] = handoff
-            if handoff["errors"] or handoff["blocked"]:
+            if handoff["errors"] or handoff["blocked"] or blockers:
                 receipt.update({
-                    "workflow_state": "writing_ready_pending",
-                    "errors": list(handoff["errors"]) + [
+                    "workflow_state": "partial_writing_ready" if handoff["issued"] else "article_knowledge_preparation",
+                    "errors": blockers + list(handoff["errors"]) + [
                         error
                         for item in handoff["blocked"]
                         for error in item["errors"]
                     ],
-                    "next_action": "按文章级writing_gate_result.json继续恢复；只有writing_gate_status=ready才交给写作Skill",
+                    "next_action": "已签发许可的文章交给写作Skill；其余逐篇按回执继续补齐，不重建已通过文章",
                 })
             elif handoff["issued"] or handoff["moved"]:
                 receipt.update({
@@ -404,6 +470,19 @@ def run_workflow(project: Path, batch_id: str, *, retry_limit: int = 2) -> dict[
                     "errors": [],
                     "next_action": "没有可迁移文章；读取当前文章级回执并继续知识准备，不得以moved_count=0结束",
                 })
+        else:
+            receipt.update({"workflow_state": "article_knowledge_preparation", "errors": blockers,
+                            "next_action": "按文章级回执处理具体未完成项；来源/Claim未变化时不要重复抓取和反复运行同一校验"})
+    receipt["pending_steps"] = [
+        {"article_id": item.get("article_id"), "state": item.get("state"), "errors": item.get("errors"), "next_action": item.get("next_action")}
+        for item in receipt["articles"] if item.get("errors")
+    ]
+    if not evidence:
+        receipt["pending_steps"] = [
+            {"article_id": item.get("article_id"), "state": "source_collection", "errors": [],
+             "next_action": "按当前10的大纲继续本轮六层检索，实际访问来源并立即保存当前运行凭证；核验候选及Formal Claim后重跑本入口"}
+            for item in payload.get("articles", []) if isinstance(item, dict)
+        ]
     persist_receipt(state_path, receipt)
     return receipt
 

@@ -47,7 +47,22 @@ class RuntimeDebugTests(unittest.TestCase):
                 result = json.loads((task / 'writing_gate_result.json').read_text(encoding='utf-8'))
                 self.assertEqual(result['writing_gate_status'], 'blocked')
                 self.assertIs(result['terminal'], False)
+                self.assertFalse(receipt.exists(), 'blocked must revoke an older matching permission')
                 formal.write_bytes(original)
+                self.assertEqual(issue_writing_ready.issue(args), 0)
+                material = task / '30_本篇知识库资料.md'
+                material.write_text(material.read_text(encoding='utf-8') + '\n', encoding='utf-8')
+                # Deterministic 35/hash drift recovers and reissues permission.
+                self.assertEqual(issue_writing_ready.issue(args), 0,
+                                 (task / 'writing_gate_result.json').read_text(encoding='utf-8'))
+                recovered = json.loads(receipt.read_text(encoding='utf-8'))
+                self.assertEqual(recovered['knowledge_sha256'], issue_writing_ready.sha256(material))
+                (task / '40_最终文章.md').write_text('# 已写终稿\n', encoding='utf-8')
+                material.write_text(material.read_text(encoding='utf-8') + '\nchanged\n', encoding='utf-8')
+                self.assertEqual(issue_writing_ready.issue(args), 2)
+                self.assertFalse(receipt.exists())
+                result = json.loads((task / 'writing_gate_result.json').read_text(encoding='utf-8'))
+                self.assertTrue(any('已有终稿' in e for e in result['blocked_reasons']))
             checked.append(True)
             return moved
 

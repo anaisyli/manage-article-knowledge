@@ -94,6 +94,8 @@ Faithfulness 结果采用审核 Skill 的协议 2.0：两轮独立阅读全文�
 
 ## 常用机器入口
 
+以下路径相对于活动包 `manage-article-knowledge-v0.6.1/`；运行脚本前先进入该目录。仓库级回归在仓库根目录运行 `python -m unittest discover -s tests`，活动包内回归运行 `python -m unittest discover -s manage-article-knowledge-v0.6.1/tests`。
+
 - `scripts/discover_workspace.py`：只读盘点待接入项目。
 - `scripts/onboard_workspace.py`：按已确认范围批量初始化和接入项目。
 - `scripts/writing_bridge.py`：写作 Skill 的 `prepare` / `finalize` 交接桥。
@@ -112,12 +114,12 @@ Faithfulness 结果采用审核 Skill 的协议 2.0：两轮独立阅读全文�
 
 ## 入口文件
 
-- [v0.6 Skill](manage-article-knowledge-v0.6/SKILL.md)
-- [内容运营操作手册](manage-article-knowledge-v0.6/references/operator-guide.md)
-- [文章知识工作流](manage-article-knowledge-v0.6/references/article-knowledge-workflow.md)
-- [项目结构与模板](manage-article-knowledge-v0.6/references/project-structure-and-templates.md)
-- [三方交接规范](manage-article-knowledge-v0.6/references/skill-integration-handoff.md)
-- [机器交接合同](manage-article-knowledge-v0.6/references/handoff-contract.json)
-- [Faithfulness 结果交接规范](manage-article-knowledge-v0.6/references/faithfulness-result-contract.md)
-- [版本与归档合同](manage-article-knowledge-v0.6/references/version-and-archive-contract.md)
-- [v0.6 更新记录](changelog/企业知识库Skill_v0.6版本说明与更新记录.md)
+- [v0.6.1 Skill](manage-article-knowledge-v0.6.1/SKILL.md)
+- [内容运营操作手册](manage-article-knowledge-v0.6.1/references/operator-guide.md)
+- [文章知识工作流](manage-article-knowledge-v0.6.1/references/article-knowledge-workflow.md)
+- [项目结构与模板](manage-article-knowledge-v0.6.1/references/project-structure-and-templates.md)
+- [三方交接规范](manage-article-knowledge-v0.6.1/references/skill-integration-handoff.md)
+- [机器交接合同](manage-article-knowledge-v0.6.1/references/handoff-contract.json)
+- [Faithfulness 结果交接规范](manage-article-knowledge-v0.6.1/references/faithfulness-result-contract.md)
+- [版本与归档合同](manage-article-knowledge-v0.6.1/references/version-and-archive-contract.md)
+- [v0.6.1 更新记录](changelog/企业知识库Skill_v0.6.1版本说明与更新记录.md)

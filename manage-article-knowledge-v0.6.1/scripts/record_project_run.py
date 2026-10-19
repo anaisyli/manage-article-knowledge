@@ -39,6 +39,9 @@ REQUIRED_FIELDS = {
     "usage",
 }
 ALLOWED_STATUS = {"success", "partial", "failed", "blocked"}
+# Schema-1 ledgers previously used this spelling. It is a read-only alias:
+# new records and append_record still require the canonical ALLOWED_STATUS.
+LEGACY_STATUS_ALIASES = {"partial_success": "partial"}
 
 
 def now_iso() -> str:
@@ -155,13 +158,16 @@ def make_record(
     }
 
 
-def validate_record(record: dict) -> None:
+def validate_record(record: dict, *, allow_legacy_status: bool = False) -> None:
     missing = sorted(REQUIRED_FIELDS - set(record))
     if missing:
         raise ValueError("run record missing fields: " + ", ".join(missing))
     if record["schema_version"] != 1:
         raise ValueError("unsupported run ledger schema_version")
-    if record["status"] not in ALLOWED_STATUS:
+    status = record["status"]
+    if allow_legacy_status:
+        status = LEGACY_STATUS_ALIASES.get(status, status)
+    if status not in ALLOWED_STATUS:
         raise ValueError("invalid run status")
     if not isinstance(record["human_intervention"], dict):
         raise ValueError("human_intervention must be an object")
@@ -238,7 +244,7 @@ def validate_ledger(path: Path) -> list[str]:
                 record = json.loads(raw_line)
                 if not isinstance(record, dict):
                     raise ValueError("record must be an object")
-                validate_record(record)
+                validate_record(record, allow_legacy_status=True)
                 run_id = str(record["run_id"])
                 if run_id in seen:
                     raise ValueError(f"duplicate run_id: {run_id}")

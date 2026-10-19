@@ -77,8 +77,8 @@ def delivery_blockers(task_dir: Path) -> list[str]:
                 members = {str(row.get("article_id")) for row in batch.get("articles", [])}
                 if article_id not in members:
                     errors.append(f"文章未登记在批次账本：{batch_id}")
-                if batch.get("status") != "evidence_ready":
-                    errors.append(f"批次证据尚未审核通过：{batch_id}")
+                # The shared article gate below checks this article's evidence
+                # closure. Another article's unresolved capture must not stop it.
     if knowledge_mode in {"new_article", "outline_refresh"}:
         # Both a new article and a fixed-outline rewrite must prove that the
         # website was checked per outline question.  A single homepage row is
@@ -126,7 +126,7 @@ def delivery_blockers(task_dir: Path) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
-def advance_project_detailed(project: Path, *, updated: str | None = None) -> dict[str, object]:
+def advance_project_detailed(project: Path, *, updated: str | None = None, article_ids: set[str] | None = None) -> dict[str, object]:
     project = project.resolve()
     source_root = project / "04_文章任务/10_进行中"
     if not source_root.is_dir():
@@ -137,6 +137,8 @@ def advance_project_detailed(project: Path, *, updated: str | None = None) -> di
     updated = updated or date.today().isoformat()
     for task_dir in sorted(path for path in source_root.iterdir() if path.is_dir()):
         request = task_dir / "10_文章知识需求.md"
+        if article_ids is not None and (not request.is_file() or parse_field(request.read_text(encoding="utf-8-sig"), "文章ID") not in article_ids):
+            continue
         reasons = delivery_blockers(task_dir)
         if reasons:
             blocked.append((task_dir, reasons))

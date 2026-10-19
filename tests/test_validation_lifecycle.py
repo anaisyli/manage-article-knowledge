@@ -13,9 +13,81 @@ sys.path.insert(0, str(SCRIPTS))
 
 import validate_v06_project as validator  # noqa: E402
 import import_faithfulness as faithfulness_importer  # noqa: E402
+import template_contract  # noqa: E402
+from article_state import article_package_errors, retrieval_claim_source_errors  # noqa: E402
+from recover_article_package import recover_task  # noqa: E402
 
 
 class ValidationLifecycleTests(unittest.TestCase):
+    def _write_retrieval_source_chain_fixture(self, root: Path, *, candidate_source: str, claim_source: str, claim_id: str = "CLM-WEB-001") -> Path:
+        task = root / "04_文章任务/10_进行中/ART-001_Web"
+        task.mkdir(parents=True)
+        formal = root / "03_正式知识/10_客户知识/20_产品介绍/formal.md"
+        formal.parent.mkdir(parents=True)
+        formal.write_text(
+            "# Formal\n\n- Claim ID：" + claim_id + "\n"
+            "- 来源链接：" + claim_source + "\n"
+            "- 精确位置：正文第1段\n\n"
+            "### 最小原文证据\n> Web evidence text.\n",
+            encoding="utf-8-sig",
+        )
+        (task / "15_检索与知识准备记录.md").write_text(
+            "## 官网正文核验\n\n"
+            "| 大纲章节/知识问题 | 页面名称与最终具体URL | 获取日期 | 正文位置 | 最小连续原文 | 候选事实ID或未命中 | 处置结果 |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| 标题 | Web page；https://example.test/page | 2026-09-29 | 正文第1段 | Web evidence text. | CF-001 | 已读取并复用Formal Claim |\n\n"
+            "## 候选事实处置明细\n\n"
+            "| 候选事实ID | 独立事实摘要 | 来源与精确位置 | 处置结果 | Formal Claim或排除/治理入口 |\n"
+            "|---|---|---|---|---|\n"
+            f"| CF-001 | 网页事实 | {candidate_source} | 复用已有Formal Claim | {claim_id} |\n",
+            encoding="utf-8-sig",
+        )
+        return task
+
+    def test_website_candidate_requires_same_claim_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            task = self._write_retrieval_source_chain_fixture(
+                Path(temp),
+                candidate_source="D:/customer/catalog.pdf 第1页",
+                claim_source="D:/customer/catalog.pdf",
+            )
+            errors = retrieval_claim_source_errors(task)
+            self.assertTrue(any("来源未绑定同一URL" in item for item in errors))
+            self.assertTrue(any("来源不一致" in item for item in errors))
+
+    def test_website_candidate_same_url_chain_can_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            task = self._write_retrieval_source_chain_fixture(
+                Path(temp),
+                candidate_source="https://example.test/page 正文第1段",
+                claim_source="https://example.test/page",
+            )
+            self.assertEqual(retrieval_claim_source_errors(task), [])
+
+    def test_completed_legacy_task_uses_identity_compatibility_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            task = Path(temp) / "ART-001_Legacy"
+            task.mkdir()
+            (task / "10_文章知识需求.md").write_text("# 文章知识需求\n\n- 文章ID：ART-001\n", encoding="utf-8-sig")
+            (task / "15_检索与知识准备记录.md").write_text("# 旧版记录\n", encoding="utf-8-sig")
+            (task / "40_最终文章.md").write_text(
+                "# 旧版终稿\n\n<!-- ARTICLE_BODY_START -->\n正文\n<!-- ARTICLE_BODY_END -->\n",
+                encoding="utf-8-sig",
+            )
+            errors = template_contract.validate_completed_task_compatibility(task)
+            self.assertEqual(errors, [])
+
+    def test_completed_legacy_task_still_rejects_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            task = Path(temp) / "ART-001_Legacy"
+            task.mkdir()
+            (task / "10_文章知识需求.md").write_text("# 文章知识需求\n\n- 文章ID：ART-001\n", encoding="utf-8-sig")
+            (task / "40_最终文章.md").write_text(
+                "# 旧版终稿\n\n- 文章ID：ART-002\n\n<!-- ARTICLE_BODY_START -->\n正文\n<!-- ARTICLE_BODY_END -->\n",
+                encoding="utf-8-sig",
+            )
+            errors = template_contract.validate_completed_task_compatibility(task)
+            self.assertTrue(any("文章ID不一致" in item for item in errors))
     def write_gap(self, root: Path, *, status: str, related: str = "无") -> Path:
         path = root / "gaps.csv"
         row = dict.fromkeys(validator.KNOWLEDGE_GAP_FIELDS, "")
@@ -129,6 +201,312 @@ class ValidationLifecycleTests(unittest.TestCase):
             warnings: list[str] = []
             validator.validate_claims(root, errors, warnings)
             self.assertFalse(any("英文严格翻译" in item for item in errors))
+
+    def _write_package_fixture(
+        self,
+        root: Path,
+        *,
+        theme_key: str = "product:cosmetic-rigid-paper-box",
+        request_object: str = "纸质化妆品外盒，用于多 SKU 美妆系列",
+        claim_evidence: str = "Application Cosmetic Packaging.",
+        material_evidence: str = "Application Cosmetic Packaging.",
+        claim_id: str = "CLM-TEST-001",
+    ) -> Path:
+        task = root / "04_文章任务/10_进行中/ART-001_Cosmetic"
+        task.mkdir(parents=True)
+        formal = root / "03_正式知识/10_客户知识/20_产品介绍/formal.md"
+        formal.parent.mkdir(parents=True)
+        formal.write_text(
+            f"# Formal\n\n- 稳定实体/主题键：{theme_key}\n\n"
+            f"### {claim_id}｜测试\n\n{self.claim_block(claim_id, claim_evidence)}",
+            encoding="utf-8-sig",
+        )
+        (task / "10_文章知识需求.md").write_text(
+            "# 文章知识需求\n\n- 标题：Cosmetic Box Design\n"
+            f"- 产品或内容对象：{request_object}\n- 选题方向：多 SKU 系列包装\n",
+            encoding="utf-8-sig",
+        )
+        material = (
+            "# 本篇写作素材包\n\n- 文章ID：ART-001\n- 文章版本：v1\n"
+            "- 资料视图：写作素材包\n- 资料版本：v1\n- 生成日期：2026-09-28\n"
+            "- 目标语言：English\n- 对应大纲：[[10_文章知识需求.md#大纲]]\n"
+            "- 使用对象：写作流程\n\n## 一、可直接用于正文的事实\n\n"
+            "### 测试事实\n\n##### 证据正文（供Faithfulness核验）\n\n"
+            f"> {material_evidence}\n\n## 二、可直接采用的英文表达\n\n无\n\n"
+            "## 三、可使用的数据表\n\n无\n\n## 四、按大纲使用\n\n无\n\n"
+            "## 五、仅供生成控制（不得写入正文）\n\n无\n\n"
+            "## 六、缺少资料的章节及建议处理方式\n\n无\n"
+        )
+        material_path = task / "30_本篇知识库资料.md"
+        material_path.write_text(material, encoding="utf-8-sig")
+        evidence_line = next(
+            index for index, line in enumerate(material.splitlines(), 1) if line.startswith("> ")
+        )
+        audit = (
+            "# 写作素材来源索引\n\n- 文章ID：ART-001\n- 文章版本：v1\n"
+            "- 索引版本：v1\n- 生成日期：2026-09-28\n"
+            "- 对应写作素材：[[30_本篇知识库资料.md]]\n"
+            f"- 写作素材SHA-256：{validator.sha256_file(material_path)}\n- 用途：内部追溯\n\n"
+            "## 写作素材到正式知识映射\n\n"
+            "| 证据正文行开始 | 证据正文行结束 | 素材主题 | 正式Claim ID | Claim通俗标题 | 正式知识文件 | 原始来源与精确位置 |\n"
+            "|---:|---:|---|---|---|---|---|\n"
+            f"| {evidence_line} | {evidence_line} | 测试 | {claim_id} | 测试 | [[03_正式知识/10_客户知识/20_产品介绍/formal.md]] | 测试 |\n\n"
+            "## 写作事实输入确认\n\n- 唯一事实输入：[[30_本篇知识库资料.md]]\n"
+        )
+        (task / "35_写作素材来源索引.md").write_text(audit, encoding="utf-8-sig")
+        return task
+
+    def test_article_package_rejects_mismatched_product_theme(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_package_fixture(
+                root,
+                theme_key="product:packaging-applications-watch",
+                claim_evidence="Watch Packaging.",
+                material_evidence="Watch Packaging.",
+            )
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+            self.assertTrue(any("主题不匹配" in item for item in errors))
+
+    def test_article_package_allows_mixed_application_claim_for_listed_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_package_fixture(
+                root,
+                theme_key="product:packaging-applications-watch",
+                claim_evidence="Watch Packaging. Cosmetic Packaging. Food Packaging.",
+                material_evidence="Watch Packaging. Cosmetic Packaging. Food Packaging.",
+            )
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+            self.assertFalse(any("主题不匹配" in item for item in errors))
+
+    def test_service_theme_is_product_agnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(
+                root,
+                theme_key="service:custom-packaging",
+                claim_evidence="Custom packaging services.",
+                material_evidence="Custom packaging services.",
+            )
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+            self.assertFalse(any("主题不匹配" in item for item in errors))
+
+    def test_article_package_rejects_chinese_in_english_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_package_fixture(
+                root,
+                claim_evidence="Application Cosmetic Packaging.",
+                material_evidence="Application类别原文：Application Cosmetic Packaging.",
+            )
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+            self.assertTrue(any("英文30证据正文不得包含中文" in item for item in errors))
+
+    def test_article_package_requires_complete_formal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_package_fixture(
+                root,
+                claim_evidence="First sentence. Second sentence.",
+                material_evidence="First sentence.",
+            )
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+            self.assertTrue(any("未完整复用Claim" in item for item in errors))
+
+    def test_imported_completed_package_keeps_its_historical_claim_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(
+                root,
+                claim_evidence="First sentence. Second sentence.",
+                material_evidence="First sentence.",
+            )
+            completed = root / "04_文章任务/40_已完成/ART-001_Cosmetic"
+            completed.parent.mkdir(parents=True)
+            task.rename(completed)
+            (completed / "40_最终文章.md").write_text(
+                "# Final article\n\n- 文章ID：ART-001\n- 文章版本：v1\n",
+                encoding="utf-8-sig",
+            )
+            (completed / "50_文章知识使用与Faithfulness记录.md").write_text(
+                "# Faithfulness record\n\n- 文章ID：ART-001\n- 文章版本：v1\n"
+                "- 当前状态：已导入，存在待处理事项\n",
+                encoding="utf-8-sig",
+            )
+
+            errors: list[str] = []
+            warnings: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, warnings)
+
+            self.assertFalse(any("未完整复用Claim" in item for item in errors))
+            self.assertTrue(any("已完成文章的历史30/35与当前Formal Claim证据文本不同" in item for item in warnings))
+
+    def test_completed_folder_without_imported_record_still_requires_current_claim_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(
+                root,
+                claim_evidence="First sentence. Second sentence.",
+                material_evidence="First sentence.",
+            )
+            completed = root / "04_文章任务/40_已完成/ART-001_Cosmetic"
+            completed.parent.mkdir(parents=True)
+            task.rename(completed)
+            (completed / "40_最终文章.md").write_text(
+                "# Final article\n\n- 文章ID：ART-001\n- 文章版本：v1\n",
+                encoding="utf-8-sig",
+            )
+
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+
+            self.assertTrue(any("未完整复用Claim" in item for item in errors))
+
+    def test_writing_ready_gate_rejects_the_same_package_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(
+                root,
+                theme_key="product:packaging-applications-watch",
+                claim_evidence="Watch Packaging.",
+                material_evidence="Application类别原文：Watch Packaging.",
+            )
+            (task / "20_文章前知识审核.md").write_text(
+                "# 文章前知识审核\n\n- 可用Claim数：1\n", encoding="utf-8-sig"
+            )
+            errors = article_package_errors(task)
+            self.assertTrue(any("主题不匹配" in item for item in errors))
+            self.assertTrue(any("中文管理说明" in item for item in errors))
+
+    def test_recovery_repairs_evidence_mapping_hash_and_claim_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(root)
+            (task / "20_文章前知识审核.md").write_text(
+                "# 文章前知识审核\n\n- 可用Claim数：0\n", encoding="utf-8-sig"
+            )
+            material = task / "30_本篇知识库资料.md"
+            material.write_text(
+                material.read_text(encoding="utf-8-sig").replace(
+                    "> Application Cosmetic Packaging.",
+                    "Application Cosmetic Packaging.",
+                ),
+                encoding="utf-8-sig",
+            )
+            index = task / "35_写作素材来源索引.md"
+            index.write_text(
+                index.read_text(encoding="utf-8-sig").replace(
+                    "写作素材SHA-256：", "写作素材SHA-256：wrong-"
+                ),
+                encoding="utf-8-sig",
+            )
+            result = recover_task(task)
+            self.assertTrue(result.changed_any)
+            self.assertFalse(any("35记录的30哈希不匹配" in item for item in result.after_errors))
+            self.assertFalse(any("30证据正文未逐字" in item for item in result.after_errors))
+            self.assertFalse(any("20与35的可用Claim数不一致" in item for item in result.after_errors))
+            self.assertIn("> Application Cosmetic Packaging.", material.read_text(encoding="utf-8-sig"))
+            self.assertIn("- 可用Claim数：1", (task / "20_文章前知识审核.md").read_text(encoding="utf-8-sig"))
+            self.assertNotIn("wrong-", index.read_text(encoding="utf-8-sig"))
+
+    def test_recovery_repairs_unique_website_claim_source_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = root / "04_文章任务/10_进行中/ART-001_Web"
+            task.mkdir(parents=True)
+            formal = root / "03_正式知识/10_客户知识/20_产品介绍/formal.md"
+            formal.parent.mkdir(parents=True)
+            formal.write_text(
+                "# Formal\n\n### CLM-WEB-001｜网页事实\n\n"
+                "- Claim ID：CLM-WEB-001\n"
+                "- Claim：网页事实\n"
+                "- 来源链接：https://example.test/page\n"
+                "- 精确位置：正文第1段\n\n"
+                "### 最小原文证据\n> Web evidence text.\n",
+                encoding="utf-8-sig",
+            )
+            (task / "10_文章知识需求.md").write_text(
+                "# 文章知识需求\n\n- 文章ID：ART-001\n- 当前版本：v1\n",
+                encoding="utf-8-sig",
+            )
+            (task / "15_检索与知识准备记录.md").write_text(
+                "## 官网正文核验\n\n"
+                "| 大纲章节/知识问题 | 页面名称与最终具体URL | 获取日期 | 正文位置 | 最小连续原文 | 候选事实ID或未命中 | 处置结果 |\n"
+                "|---|---|---|---|---|---|---|\n"
+                "| 网页事实 | Web page；https://example.test/page | 2026-09-29 | 正文第1段 | Web evidence text. | CF-001 | 已读取 |\n\n"
+                "## 候选事实处置明细\n\n"
+                "| 候选事实ID | 独立事实摘要 | 来源与精确位置 | 处置结果 | Formal Claim或排除/治理入口 |\n"
+                "|---|---|---|---|---|\n"
+                "| CF-001 | 网页事实 | 旧来源记录 | 复用已有Formal Claim | CLM-WEB-001 |\n",
+                encoding="utf-8-sig",
+            )
+            material = task / "30_本篇知识库资料.md"
+            material.write_text(
+                "# 本篇写作素材包\n\n- 文章ID：ART-001\n- 文章版本：v1\n"
+                "- 资料视图：写作素材包\n- 资料版本：v1\n- 生成日期：2026-09-29\n"
+                "- 目标语言：English\n- 对应大纲：[[10_文章知识需求.md]]\n- 使用对象：写作流程\n\n"
+                "## 一、可直接用于正文的事实\n\n### 网页事实\n\n"
+                "##### 证据正文（供Faithfulness核验）\n\n> Web evidence text.\n\n"
+                "- 来源与精确位置：https://example.test/page 正文第1段\n\n"
+                "## 二、可直接采用的英文表达\n\n无\n\n## 三、可使用的数据表\n\n无\n\n"
+                "## 四、按大纲使用\n\n无\n\n## 五、仅供生成控制（不得写入正文）\n\n无\n\n"
+                "## 六、缺少资料的章节及建议处理方式\n\n无\n",
+                encoding="utf-8-sig",
+            )
+            material_line = next(
+                index for index, line in enumerate(material.read_text(encoding="utf-8-sig").splitlines(), 1)
+                if line.startswith("> Web evidence text.")
+            )
+            (task / "35_写作素材来源索引.md").write_text(
+                "# 写作素材来源索引\n\n- 文章ID：ART-001\n- 文章版本：v1\n"
+                "- 索引版本：v1\n- 生成日期：2026-09-29\n- 对应写作素材：[[30_本篇知识库资料.md]]\n"
+                "- 写作素材SHA-256：wrong\n- 用途：内部追溯\n\n## 写作素材到正式知识映射\n\n"
+                "| 证据正文行开始 | 证据正文行结束 | 素材主题 | 正式Claim ID | Claim通俗标题 | 正式知识文件 | 原始来源与精确位置 |\n"
+                "|---:|---:|---|---|---|---|---|\n"
+                f"| {material_line} | {material_line} | 网页事实 | CLM-WEB-001 | 网页事实 | [[03_正式知识/10_客户知识/20_产品介绍/formal.md]] | https://example.test/page |\n\n"
+                "## 写作事实输入确认\n\n- 唯一事实输入：[[30_本篇知识库资料.md]]\n",
+                encoding="utf-8-sig",
+            )
+
+            result = recover_task(task)
+            self.assertIn("15_检索与知识准备记录.md", result.changed)
+            retrieval = (task / "15_检索与知识准备记录.md").read_text(encoding="utf-8-sig")
+            self.assertIn("https://example.test/page；正文第1段", retrieval)
+
+    def test_recovery_keeps_ambiguous_claim_block_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(root)
+            (task / "20_文章前知识审核.md").write_text(
+                "# 文章前知识审核\n\n- 可用Claim数：1\n", encoding="utf-8-sig"
+            )
+            formal = root / "03_正式知识/10_客户知识/20_产品介绍/second.md"
+            formal.write_text(
+                "# Second\n\n### CLM-TEST-002｜测试\n\n"
+                + self.claim_block("CLM-TEST-002", "Application Cosmetic Packaging."),
+                encoding="utf-8-sig",
+            )
+            material = task / "30_本篇知识库资料.md"
+            material.write_text(
+                material.read_text(encoding="utf-8-sig").replace(
+                    "> Application Cosmetic Packaging.",
+                    "Application Cosmetic Packaging.",
+                ),
+                encoding="utf-8-sig",
+            )
+            result = recover_task(task)
+            # v0.6.1 may repair deterministic metadata/hash/mapping fields while
+            # preserving the unresolved semantic Claim ambiguity.
+            self.assertTrue(result.changed_any)
+            self.assertTrue(any("无法唯一对应Formal Claim" in item for item in result.unresolved))
+            self.assertTrue(result.after_errors)
+            self.assertNotIn("> Application Cosmetic Packaging.", material.read_text(encoding="utf-8-sig"))
 
     def test_unused_legacy_external_claim_is_migration_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

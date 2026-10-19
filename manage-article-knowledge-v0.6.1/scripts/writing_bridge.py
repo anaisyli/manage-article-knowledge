@@ -391,7 +391,7 @@ def register_batch_request(project: Path, batch_id: str, request: dict[str, obje
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", batch_id.strip())
     path = batch_root / f"{safe_id}.json"
     if path.exists():
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     else:
         payload = {
             "schema": "MAK-BATCH-1.0", "batch_id": batch_id.strip(),
@@ -400,6 +400,14 @@ def register_batch_request(project: Path, batch_id: str, request: dict[str, obje
         }
     if payload.get("batch_id") != batch_id.strip():
         raise ValueError("已有批次账本的batch_id不匹配")
+    # A revision is registered only from the committed task, not a guessed CSV
+    # version or a caller-supplied replacement run ID. Pure legacy members stay
+    # readable, but cannot overwrite a modern task with an older identity.
+    task = current_task(project, str(request.get("article_id", "")))
+    from sync_website_evidence import current_run
+    current_run(task, request, batch_id.strip())
+    from batch_revision import retire_previous_run
+    retire_previous_run(payload, request)
     articles = [row for row in payload.get("articles", []) if row.get("article_id") != request.get("article_id")]
     articles.append(request)
     payload["articles"] = articles
@@ -422,6 +430,60 @@ def register_batch_request(project: Path, batch_id: str, request: dict[str, obje
 def normalized_version(value: str) -> str:
     value = value.strip() or "v1"
     return value if value.lower().startswith("v") else "v" + value
+
+
+def batch_article_from_task(project: Path, article_id: str) -> dict[str, object]:
+    """Read the committed identity, never the pre-revision CSV snapshot."""
+    task = current_task(project, article_id)
+    request = read_text(task / "10_文章知识需求.md")
+    result: dict[str, object] = {
+        "article_id": article_id,
+        "batch_id": field(request, "批次ID"),
+        "article_version": normalized_version(field(request, "当前版本")),
+        "external_task_key": field(request, "外部任务唯一键"),
+        "title": field(request, "标题"),
+        "outline_id": field(request, "大纲ID"),
+        "outline_version": field(request, "大纲版本"),
+        "outline": request.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip(),
+        "revision_mode": field(request, "任务模式") or "new_article",
+        "target_language": field(request, "目标语言"),
+    }
+    runs = (() if result["revision_mode"] == "knowledge_reuse_rewrite" else
+            (("知识重整运行.json", "refresh_run_id"),) if result["revision_mode"] == "outline_refresh" else
+            (("知识检索运行.json", "research_run_id"),))
+    for filename, key in runs:
+        if (task / filename).is_file():
+            run = json.loads((task / filename).read_text(encoding="utf-8-sig"))
+            if run.get("article_id") != article_id or normalized_version(str(run.get("article_version", ""))) != result["article_version"]:
+                raise SystemExit(f"当前运行记录身份与10不一致：{task / filename}")
+            result[key] = run.get(key, "")
+    return result
+
+
+def revision_is_resume(args: argparse.Namespace, request: str, source: Path, title: str, outline: str) -> bool:
+    """A replay of a committed revision must not archive/increment it again."""
+    if field(request, "任务模式") != args.revision_mode:
+        return False
+    if normalized_version(str(args.base_article_version or "")) != field(request, "基线文章版本"):
+        return False
+    expected = {
+        "文章ID": args.article_id, "标题": title, "关键词": args.keywords or "待补充",
+        "目标语言": args.target_language, "特殊限制": args.constraints or "未提供",
+        "原始写作请求": args.request_text.strip(), "产品或内容对象": args.product_or_content_object.strip(),
+        "选题方向": args.topic_direction.strip(), "原始写作要求": args.original_writing_requirements.strip(),
+        "写作Skill": args.writing_skill.strip(), "大纲ID": args.outline_id, "大纲版本": args.outline_version,
+        "基线大纲ID": args.base_outline_id, "基线大纲版本": args.base_outline_version,
+        "原任务文件": str(source), "原任务SHA-256": sha256(source), "原任务位置或块键": args.source_locator.strip(),
+    }
+    changed = [label for label, value in expected.items() if field(request, label) != value]
+    recorded_outline = request.split("## 大纲", 1)[1].split("## 随文章提交文件分类", 1)[0].strip()
+    if recorded_outline != outline:
+        changed.append("大纲")
+    if args.batch_id and field(request, "批次ID") != args.batch_id:
+        changed.append("批次ID")
+    if changed:
+        raise SystemExit("同一重做请求的恢复参数变化：" + "、".join(changed) + "；未归档或覆盖当前任务")
+    return True
 
 
 def next_version(value: str) -> str:
@@ -467,6 +529,9 @@ def request_document(
     body = [
         "# 文章知识需求", "", f"- 文章ID：{article_id}", f"- 当前版本：{article_version}",
         f"- 模板版本：{TEMPLATE_VERSION}",
+        "- 证据模板版本：EC-1",
+        "- 来源核验模板版本：GC-1",
+        *(["- 知识准备记录协议：PR-1"] if revision_mode != "knowledge_reuse_rewrite" else []),
         f"- 交接合同版本：{contract_version}",
         f"- 批次ID：{args.batch_id or '不适用'}",
         f"- 标题：{title}", f"- 关键词：{args.keywords or '待补充'}",
@@ -712,6 +777,10 @@ def prepare_revision(
                     "refresh_run_id": refresh_run_id,
                     "article_id": article_id,
                     "article_version": new_version,
+                    "batch_id": args.batch_id or "不适用",
+                    "outline_id": args.outline_id,
+                    "outline_version": args.outline_version,
+                    "revision_mode": mode,
                     "baseline_article_version": old_version,
                     "baseline_archive": archive_entry,
                     "website_evidence_manifest": evidence_manifest,
@@ -748,11 +817,16 @@ def prepare_revision(
         )
         from template_contract import validate_task_templates
 
+        from governance_source_check import rebind_reused_scope
+        rebind_reused_scope(staging)
         staged_errors = validate_task_templates(staging)
         if staged_errors:
             shutil.rmtree(staging)
             raise SystemExit("知识不变重写的新版本文件校验失败：" + "；".join(staged_errors[:8]))
-        if not article_package_ready(staging):
+        from governance_source_check import original_sources
+        with original_sources(project):
+            reused_ready = article_package_ready(staging)
+        if not reused_ready:
             shutil.rmtree(staging)
             raise SystemExit("知识不变重写的新版本30/35整包校验失败，未替换当前任务")
     else:
@@ -825,7 +899,21 @@ def prepare(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc)) from exc
     project = args.project.resolve()
     sync_skill_version(project)
-    revision_mode = (args.revision_mode or "new_article").strip()
+    external_task_key = args.external_task_key.strip()
+    ledger = project / RELATIVE_LEDGER
+    existing = next((row for row in load(ledger) if row["external_task_key"] == external_task_key), None)
+    existing_request = read_text(current_task(project, existing["article_id"]) / "10_文章知识需求.md") if existing else ""
+    current_mode = field(existing_request, "任务模式") or "new_article"
+    revision_mode = (args.revision_mode or (current_mode if existing else "new_article")).strip()
+    if existing and revision_mode == "new_article" and current_mode != "new_article":
+        raise SystemExit("当前任务为" + current_mode + "，不能以new_article覆盖其重做身份；恢复时省略--revision-mode或沿用当前模式")
+    if existing and not args.revision_mode and current_mode != "new_article":
+        # Omitted mode means resume the committed request, not start a revision.
+        args.article_id = args.article_id or existing["article_id"]
+        args.base_article_version = args.base_article_version or field(existing_request, "基线文章版本")
+        args.base_outline_id = args.base_outline_id or field(existing_request, "基线大纲ID")
+        args.base_outline_version = args.base_outline_version or field(existing_request, "基线大纲版本")
+    args.revision_mode = revision_mode
     if revision_mode not in REVISION_MODES:
         raise SystemExit(f"无效revision_mode：{revision_mode}")
     external_task_key = args.external_task_key.strip()
@@ -895,13 +983,21 @@ def prepare(args: argparse.Namespace) -> None:
         validate_event("writing_request", request_payload)
     except HandoffContractError as exc:
         raise SystemExit(f"writing_request合同校验失败：{exc}") from exc
-    ledger = project / RELATIVE_LEDGER
-    existing = next((row for row in load(ledger) if row["external_task_key"] == external_task_key), None)
     if revision_mode != "new_article":
         if not existing:
             raise SystemExit("重做请求没有找到既有外部任务映射；不得猜测文章身份")
         if existing.get("article_id") != request_payload["base_article_id"]:
             raise SystemExit("重做请求的article_id与既有任务映射不一致")
+        if revision_is_resume(args, existing_request, source, title, outline):
+            if args.batch_id:
+                register_batch_request(project, args.batch_id, batch_article_from_task(project, existing["article_id"]))
+            print(f"article_id={existing['article_id']}")
+            print(f"article_version={field(existing_request, '当前版本')}")
+            print(f"revision_mode={revision_mode}")
+            print(f"task_dir={current_task(project, existing['article_id'])}")
+            print("ledger_action=reused_revision")
+            print("handoff_event=writing_request")
+            return
         prepare_revision(
             args,
             project=project,
@@ -912,13 +1008,7 @@ def prepare(args: argparse.Namespace) -> None:
             outline=outline,
         )
         if args.batch_id:
-            register_batch_request(project, args.batch_id, {
-                "article_id": existing["article_id"], "article_version": existing.get("article_version", ""),
-                "external_task_key": external_task_key, "title": title,
-                "outline_id": request_payload["outline_id"], "outline_version": request_payload["outline_version"],
-                "outline": outline,
-                "revision_mode": revision_mode,
-            })
+            register_batch_request(project, args.batch_id, batch_article_from_task(project, existing["article_id"]))
         return
     article_id = args.article_id.strip() if args.article_id else (existing or {}).get("article_id", "") or next_article_id(project, args.date)
     item = {
@@ -981,13 +1071,7 @@ def prepare(args: argparse.Namespace) -> None:
         print(f"handoff_contract_version={contract_version}")
         print("handoff_event=writing_request")
         if args.batch_id:
-            register_batch_request(project, args.batch_id, {
-                "article_id": article_id, "article_version": item["article_version"],
-                "external_task_key": external_task_key, "title": title,
-                "outline_id": request_payload["outline_id"], "outline_version": request_payload["outline_version"],
-                "outline": outline,
-                "revision_mode": revision_mode,
-            })
+            register_batch_request(project, args.batch_id, batch_article_from_task(project, article_id))
         return
     if task_dir.exists():
         raise SystemExit(f"文章任务目录已存在：{task_dir}")
@@ -1001,6 +1085,10 @@ def prepare(args: argparse.Namespace) -> None:
                 "research_run_id": new_run_id,
                 "article_id": article_id,
                 "article_version": "v1",
+                "batch_id": args.batch_id or "不适用",
+                "outline_id": args.outline_id,
+                "outline_version": args.outline_version,
+                "revision_mode": "new_article",
                 "website_evidence_manifest": evidence_manifest,
                 "status": "pending_full_knowledge_preparation",
             },
@@ -1032,13 +1120,7 @@ def prepare(args: argparse.Namespace) -> None:
     print(f"research_run_id={new_run_id}")
     print(f"website_evidence_manifest={task_dir / evidence_manifest}")
     if args.batch_id:
-        register_batch_request(project, args.batch_id, {
-            "article_id": article_id, "article_version": "v1",
-            "external_task_key": external_task_key, "title": title,
-            "outline_id": request_payload["outline_id"], "outline_version": request_payload["outline_version"],
-            "outline": outline,
-            "revision_mode": revision_mode,
-        })
+        register_batch_request(project, args.batch_id, batch_article_from_task(project, article_id))
     print("handoff_event=writing_request")
     update_integration_status(
         project,
@@ -1203,8 +1285,10 @@ def self_test() -> None:
         claim_id = "CLM-DEMO-PROD-001"
         formal = root / "03_正式知识/20_产品介绍/测试正式知识.md"
         formal.parent.mkdir(parents=True)
+        demo_evidence = "Example Company provides custom packaging services."
+        demo_evidence_sha = hashlib.sha256(demo_evidence.encode("utf-8")).hexdigest()
         formal.write_text(
-            f"# 测试正式知识\n\n- Claim ID：{claim_id}\n- Claim：Example Company provides custom packaging services.\n- Claim状态：有效\n- 来源链接：https://example.com/about-us/\n- 精确位置：Company Introduction第1段\n- 最小原文证据：Example Company provides custom packaging services.\n\nExample Company provides custom packaging services.\n",
+            f"# 测试正式知识\n\n### {claim_id}｜测试正式知识\n\n- Claim ID：{claim_id}\n- Claim：{demo_evidence}\n- 适用范围：Example Company的定制包装服务\n- 来源类型：客户官网\n- 来源链接：https://example.com/about-us/\n- 原文证据：本区块最小原文证据\n- 调研核验：已回读官网正文\n- 精确位置：Company Introduction第1段\n- 日期或版本：2026-09-07\n- 归类模块：产品介绍\n- 归类依据：回答定制包装服务事实\n- 使用边界：不得外推具体材料、数量或效果\n- 证据模板版本：EC-1\n- 证据归属主体：Example Company\n- 证据归属对象：定制包装服务\n- 指代解析：无\n- 归属核验依据：官网页面标题与正文主体一致\n- 归属核验日期：2026-09-07\n- 归属核验状态：已核验\n- 归属证据SHA-256：{demo_evidence_sha}\n- 竞品信息筛查：通过\n- 状态：可用\n\n### 最小原文证据\n\n> {demo_evidence}\n",
             encoding="utf-8",
         )
         outline_rows = ("标题", "主问题", "说明测试问题", "给出安全建议")
@@ -1304,10 +1388,10 @@ def self_test() -> None:
         )
         material = task / "30_本篇知识库资料.md"
         material.write_text(
-            "# 本篇写作素材包\n\n"
-            f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n- 资料视图：写作素材包\n"
+             "# 本篇写作素材包\n\n"
+            f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n- 资料视图：写作素材包\n- 证据模板版本：EC-1\n"
             "- 资料版本：v1\n- 生成日期：2026-09-07\n- 目标语言：中文\n- 对应大纲：10_文章知识需求.md\n- 使用对象：本篇写作Skill\n\n"
-            "## 一、可直接用于正文的事实\n\n### 测试事实\n\n- 事实素材：Example Company provides custom packaging services.\n\n### 证据正文（供Faithfulness核验）\n\nExample Company provides custom packaging services.\n\n"
+             "## 一、可直接用于正文的事实\n\n### 测试事实\n\n- 事实素材：Example Company provides custom packaging services.\n- 使用条件：仅适用于Example Company的定制包装服务。\n\n#### 证据归属（仅用于指代解析）\n- 内容提供方：Example Company\n- 对应对象：定制包装服务\n- 指代关系：无\n- 核验状态：已核验\n\n#### 证据正文（供Faithfulness核验）\n\n> Example Company provides custom packaging services.\n\n"
             "## 二、可直接采用的英文表达\n\n| 使用场景/大纲章节 | 可采用表达 | 使用条件 |\n|---|---|---|\n| 无 | 无 | 本篇目标语言为中文 |\n\n"
             "## 三、可使用的数据表\n\n无\n\n"
             "## 四、按大纲使用\n\n| 大纲章节 | 可用事实/表达/数据表 | 推荐写作角度 |\n|---|---|---|\n"
@@ -1316,7 +1400,7 @@ def self_test() -> None:
             "## 六、缺少资料的章节及建议处理方式\n\n| 原大纲章节 | 建议处理 | 可保留的安全写作方向 |\n|---|---|---|\n| 无 | 无需处理 | 使用现有事实 |\n",
             encoding="utf-8",
         )
-        evidence_line = read_text(material).splitlines().index("Example Company provides custom packaging services.") + 1
+        evidence_line = read_text(material).splitlines().index("> Example Company provides custom packaging services.") + 1
         (task / "35_写作素材来源索引.md").write_text(
             "# 写作素材来源索引\n\n"
             f"- 文章ID：{article_id}\n- 文章版本：v1\n- 模板版本：{TEMPLATE_VERSION}\n- 索引版本：v1\n- 生成日期：2026-09-07\n"
@@ -1327,6 +1411,56 @@ def self_test() -> None:
             encoding="utf-8",
         )
         from template_contract import validate_task_templates
+        # Exercise the current source protocol with real managed fixture
+        # records, including direct website checks and category-specific scope.
+        from governance_source_check import HEADER as source_header, HEADING as source_heading
+        from prewrite_governance import CATEGORIES, DETAIL_HEADER, DETAIL_HEADING
+        manifest = task / "官网正文抓取凭证.json"
+        captures = json.loads(read_text(manifest))
+        for capture in captures:
+            capture["response_sha256"] = hashlib.sha256(b"self-test-http-response").hexdigest()
+        manifest.write_text(json.dumps(captures, ensure_ascii=False), encoding="utf-8")
+        source_lines = [source_heading, "", "| " + " | ".join(source_header) + " |", "|" + "---|" * len(source_header)]
+        detail_lines = [DETAIL_HEADING, "", "| " + " | ".join(DETAIL_HEADER) + " |", "|" + "---|" * len(DETAIL_HEADER)]
+        number = 0
+        for detector, categories in CATEGORIES.items():
+            for category in categories:
+                number += 1
+                key = f"GC-{number:03d}"
+                applicable = category in {"客户能力", "版本", "定位", "提取", "翻译与规范化", "残缺与外推", "来源冲突"}
+                scope = f"本篇定制包装服务的{category}核对" if applicable else f"本篇不涉及{category}"
+                quote = demo_evidence if applicable else "- 说明测试问题"
+                source_row = [key, detector, category, scope, "官网正文" if applicable else "需求范围",
+                              "PRIMARY-WEBSITE" if applicable else "不适用",
+                              "https://example.com/about-us/" if applicable else "[[10_文章知识需求.md#大纲]]",
+                              "B001" if applicable else "大纲",
+                              demo_evidence_sha if applicable else sha256(task / "10_文章知识需求.md"),
+                              quote, "research-self-test-001",
+                              f"核对{category}：当前事实仅有该官网连续区块，不外推参数；本夹具无第二冲突来源" if applicable else f"当前需求不要求{category}，本轮未采用该类事实"]
+                source_lines.append("| " + " | ".join(source_row) + " |")
+                detail = [detector, category, scope, f"[[15_检索与知识准备记录.md#CUS / ANM来源核验记录]] {key}", quote,
+                          "已核验" if applicable else "不适用", source_row[-1], "无",
+                          "按证据使用，不扩展来源范围" if applicable else f"不涉及本篇{category}"]
+                detail_lines.append("| " + " | ".join(detail) + " |")
+        retrieval = task / "15_检索与知识准备记录.md"
+        retrieval.write_text(read_text(retrieval) + "\n" + "\n".join(source_lines) + "\n", encoding="utf-8")
+        preaudit = task / "20_文章前知识审核.md"
+        preaudit.write_text(read_text(preaudit).split(DETAIL_HEADING)[0] + "\n".join(detail_lines) + "\n", encoding="utf-8")
+        # This is synthetic fixture data, not a production conversion.
+        from preparation_record import section as pr_section, table as pr_table, CANDIDATE_HEADER, counts as pr_counts
+        old = read_text(retrieval)
+        meta = old.split("## 固定检索层状态")[0] + "- 知识准备记录协议：PR-1\n"
+        prepared_fixture = meta + "\n## 固定检索层状态\n\n" + pr_section(old, "固定检索层状态")
+        prepared_fixture += "\n\n### 官网正文核验\n\n" + pr_section(old, "官网正文核验")
+        prepared_fixture += "\n\n## 大纲逐项检索与候选事实覆盖\n\n" + pr_section(old, "大纲逐项检索与候选事实覆盖")
+        candidate = ["CF-001", demo_evidence, "https://example.com/about-us/ Company Introduction第1段", "复用已有Formal Claim", claim_id, "本轮官网连续原文核验通过", "客户知识", "复用", "本轮证据直接支持定制包装服务"]
+        prepared_fixture += "\n\n## 候选事实处置明细\n\n" + pr_table(CANDIDATE_HEADER, [candidate])
+        prepared_fixture += "\n\n## CUS / ANM来源核验记录\n\n" + pr_section(old, "CUS / ANM来源核验记录")
+        prepared_fixture += "\n\n## 缺口与特殊资料处理\n\n### 本轮待调研缺口复核\n\n" + pr_table(("GAP ID", "当前台账入口与状态", "本轮具体公共知识问题", "与当前大纲关系", "本轮处理和证据"), [["无"] * 5])
+        for title in ("MAT依赖与资料选择", "复杂资料处理与原件核对"):
+            prepared_fixture += "\n\n### " + title + "\n\n" + pr_section(old, title)
+        prepared_fixture += "\n\n## 本轮知识准备结论\n\n" + pr_table(("项目", "本轮结果"), [[k, str(v)] for k, v in pr_counts(prepared_fixture).items()] + [["中文结论", "本轮仅采用官网连续原文支持的定制包装服务，无公共知识缺口。"]]) + "\n"
+        retrieval.write_text(prepared_fixture, encoding="utf-8")
         bundle_errors = validate_task_templates(task)
         if bundle_errors or not article_package_ready(task):
             raise AssertionError(f"self-test failed: valid reusable bundle was rejected: {bundle_errors}")
@@ -1348,13 +1482,34 @@ def self_test() -> None:
 
         baseline_final = Path(temp) / "baseline-final.md"
         baseline_final.write_text("测试基线正文。\n", encoding="utf-8")
-        finalize(argparse.Namespace(
+        final_args = argparse.Namespace(
             handoff_contract_version=current_version(),
             project=root,
             final_path=baseline_final,
             article_id=article_id,
             external_task_key=None,
-        ))
+        )
+        gate_file = task / "writing_gate_result.json"
+        ready_gate = gate_file.read_bytes()
+        for changed_gate in (
+            {"writing_gate_status": "blocked", "terminal": False},
+            {"writing_gate_status": "ready", "article_id": "OTHER", "article_version": "v1"},
+            None,
+        ):
+            if changed_gate is None:
+                gate_file.unlink()
+            else:
+                gate_file.write_text(json.dumps(changed_gate), encoding="utf-8")
+            try:
+                finalize(final_args)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("self-test failed: stale receipt bypassed current gate")
+            if (task / "40_最终文章.md").exists():
+                raise AssertionError("self-test failed: blocked final wrote 40")
+            gate_file.write_bytes(ready_gate)
+        finalize(final_args)
         # finalize() normalizes 40 in the waiting-for-final task.  The
         # subsequent create_faithfulness_record.py step owns the move to
         # 30_等待Faithfulness, so the bridge self-test must inspect 20 here.
@@ -1563,6 +1718,17 @@ def finalize(args: argparse.Namespace) -> None:
     if not version.lower().startswith("v"):
         version = "v" + version
     ready_receipt = task / "writing_ready.json"
+    gate_path = task / "writing_gate_result.json"
+    if not gate_path.is_file():
+        raise SystemExit("缺少当前writing_ready门禁回执；交回知识库重跑门禁，不得接收终稿")
+    if gate_path.is_file():
+        try:
+            gate = json.loads(read_text(gate_path))
+        except (ValueError, OSError) as exc:
+            raise SystemExit(f"当前writing_ready门禁回执不可读取；交回知识库重跑门禁：{exc}") from exc
+        if (not isinstance(gate, dict) or gate.get("writing_gate_status") != "ready"
+                or gate.get("article_id") != article_id or gate.get("article_version") != version):
+            raise SystemExit("当前writing_ready门禁未通过；交回知识库自动恢复并重跑门禁，不得接收终稿")
     if not ready_receipt.is_file():
         raise SystemExit(
             "当前文章没有知识库签发的writing_ready机器回执；"
@@ -1718,7 +1884,7 @@ def main() -> None:
     p.add_argument(
         "--revision-mode",
         choices=sorted(REVISION_MODES),
-        default="new_article",
+        default=None,
         help="新文章或两种明确重做模式；重做时还要提供article-id和base-article-version",
     )
     p.add_argument("--base-article-version")

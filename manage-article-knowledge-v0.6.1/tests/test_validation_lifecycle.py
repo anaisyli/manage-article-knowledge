@@ -319,6 +319,55 @@ class ValidationLifecycleTests(unittest.TestCase):
             validator.validate_article_knowledge_packages(root, errors, [])
             self.assertTrue(any("未完整复用Claim" in item for item in errors))
 
+    def test_imported_completed_package_keeps_its_historical_claim_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(
+                root,
+                claim_evidence="First sentence. Second sentence.",
+                material_evidence="First sentence.",
+            )
+            completed = root / "04_文章任务/40_已完成/ART-001_Cosmetic"
+            completed.parent.mkdir(parents=True)
+            task.rename(completed)
+            (completed / "40_最终文章.md").write_text(
+                "# Final article\n\n- 文章ID：ART-001\n- 文章版本：v1\n",
+                encoding="utf-8-sig",
+            )
+            (completed / "50_文章知识使用与Faithfulness记录.md").write_text(
+                "# Faithfulness record\n\n- 文章ID：ART-001\n- 文章版本：v1\n"
+                "- 当前状态：已导入，存在待处理事项\n",
+                encoding="utf-8-sig",
+            )
+
+            errors: list[str] = []
+            warnings: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, warnings)
+
+            self.assertFalse(any("未完整复用Claim" in item for item in errors))
+            self.assertTrue(any("已完成文章的历史30/35与当前Formal Claim证据文本不同" in item for item in warnings))
+
+    def test_completed_folder_without_imported_record_still_requires_current_claim_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = self._write_package_fixture(
+                root,
+                claim_evidence="First sentence. Second sentence.",
+                material_evidence="First sentence.",
+            )
+            completed = root / "04_文章任务/40_已完成/ART-001_Cosmetic"
+            completed.parent.mkdir(parents=True)
+            task.rename(completed)
+            (completed / "40_最终文章.md").write_text(
+                "# Final article\n\n- 文章ID：ART-001\n- 文章版本：v1\n",
+                encoding="utf-8-sig",
+            )
+
+            errors: list[str] = []
+            validator.validate_article_knowledge_packages(root, errors, [])
+
+            self.assertTrue(any("未完整复用Claim" in item for item in errors))
+
     def test_writing_ready_gate_rejects_the_same_package_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from external_research_links import RESEARCH_ROOT, FIELDS as LINK_FIELDS, claim_locations, links_for_gap, research_records
 
 
 OUTPUT_RELATIVE = Path("05_数据与审核/20_知识库覆盖与缺口/01_知识库覆盖与缺口.md")
@@ -71,7 +72,7 @@ def coverage_input_files(root: Path) -> list[Path]:
         path = root / relative
         if path.is_file():
             files.add(path)
-    for relative_root in (Path("03_正式知识"), Path("04_文章任务")):
+    for relative_root in (Path("03_正式知识"), Path("04_文章任务"), RESEARCH_ROOT):
         directory = root / relative_root
         if not directory.is_dir():
             continue
@@ -439,6 +440,35 @@ def related_gaps(files: list[Path], gaps: list[dict[str, str]]) -> list[dict[str
     return [item for item in gaps if any(identifier in " ".join(item.values()) for identifier in identifiers)]
 
 
+def gap_research_summary(root: Path, gap: dict[str, str], research: list[dict], locations: dict) -> tuple[str, str, str]:
+    from external_research_links import CLAIM_RE
+    entries, answered, remaining = [], [], []
+    for link in links_for_gap(gap, research):
+        record, row = link["record"], link["row"]
+        res = record["res_id"]
+        entries.append(f"{res} {wikilink(root, record['path'])}")
+        if record["errors"]:
+            answered.append(f"{res}：关联格式待修复")
+            remaining.append(f"{res}：关联格式待修复，不作为解决证明")
+        elif row:
+            for claim in CLAIM_RE.findall(row[LINK_FIELDS[4]]):
+                paths = locations.get(claim, [])
+                entries.append(f"{claim} {wikilink(root, paths[0])}" if len(paths) == 1 else f"{claim}（正式入口缺失或不唯一）")
+            answered.append(f"{res}：{row[LINK_FIELDS[2]]}（{row[LINK_FIELDS[5]]}）")
+            remaining.append(f"{res}：{row[LINK_FIELDS[3]]}")
+        else:
+            answered.append(f"{res}：历史记录未分项登记，复用时核验补齐")
+            remaining.append(f"{res}：尚缺范围未分项登记")
+    # Legacy CSV references may explicitly name a Claim without a structured RES table.
+    for claim in CLAIM_RE.findall(gap.get("related_governance_ref", "")):
+        paths = locations.get(claim, [])
+        if len(paths) == 1:
+            entries.append(f"{claim} {wikilink(root, paths[0])}")
+    return ("；".join(dict.fromkeys(entries)) or "[[10_知识缺口记录.csv]]（尚无可定位RES关联）",
+            "；".join(answered) or "尚无已核验调研范围",
+            "；".join(remaining) or gap.get("next_action", "详见缺口记录"))
+
+
 def build_view(root: Path) -> str:
     project_id = parse_project_id(root)
     rebuilt_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -448,6 +478,8 @@ def build_view(root: Path) -> str:
     mats = open_mat_items(root)
     gaps = governance_gaps(root)
     public_gaps = knowledge_gaps(root)
+    research = research_records(root)
+    formal_claims = claim_locations(root)
     input_fingerprint = coverage_fingerprint(root)
     lines = [
         "# 知识库覆盖与缺口", "", f"- 项目ID：{project_id}", f"- 最近重建：{rebuilt_at}",
@@ -522,17 +554,18 @@ def build_view(root: Path) -> str:
         ("待处理与部分解决", [g for g in public_gaps if g.get("status") in {"观察中", "待外部调研", "部分解决"}]),
         ("已解决与已关闭（历史）", [g for g in public_gaps if g.get("status") in {"已解决", "已关闭"}]),
     ):
-        lines.extend(["", f"### {heading}", "", "| 缺口ID | 缺口主题 | 类型 | 触发依据 | 历史文章数 | 当前影响数 | 当前状态 | 下一步 | 入口 |",
-                      "|---|---|---|---|---:|---:|---|---|---|"])
+        lines.extend(["", f"### {heading}", "", "| 缺口ID | 缺口主题 | 类型 | 触发依据 | 历史文章数 | 当前影响数 | 当前状态 | 下一步 | 相关调研与正式知识 | 已回答范围 | 尚缺范围 |",
+                      "|---|---|---|---|---:|---:|---|---|---|---|---|"])
         for gap in sorted(selected, key=lambda item: (item.get("first_seen", ""), item.get("gap_key", ""))):
+            entries, answered, remaining = gap_research_summary(root, gap, research, formal_claims)
             lines.append("| " + " | ".join(map(markdown_cell, (
                 gap.get("gap_key", ""), gap.get("gap_topic", ""), gap.get("gap_type", "公共知识"), gap.get("trigger_basis", ""),
                 gap.get("article_count", "0"), gap.get("current_article_count", "0"),
                 gap.get("status", ""), gap.get("next_action", ""),
-                "[[10_知识缺口记录.csv]]",
+                entries, answered, remaining,
             ))) + " |")
         if not selected:
-            lines.append("| 无 | 无 | 无 | 无 | 0 | 0 | 无 | 无 | [[10_知识缺口记录.csv]] |")
+            lines.append("| 无 | 无 | 无 | 无 | 0 | 0 | 无 | 无 | [[10_知识缺口记录.csv]] | 无 | 无 |")
     return "\n".join(lines) + "\n"
 
 

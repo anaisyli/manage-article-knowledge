@@ -131,6 +131,51 @@ class FaithfulnessReportingTests(unittest.TestCase):
         self.assertFalse(hasattr(import_faithfulness, "CUS_LOW_FAITHFULNESS_THRESHOLD"))
         self.assertFalse(hasattr(import_faithfulness, "mark_low_faithfulness_cus_recheck"))
 
+    def test_serialization_only_article_change_stays_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            article = root / "40_最终文章.md"
+            knowledge = root / "30_本篇知识库资料.md"
+            prepared = root / "prepared.json"
+            article.write_text("# Title\n\n| A | B |\n|---|---|\n| one | two |\n", encoding="utf-8")
+            knowledge.write_text("knowledge", encoding="utf-8")
+            prepared.write_text(
+                '{"article_lines":[{"line":"3","text":"A | B"},{"line":"5","text":"one | two"}]}',
+                encoding="utf-8",
+            )
+            row = self.metric_row(article, knowledge, prepared_file=str(prepared), article_sha256="old-hash")
+            monthly = root / "monthly.md"
+            metrics = root / "metrics.csv"
+            self.write_metrics(metrics, [row])
+            subprocess.run(
+                [sys.executable, str(SCRIPTS / "calculate_monthly_faithfulness.py"), "--metrics-csv", str(metrics), "--month", "2026-09", "--output", str(monthly)],
+                check=True, capture_output=True, text=True,
+            )
+            report = monthly.read_text(encoding="utf-8")
+            self.assertIn("已完成有效审核：1", report)
+            self.assertIn("序列化兼容警告", report)
+
+    def test_real_article_change_is_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            article = root / "40_最终文章.md"
+            knowledge = root / "30_本篇知识库资料.md"
+            prepared = root / "prepared.json"
+            article.write_text("# Title\n\nchanged\n", encoding="utf-8")
+            knowledge.write_text("knowledge", encoding="utf-8")
+            prepared.write_text('{"article_lines":[{"line":"3","text":"original"}]}', encoding="utf-8")
+            row = self.metric_row(article, knowledge, prepared_file=str(prepared), article_sha256="old-hash")
+            metrics = root / "metrics.csv"
+            monthly = root / "monthly.md"
+            self.write_metrics(metrics, [row])
+            subprocess.run(
+                [sys.executable, str(SCRIPTS / "calculate_monthly_faithfulness.py"), "--metrics-csv", str(metrics), "--month", "2026-09", "--output", str(monthly)],
+                check=True, capture_output=True, text=True,
+            )
+            report = monthly.read_text(encoding="utf-8")
+            self.assertIn("已完成有效审核：0", report)
+            self.assertIn("正文内容已修改，等待重审", report)
+
 
 if __name__ == "__main__":
     unittest.main()

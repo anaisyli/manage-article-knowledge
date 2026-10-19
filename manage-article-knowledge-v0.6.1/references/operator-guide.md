@@ -47,10 +47,12 @@
 1. 每篇先按原流程确定标题/主题和非空简要大纲，并把任务身份、原始请求、当前需求和大纲保存到已确认的写作任务入口；不得只留在对话中。
 2. 每次交接定位当前已安装的manage-article-knowledge，运行时读取references/handoff-contract.json和references/skill-integration-handoff.md中标明适用于写作方的章节；不写死版本号或本机安装路径。
 3. 按当前合同提交writing_request；收到知识库脚本 `scripts/issue_writing_ready.py` 输出的 `writing_gate_status=ready`、兼容的 `writing_ready`、当前30绝对路径和 `writing_ready.json` 绝对路径前，不得起草，也不得调用会生成文章、DOCX、图片或交付包的工具。`evidence_ready`、`writing_request`、模板校验输出或任务目录存在都不能替代该回执。
-4. 收到 `writing_gate_status=blocked` 时，先等待门禁入口完成其自动恢复循环：它会按当前文章ID在临时副本中修复可唯一判断的`15/20/30/35`结构、Claim映射、证据正文和哈希，并自动重跑门禁。恢复成功会直接生成`writing_ready`，不需要人工再次发送“继续”。若仍阻塞，才读取并原样保留 `terminal=false`、`blocked_step`、`next_owner`、`resume_condition`、`next_action` 和全部 `blocked_reason`；这不是最终回复或整条任务暂停信号。批次内其他文章继续独立推进。只有重新得到`writing_gate_status=ready`后，才读取 `writing_ready.json`，核对 `article_id`、`article_version` 和 `knowledge_sha256` 与当前任务及30完全一致，再读取handoff中的30使用规则并完整执行原写作流程。回执缺失、哈希不一致或状态为blocked时不得开始写作，也不得结束整条任务。
+4. 提交`writing_request`后，只等待知识库交接。知识库尚在收集来源、处理候选事实/Claim、生成或修复文章包时，按当前机器回执中的`terminal=false`、`next_owner`、`resume_condition`和`next_action`由知识库继续处理；不得把这些内部知识准备状态报告为人工阻塞或整条任务结束，也不得要求人工重复发送“继续”。若单篇门禁输出`writing_gate_status=blocked`，等待知识库按当前文章ID完成自动恢复并重跑门禁；仍有问题时把回执交回知识库，批次内其他文章继续独立推进。只有合同明确要求人工处理的`needs_human`/`handoff_error`、真实权限问题、不可替代材料缺失或业务决定，才向人工说明具体恢复条件。只有拿到`writing_gate_status=ready`及`writing_ready.json`，核对`article_id`、`article_version`和30哈希一致后，才读取handoff中的知识附件规则并执行原写作流程。回执缺失、哈希不一致或门禁未通过时不得开始写作。
 5. 完成后返回writing_completed和终稿正文绝对路径；已有文章ID/版本则原样返回，没有则不猜测。writing_completed和faithfulness_completed都不是整条流程终点。把控制权交回知识库继续审核与导入；当前Codex只接受知识库导入器生成的article_completed.json，不得自行拼接完成回执，并必须调用handoff规定的统一完成校验器，取得completion_verified=true后才能报告完成。未取得该凭证时不得结束或向人工宣称文章流程完成。
 6. 不创建或修改知识库项目内的10/15/20/30/35/40/50、正式知识、Faithfulness结果或治理台账。
 7. 合同、项目、任务或入口无法唯一确定时，说明发生了什么和下一步，立即停止；不得绕过桥接、把 `evidence_ready` 当作 `writing_ready`、手工伪造回执/40或用简化脚本替代原写作流程。
+
+补充运行约束：正文/DOCX/图片/交付工具调用前及终稿提交前，按当前handoff复核最新writing_gate_result.json与writing_ready.json的ready状态、文章ID、版本和当前30哈希；重检blocked时旧许可失效，交回知识库自动回源修复或按版本合同重建，不能沿用旧许可或要求人工再说“继续”。知识库的CUS/ANM核验记录固定在15并回源，写作方不得生成任务核验笔记或修改内部文件；不要把该模板或完整字段表复制到写作Skill。
 
 完成后只说明：修改了哪个文件、本次写作需求记录入口、终稿入口规则，以及是否完整保留原写作流程。
 ```
@@ -81,9 +83,11 @@
 - references/handoff-contract.json
 
 2. 以 `handoff-contract.json` 为事件、版本、必填字段和终止语义的唯一机器真源，以 handoff 中明确标注适用于写作方的章节为运行说明。检查本 Skill 现有接入规则与当前合同的差异，再完成同步；不得在本 Skill 中复制整份合同、写死合同版本、事件字段清单、成功终点或 `30` 的详细规则。以后每次交接都必须从当前已安装知识库 Skill 运行时读取这些内容。
-3. 接入章节只保留写作方职责、当前写作任务入口及其需求记录方式、当前终稿入口规则、调用当前合同的方式，以及知识库文件禁止写入边界。本 Skill 应按运行时读取到的当前合同完成写作方事件；提交 `writing_request` 后只能等待 `scripts/issue_writing_ready.py` 的 `writing_gate_status=ready` 和 `writing_ready.json`，核对文章ID、版本、30哈希后才允许调用任何正文、DOCX、图片或交付工具。若输出`writing_gate_status=blocked`，必须按其`terminal=false`、`next_owner`和`resume_condition`把控制权交回知识库，不能向人工报告整条任务结束；知识库修复后使用同一文章身份重新运行门禁。收到可写事件后读取 handoff 规定的当前知识附件，并完整执行原写作流程；写作方回执后把控制权交给合同指定的下一接收方。当前Codex不得在writing_completed或faithfulness_completed后结束；只有收到知识库导入器对当前文章ID和版本签发的article_completed，并调用handoff规定的统一完成校验器取得completion_verified=true后，才可报告完成。
+3. 接入章节只保留写作方职责、当前写作任务入口及其需求记录方式、当前终稿入口规则、调用当前合同的方式，以及知识库文件禁止写入边界。本 Skill 应按运行时读取到的当前合同完成写作方事件；提交 `writing_request` 后只能等待 `scripts/issue_writing_ready.py` 的 `writing_gate_status=ready` 和 `writing_ready.json`，核对文章ID、版本、30哈希后才允许调用任何正文、DOCX、图片或交付工具。若输出`writing_gate_status=blocked`，必须按其`terminal=false`、`next_owner`和`resume_condition`把控制权交回知识库，不能向人工报告整条任务结束，也不能把“需要补账本、需要Claim闭环、需要重建15/20/30/35”当成人工阻塞；知识库应使用同一文章身份自动继续修复或重建并重新运行门禁。只有回执明确为`needs_human`、`handoff_error`或真实权限/不可替代材料问题时，才向人工展示具体恢复条件。收到可写事件后读取 handoff 规定的当前知识附件，并完整执行原写作流程；写作方回执后把控制权交给合同指定的下一接收方。当前Codex不得在writing_completed或faithfulness_completed后结束；只有收到知识库导入器对当前文章ID和版本签发的article_completed，并调用handoff规定的统一完成校验器取得completion_verified=true后，才可报告完成。
 4. 写作 Skill 不得创建或修改知识库内部文件、正式知识、审核结果或治理记录；合同、项目、任务或入口不兼容时，必须把当前合同规定的错误说明和下一步直接展示给人工并停止，不得猜字段、自动降级、把 `writing_request`/`evidence_ready`/`moved_count=0` 当成开写信号、临时修改定位逻辑或用临时脚本替代原流程。
 5. 同步后做静态自检：只有一份接入章节；不残留旧合同版本、旧字段表或旧终止条件；当前写作任务入口和终稿入口可确定；明确 `writing_request`、`evidence_ready`、`moved_count=0` 和普通校验输出均不能开始写作，只有带文章ID/版本/30哈希的 `writing_ready.json` 可以开始；明确两个中间事件不得结束、article_completed不得由写作方构造且必须经统一校验器得到completion_verified=true；原写作流程的章节与约束均仍存在。若当前合同要求无法在不改写原流程的前提下满足，列出冲突并停止，不得自行删改原流程。
+
+补充运行约束：正文/DOCX/图片/交付工具调用前及终稿提交前，按当前handoff复核最新writing_gate_result.json与writing_ready.json的ready状态、文章ID、版本和当前30哈希；重检blocked时旧许可失效，交回知识库自动回源修复或按版本合同重建，不能沿用旧许可或要求人工再说“继续”。知识库的CUS/ANM核验记录固定在15并回源，写作方不得生成任务核验笔记或修改内部文件；不要把该模板或完整字段表复制到写作Skill。
 
 完成后只说明：修改了哪个 Skill 文件；替换或新建了哪段接入规则；当前读取到的合同版本；本次写作需求记录入口；终稿入口规则；是否清除了重复旧规则；是否完整保留原写作流程。不要执行真实写作任务。
 ```

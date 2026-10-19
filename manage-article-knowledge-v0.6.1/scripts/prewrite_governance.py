@@ -43,6 +43,14 @@ def _reference_text(task: Path, project: Path, value: str) -> str | None:
     selected = existing.pop()
     if selected.name.startswith(("20_", "30_", "35_")) or "90_归档" in selected.parts:
         return None
+    # A freshly written task note is not an independent source. Keep the
+    # established request/retrieval/handling entries for historical records.
+    if selected.is_relative_to(task.resolve()) and selected.name not in {
+        "10_文章知识需求.md", "15_检索与知识准备记录.md", "文章前问题与处理单.md",
+    }:
+        return None
+    if selected.suffix.lower() not in {".md", ".txt", ".html", ".htm", ".json"}:
+        return None
     text = selected.read_text(encoding="utf-8-sig")
     if not anchor:
         return text
@@ -88,7 +96,14 @@ def governance_errors(task: Path, project: Path | None = None) -> list[str]:
     if not audit.is_file():
         return ["缺少20，知识库必须继续完成CUS/ANM逐项核对"]
     text = audit.read_text(encoding="utf-8-sig")
+    request = task / "10_文章知识需求.md"
+    request_text = request.read_text(encoding="utf-8-sig") if request.is_file() else ""
+    from governance_source_check import PROTOCOL, record_errors
+    strict_sources = parse_field(request_text, "来源核验模板版本") == PROTOCOL
     errors: list[str] = []
+    protocol = parse_field(request_text, "来源核验模板版本")
+    if protocol and protocol != PROTOCOL:
+        errors.append(f"未知来源核验模板版本：{protocol}；不得自动降级为历史核验规则")
     rows = table_rows(text, DETAIL_HEADING)
     if tuple(table_header(text, DETAIL_HEADING)) != DETAIL_HEADER or not rows:
         errors.append("20缺少CUS/ANM逐项核对明细；知识库继续读取来源并完成检测，不得默认未触发")
@@ -112,11 +127,14 @@ def governance_errors(task: Path, project: Path | None = None) -> list[str]:
         if result == "待核对":
             errors.append(f"{label}尚未检测，知识库继续核对，不得签发writing_ready")
             continue
-        evidence = _reference_text(task, project, source)
-        if evidence is None:
-            errors.append(f"{label}缺少可回读的具体本地来源/定位（不能使用20/30/35或归档结论）")
-        elif not excerpt or _compact(excerpt) not in _compact(evidence):
-            errors.append(f"{label}核对依据原文不在所指来源位置中")
+        if strict_sources or re.search(r"\bGC-\d{3,}\b", source):
+            errors.extend(record_errors(task, project, detector, category, source, excerpt, result, scope, reason))
+        else:
+            evidence = _reference_text(task, project, source)
+            if evidence is None:
+                errors.append(f"{label}缺少可回读的受管来源/定位（不能使用自建任务笔记、20/30/35或归档结论）")
+            elif not excerpt or _compact(excerpt) not in _compact(evidence):
+                errors.append(f"{label}核对依据原文不在所指来源位置中")
         if result == "已核验" and "10_文章知识需求.md" in source:
             errors.append(f"{label}写作需求不能证明客户事实或来源无异常")
         if not handling or not handling.startswith(("按证据使用", "不涉及", "已排除", "已缩小", "等待")):

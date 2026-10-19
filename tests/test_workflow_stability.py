@@ -163,15 +163,10 @@ class WorkflowStabilityTests(unittest.TestCase):
         )
         cross_domain["fact_check"] = dict(contains_factual_judgment=True, reusable_across_articles=True, knowledge_domains=["method", "procurement_selection"], why_not_knowledge_issue="")
         cross_domain["classification_basis"] = "该主张属于一个可由同组方法证据回答的公共问题"
-        # This second case isolates the semantic-mapping rule. C001 was
-        # intentionally rejected above; the current contract still requires
-        # every unsupported claim in a result to be handled, so it must not be
-        # present in this isolated disposition fixture.
-        isolated_claims = [claims[1]]
         path = Path(tempfile.mktemp(suffix=".json"))
         try:
             path.write_text(json.dumps({"schema_version": "1.1", "article_id": "ART-001", "groups": [cross_domain]}, ensure_ascii=False), encoding="utf-8")
-            loaded = load_disposition(path, "ART-001", isolated_claims)
+            loaded = load_disposition(path, "ART-001", [claims[1]])
             self.assertEqual(loaded[0]["scope_review"]["knowledge_question"], cross_domain["scope_review"]["knowledge_question"])
 
             malformed = dict(cross_domain)
@@ -181,7 +176,7 @@ class WorkflowStabilityTests(unittest.TestCase):
             )
             path.write_text(json.dumps({"schema_version": "1.1", "article_id": "ART-001", "groups": [malformed]}, ensure_ascii=False), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "map every claim_id"):
-                load_disposition(path, "ART-001", isolated_claims)
+                load_disposition(path, "ART-001", [claims[1]])
         finally:
             path.unlink(missing_ok=True)
 
@@ -467,7 +462,12 @@ class WorkflowStabilityTests(unittest.TestCase):
             )
             result_dir = Path(temp) / "results/P-TEST/ART-001/v1"
             receipt = task / "50_文章知识使用与Faithfulness记录.md"
-            audit_skill = ROOT.parent / "deepeval-article-audit"
+            audit_skill = Path(temp) / "deepeval-article-audit"
+            audit_skill.mkdir()
+            (audit_skill / "SKILL.md").write_text(
+                "---\nname: deepeval-article-audit\ndescription: Test fixture.\n---\n",
+                encoding="utf-8",
+            )
             result = subprocess.run(
                 [
                     sys.executable,

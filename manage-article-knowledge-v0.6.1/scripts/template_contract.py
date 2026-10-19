@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from preparation_record import compact, validation_view, protocol_errors
 
 
 TEMPLATE_VERSION = "v0.6-20260907.1"
@@ -209,6 +210,7 @@ def parse_field(text: str, label: str) -> str:
 
 
 def table_header(text: str, heading: str) -> tuple[str, ...]:
+    text = validation_view(text)
     match = re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE)
     if not match:
         return ()
@@ -224,6 +226,7 @@ def table_header(text: str, heading: str) -> tuple[str, ...]:
 
 def table_rows(text: str, heading: str) -> list[list[str]]:
     """Return non-header markdown rows in the table immediately under a heading."""
+    text = validation_view(text)
     match = re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE)
     if not match:
         return []
@@ -622,8 +625,11 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
     contract = CONTRACTS.get(contract_name or path.name)
     if not contract:
         return []
-    text = path.read_text(encoding="utf-8-sig")
+    raw_text = path.read_text(encoding="utf-8-sig")
+    text = validation_view(raw_text) if path.name == "15_检索与知识准备记录.md" else raw_text
     errors: list[str] = []
+    if path.name == "15_检索与知识准备记录.md":
+        errors.extend(protocol_errors(raw_text))
     first = next((line.strip() for line in text.splitlines() if line.strip()), "")
     if first != contract["title"]:
         errors.append(f"固定标题应为{contract['title']}，实际为{first or '空'}")
@@ -639,7 +645,9 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
         if not re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE):
             errors.append(f"缺少固定章节：{heading}")
     for heading, expected in contract["tables"].items():
-        errors.extend(markdown_table_layout_errors(text, heading))
+        empty_candidates = compact(raw_text) and heading == "## 候选事实处置明细" and not table_rows(text, heading)
+        if not empty_candidates:
+            errors.extend(markdown_table_layout_errors(text, heading))
         actual = table_header(text, heading)
         legacy_faithfulness_headers = {
             (
@@ -667,7 +675,7 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
             errors.append(
                 f"{heading}固定表头不符：应为{' | '.join(expected)}，实际为{' | '.join(actual) or '缺失'}"
             )
-        if not table_rows(text, heading):
+        if not table_rows(text, heading) and not empty_candidates:
             errors.append(f"{heading}必须至少有一行真实记录；不能只保留表头")
 
     if path.name == "10_文章知识需求.md":
@@ -741,14 +749,15 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
                 errors.append("知识重整必须包含固定表头的本轮知识准备结论")
             refresh_rows = table_rows(text, "## 本轮知识准备结论")
             refresh_summary = {row[0].strip(): row[1].strip() for row in refresh_rows if len(row) >= 2}
-            missing_items = [item for item in REFRESH_SUMMARY_ITEMS if not refresh_summary.get(item)]
+            required_items = ("本轮候选事实数", "采用事实数", "排除事实数", "进入治理事实数", "中文结论") if compact(raw_text) else REFRESH_SUMMARY_ITEMS
+            missing_items = [item for item in required_items if not refresh_summary.get(item)]
             if missing_items:
                 errors.append("本轮知识准备结论缺少项目：" + "、".join(missing_items))
             for item in REFRESH_COUNT_ITEMS:
                 value = refresh_summary.get(item, "")
                 if value and not value.isdigit():
                     errors.append(f"本轮知识准备结论的{item}必须是非负整数")
-            if refresh_summary.get("基线版本") != base_version:
+            if not compact(raw_text) and refresh_summary.get("基线版本") != base_version:
                 errors.append("本轮知识准备结论的基线版本必须与15头部一致")
             scope = refresh_summary.get("重新检索范围", "")
             if scope in {"已检索", "检索完成", "无", "不适用"}:
@@ -756,7 +765,7 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
             conclusion = refresh_summary.get("中文结论", "")
             if not re.search(r"[\u3400-\u9fff]", conclusion):
                 errors.append("本轮知识准备结论必须使用中文人话")
-            if conclusion and "不阻塞文章重写" not in conclusion:
+            if not compact(raw_text) and conclusion and "不阻塞文章重写" not in conclusion:
                 errors.append("本轮知识准备结论必须明确说明不阻塞文章重写")
         elif knowledge_mode == "new_article":
             for field in CONTRACTS["15_检索与知识准备记录.md"].get("new_fields", ()):
@@ -950,6 +959,12 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
                     if missing:
                         errors.append(f"CUS候选检测缺少固定类别：{'、'.join(missing)}")
     elif path.name == "30_本篇知识库资料.md":
+        from evidence_identity import material_contexts, field as identity_field
+        if identity_field(text, "证据模板版本") == "EC-1" or "证据归属（仅用于指代解析）" in text:
+            try:
+                material_contexts(text.splitlines(), required=identity_field(text, "证据模板版本") == "EC-1")
+            except ValueError as exc:
+                errors.append(str(exc))
         facts = section_body(text, "## 一、可直接用于正文的事实")
         if facts.strip() not in {"", "无"} and not re.search(r"证据正文", facts):
             errors.append("第一节的事实素材必须包含证据正文标记")
@@ -973,6 +988,33 @@ def validate_file(path: Path, contract_name: str | None = None) -> list[str]:
     return errors
 
 
+def coverage_mapping_errors(retrieval: str, audit: str, index: str) -> list[str]:
+    """Check declared question support against this run, without guessing meaning."""
+    errors = []
+    candidates = {r[0]: r for r in table_rows(retrieval, "## 候选事实处置明细") if len(r) >= 5}
+    by_question = {r[0]: r for r in table_rows(retrieval, "## 大纲逐项检索与候选事实覆盖") if len(r) >= 8}
+    mapped = {r[3] for r in table_rows(index, "## 写作素材到正式知识映射") if len(r) >= 4}
+    sufficiency = {r[0]: r for r in table_rows(audit, "## 知识准备充分性复核") if len(r) >= 6}
+    for row in table_rows(audit, "## 大纲知识覆盖检查"):
+        if len(row) < 6 or row[0] not in by_question:
+            continue
+        question = row[0]
+        matrix = by_question[question]
+        refs = set(re.findall(r"CF-\d{3}", matrix[3]))
+        eligible = {cid for ref in refs for cid in re.findall(r"CLM-[A-Za-z0-9-]+", candidates.get(ref, [""] * 5)[4])
+                    if candidates.get(ref, [""] * 5)[3] in {"已沉淀Formal Claim", "复用已有Formal Claim"}}
+        claimed = set(re.findall(r"CLM-[A-Za-z0-9-]+", row[3]))
+        if claimed - eligible:
+            errors.append(f"20的{question}引用了未在15为该问题采用的Claim：{sorted(claimed - eligible)}")
+        if row[2] == "已覆盖" and (not claimed or not claimed <= mapped):
+            errors.append(f"20的{question}标已覆盖但Claim未完整进入当前35")
+        if row[2] == "已覆盖" and row[4] not in {"无", "不适用"}:
+            errors.append(f"20的{question}仍有缺口/治理事项，不能标已覆盖")
+        if row[2] in {"部分覆盖", "未覆盖"} and sufficiency.get(question, [""] * 6)[4] == "充分":
+            errors.append(f"20的{question}覆盖状态与充分结论冲突")
+    return errors
+
+
 def validate_task_templates(task_dir: Path) -> list[str]:
     errors: list[str] = []
     for name in CONTRACTS:
@@ -984,6 +1026,20 @@ def validate_task_templates(task_dir: Path) -> list[str]:
     audit = task_dir / "20_文章前知识审核.md"
     if request.is_file():
         request_text = request.read_text(encoding="utf-8-sig")
+        preparation_protocol = parse_field(request_text, "知识准备记录协议")
+        if preparation_protocol and preparation_protocol != "PR-1":
+            errors.append("10知识准备记录协议未知，不得自动降级")
+        if preparation_protocol == "PR-1" and retrieval.is_file():
+            if not compact(retrieval.read_text(encoding="utf-8-sig")):
+                errors.append("15须使用10声明的PR-1六节模板；由知识库合并本轮记录后继续")
+        from governance_source_check import HEADER as source_header, HEADING as source_heading, PROTOCOL
+        protocol = parse_field(request_text, "来源核验模板版本")
+        if protocol and protocol != PROTOCOL:
+            errors.append("10来源核验模板版本未知，不得自动降级")
+        if protocol == PROTOCOL and retrieval.is_file():
+            source_text = retrieval.read_text(encoding="utf-8-sig")
+            if tuple(table_header(source_text, source_heading)) != source_header or not table_rows(source_text, source_heading):
+                errors.append("15缺少固定CUS / ANM来源核验记录；知识库继续回源核验，不得以临时任务笔记替代")
         requested = outline_labels(request_text)
         expected = ["标题", "主问题", *requested]
         checks = (
@@ -1022,6 +1078,12 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                         f"15与20的候选事实/已沉淀Claim计数不一致：{label}，"
                         f"15={counts[0]}/{counts[1]}，20={sufficiency_counts[label][0]}/{sufficiency_counts[label][1]}"
                     )
+            if preparation_protocol == "PR-1":
+                errors.extend(coverage_mapping_errors(
+                    retrieval.read_text(encoding="utf-8-sig"),
+                    audit.read_text(encoding="utf-8-sig"),
+                    (task_dir / "35_写作素材来源索引.md").read_text(encoding="utf-8-sig")
+                    if (task_dir / "35_写作素材来源索引.md").is_file() else ""))
             complex_rows = complex_material_rows(retrieval.read_text(encoding="utf-8-sig"))
             review_rows = table_rows(
                 audit.read_text(encoding="utf-8-sig"), "## 复杂资料与原件核对复核"
@@ -1127,7 +1189,7 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                         continue
                     if row[0].strip() != "无" and any(not cell.strip() for cell in row[:len(CLAIM_RECHECK_HEADER)]):
                         errors.append(f"15_检索与知识准备记录.md：{row[0] or '未编号事实'}本轮盘点记录不完整")
-                    if row[0].strip() != "无" and row[CLAIM_RECHECK_HEADER.index("本轮处置")].strip() not in {"复用", "更新", "拆分", "迁移", "失效", "不适用"}:
+                    if row[0].strip() != "无" and row[CLAIM_RECHECK_HEADER.index("本轮处置")].strip() not in {"新建", "复用", "更新", "拆分", "迁移", "失效", "排除", "治理", "不适用"}:
                         errors.append(
                             f"15_检索与知识准备记录.md：{row[0] or '未编号事实'}本轮处置必须使用复用/更新/拆分/迁移/失效/不适用"
                         )
@@ -1167,7 +1229,6 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                     for claim_id in re.findall(r"\bCLM-[A-Za-z0-9-]+\b", row[4])
                 }
                 expected_counts = {
-                    "基线Claim数": len(old_claims),
                     "本轮候选事实数": len({
                         row[0].strip() for row in candidate_rows
                         if row and re.fullmatch(r"CF-\d{3}", row[0].strip())
@@ -1189,7 +1250,6 @@ def validate_task_templates(task_dir: Path) -> list[str]:
                             f"15_检索与知识准备记录.md：本轮知识准备结论的{label}与明细不一致，"
                             f"应为{expected_count}，实际为{value}"
                         )
-                archive = resolve_archive_entry(task_dir, archive_entry)
                 gap_review_rows = table_rows(retrieval_text, "## 本轮待调研缺口复核")
                 explicit_gap_ids = {
                     row[0].strip() for row in gap_review_rows
