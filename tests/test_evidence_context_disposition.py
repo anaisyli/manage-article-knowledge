@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manage-article-knowledge-v0.6.1" / "scripts"))
 from import_faithfulness import load_disposition, source_scope, validate_disposition_links
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "scripts"
+SCRIPTS = ROOT / "manage-article-knowledge-v0.6.1" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import batch_knowledge_run  # noqa: E402

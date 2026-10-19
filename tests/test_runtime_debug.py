@@ -9,7 +9,7 @@ import contextlib
 import io
 from unittest.mock import patch
 
-SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
+SCRIPTS = Path(__file__).resolve().parents[1] / 'manage-article-knowledge-v0.6.1' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 from run_outline_refresh import check_task
 from manage_skill_feedback import transition, audit

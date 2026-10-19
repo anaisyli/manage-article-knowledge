@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'manage-article-knowledge-v0.6.1' / 'scripts'))
 from record_project_run import LEDGER_RELATIVE, append_record, make_record, validate_ledger
 from validate_v06_project import extract_source_ids, validate_run_ledger, validate_source_references, validate_version_archives
 from archive_project_version import create_archive

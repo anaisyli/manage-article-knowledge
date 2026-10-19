@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "manage-article-knowledge-v0.6.1" / "scripts"))
 from test_evidence_identity import formal_fixture
 import test_validation_lifecycle
 from evidence_identity import material_contexts

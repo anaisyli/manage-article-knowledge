@@ -8,14 +8,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+SKILL = ROOT / "manage-article-knowledge-v0.6.1"
+sys.path.insert(0, str(SKILL / "scripts"))
 
 from workflow_terminal import assert_terminal_event, decide, decision_from_gate_output  # noqa: E402
 
 
 class WorkflowTerminalTests(unittest.TestCase):
     def test_issue_gate_missing_arguments_emits_recoverable_receipt(self) -> None:
-        script = ROOT / "scripts" / "issue_writing_ready.py"
+        script = SKILL / "scripts" / "issue_writing_ready.py"
         result = subprocess.run(
             [sys.executable, str(script)],
             capture_output=True,
@@ -28,7 +29,7 @@ class WorkflowTerminalTests(unittest.TestCase):
         self.assertIn("writing_gate_status=blocked", result.stdout)
 
     def test_issue_gate_unknown_task_emits_recoverable_receipt(self) -> None:
-        script = ROOT / "scripts" / "issue_writing_ready.py"
+        script = SKILL / "scripts" / "issue_writing_ready.py"
         with tempfile.TemporaryDirectory() as temp:
             result = subprocess.run(
                 [
@@ -51,7 +52,7 @@ class WorkflowTerminalTests(unittest.TestCase):
         self.assertIn("writing_gate_status=blocked", result.stdout)
 
     def test_issue_gate_missing_article_identity_emits_recoverable_receipt(self) -> None:
-        script = ROOT / "scripts" / "issue_writing_ready.py"
+        script = SKILL / "scripts" / "issue_writing_ready.py"
         with tempfile.TemporaryDirectory() as temp:
             result = subprocess.run(
                 [

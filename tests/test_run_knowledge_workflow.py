@@ -9,8 +9,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "run_knowledge_workflow.py"
-sys.path.insert(0, str(ROOT / "scripts"))
+SKILL = ROOT / "manage-article-knowledge-v0.6.1"
+SCRIPT = SKILL / "scripts" / "run_knowledge_workflow.py"
+sys.path.insert(0, str(SKILL / "scripts"))
 
 import run_knowledge_workflow as workflow  # noqa: E402
 

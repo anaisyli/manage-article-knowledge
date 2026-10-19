@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manage-article-knowledge-v0.6.1" / "scripts"))
 from external_research_links import (FIELDS, GAP_CSV, HEADING, PROTOCOL, RESEARCH_ROOT,
                                     links_for_gap, parse_links, record_link, research_records,
                                     validate_research_links)
@@ -163,7 +163,7 @@ class ResearchLinkTests(unittest.TestCase):
         self.assertEqual(next_gap_key([{"gap_key": k} for k in ("GAP-001-020", "GAP-027", "GAP-P005-RIGID-CONSTRUCTION")], "P-005"), "GAP-P005-028")
 
     def test_auto_topic_reuses_legacy_key_via_cli(self):
-        args = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "scripts/record_knowledge_gap.py"),
+        args = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "manage-article-knowledge-v0.6.1/scripts/record_knowledge_gap.py"),
                 "--csv", str(self.root / GAP_CSV), "--gap-key", "auto", "--topic", self.gaps[0]["gap_topic"],
                 "--article-id", "ART-001", "--article-date", "2026-10-13", "--trigger-basis", "核心章节首次"]
         result = subprocess.run(args, capture_output=True)

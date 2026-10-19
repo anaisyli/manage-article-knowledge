@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manage-article-knowledge-v0.6.1" / "scripts"))
 import writing_bridge as bridge
 import template_contract
 import batch_knowledge_run as batch

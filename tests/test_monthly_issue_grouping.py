@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "manage-article-knowledge-v0.6.1" / "scripts"))
 
 from monthly_issue_grouping import group_errors, render_groups, validate_report_grouping  # noqa: E402
 

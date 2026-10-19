@@ -7,7 +7,7 @@ import tempfile
 import unittest
 import zipfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "manage-article-knowledge-v0.6.1" / "scripts"))
 import governance_source_check as sources
 from prewrite_governance import _reference_text, governance_errors
 

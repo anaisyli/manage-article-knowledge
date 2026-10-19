@@ -1,0 +1,4 @@
+interface:
+  display_name: "文章知识库运营管家 v0.3"
+  short_description: "自动提取资料并调度审核，完成企业知识库闭环"
+  default_prompt: "使用 $manage-article-knowledge 自动核对已有项目版本，优先调用MinerU API取得资料并记录关键运行，完成资料处理、知识沉淀和文章闭环。"

@@ -8,7 +8,7 @@ import io
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'manage-article-knowledge-v0.6.1' / 'scripts'))
 from preparation_record import (HEADINGS, CANDIDATE_HEADER, MATERIAL_HEADER, MAT_HEADER,
                                 counts, table, validation_view, protocol_errors, normalize)
 from template_contract import coverage_mapping_errors, website_manifest_errors, WEBSITE_EVIDENCE_HEADER
@@ -68,7 +68,7 @@ class PreparationRecordTests(unittest.TestCase):
             root = Path(tmp) / 'P-005_测试'
             path = root / '05_数据与审核/20_知识库覆盖与缺口/10_知识缺口记录.csv'
             path.parent.mkdir(parents=True)
-            args = [sys.executable, '-B', str(Path(__file__).resolve().parents[1] / 'scripts/record_knowledge_gap.py'), '--csv', str(path), '--topic', '纸盒湿度条件与耐用性验证方法', '--article-id', 'ART-001', '--article-date', '2026-10-14', '--trigger-basis', '核心章节首次']
+            args = [sys.executable, '-B', str(Path(__file__).resolve().parents[1] / 'manage-article-knowledge-v0.6.1/scripts/record_knowledge_gap.py'), '--csv', str(path), '--topic', '纸盒湿度条件与耐用性验证方法', '--article-id', 'ART-001', '--article-date', '2026-10-14', '--trigger-basis', '核心章节首次']
             made = subprocess.run(args, capture_output=True)
             self.assertEqual(made.returncode, 0, made.stderr)
             self.assertEqual(read_rows(path)[0]['gap_key'], 'GAP-P005-001')
