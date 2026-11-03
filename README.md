@@ -1,14 +1,14 @@
 # manage-article-knowledge
 
-面向文章生产的轻量企业知识库管理 Skill，当前活动版本为 `manage-article-knowledge v0.6.1`，位于 `manage-article-knowledge-v0.6.1/`。`v0.6` 已冻结到 `versions/`；运行时版本以实际安装目录中的 `SKILL.md` 标题和项目版本门禁为准。
+面向文章生产的轻量企业知识库管理 Skill，当前活动版本为 `manage-article-knowledge v0.6.4`，位于 `manage-article-knowledge-v0.6.4/`。已归档版本见 `versions/`，版本更新记录见 `changelog/`；运行时版本以实际安装目录中的 `SKILL.md` 标题和项目版本门禁为准。
 
 本 Skill 负责把写作需求转换成可治理的知识任务：检索和核验来源、维护正式 Claim、生成本篇唯一知识附件、接收终稿、导入独立 Faithfulness 结果，并维护文章和项目治理状态。它不写文章，不执行 SEO/GEO 评价，也不自行完成 Faithfulness 判断。
 
 ## 先看手册
 
-第一次使用、不清楚下一步怎么做，或需要人工操作提示时，先读：[内容运营操作手册](manage-article-knowledge-v0.6.1/references/operator-guide.md)。
+第一次使用、不清楚下一步怎么做，或需要人工操作提示时，先读：[内容运营操作手册](manage-article-knowledge-v0.6.4/references/operator-guide.md)。
 
-手册是面向日常使用的入口；字段、状态、版本兼容和机器交接的硬规则以 [v0.6.1 Skill](manage-article-knowledge-v0.6.1/SKILL.md)、[三方交接规范](manage-article-knowledge-v0.6.1/references/skill-integration-handoff.md) 和 [机器交接合同](manage-article-knowledge-v0.6.1/references/handoff-contract.json) 为准。
+手册是面向日常使用的入口；字段、状态、版本兼容和机器交接的硬规则以 [v0.6.4 Skill](manage-article-knowledge-v0.6.4/SKILL.md)、[三方交接规范](manage-article-knowledge-v0.6.4/references/skill-integration-handoff.md) 和 [机器交接合同](manage-article-knowledge-v0.6.4/references/handoff-contract.json) 为准。
 
 ## 最短用法
 
@@ -19,7 +19,7 @@
 | 提示 | 处理方式 |
 | --- | --- |
 | 按原大纲重新整理知识并重写 | 保留原 `outline_id`/`outline_version`，重新执行六层检索（含客户官网正文）、处理资料、复核 Claim，重建 `15/20/30/35` 后重写 |
-| 知识不变，只按原大纲重写 | 校验并复用当前文章前文件，只重写并重新审核 |
+| 知识不变，只按原大纲重写 | 锁定旧版本 `35` 映射的 Claim（不得删除、弃用或新增），`20` 沿用并按当前 PR-2 模板整理，`30/35` 由脚本按当前模板从锁定 Claim 重建，然后重写并重新审核；旧资料包不会因模板更新而卡在门禁 |
 
 没有明确选择时，先确认模式；不要人工填写 Claim、文章版本或脚本参数。两种模式都会保留原文章 ID 并递增文章版本；同大纲身份不匹配、缺失或基线关系不一致时，知识库会拒绝归档和交付推进。
 
@@ -43,6 +43,8 @@
 
 `writing_ready` 只有在检索、来源核验、正式 Claim、文章前审核、`30/35` 校验和项目门禁全部通过后才能发出。未决的资料处理、客户确认、异常或公共知识事项不能被跳过。
 
+批次任务会保存不依赖客户端钩子的续接指针，后续调用可核对已完成步骤并按最新回执继续。可选的 Codex 结束钩子需要单独验收；Skill 和进度文件不能唤醒已经结束的 AI 会话。
+
 ## 文章前工作
 
 - 读取写作需求，确认项目、文章 ID、版本、标题或主题及非空简要大纲。
@@ -55,6 +57,8 @@
 
 `30_本篇知识库资料.md` 是唯一交给写作 Skill 的知识事实附件；`35_写作素材来源索引.md` 保存 `30` 证据正文到正式 Claim 的内部映射。写作 Skill 不读取完整知识库，也不修改知识库内部文件。
 
+写作许可签发后，`30` 若只被改了换行符、文字未变，终稿接收、审核申请和导入会自动恢复写作许可绑定的原字节并继续，`35`、`50` 的哈希核对同样忽略换行差异；文字有任何变化仍会拒绝。
+
 知识库接收终稿后，提取正文文字、列表和表格，生成内部 `40_最终文章.md`。文章身份、关键词、TDK、图片清单和交付说明位于正文边界之外；Faithfulness 只审核 `ARTICLE_BODY_START` 与 `ARTICLE_BODY_END` 之间的正文。知识库随后接收审核结果，更新 `50_文章知识使用与Faithfulness记录.md`、Claim 支撑、缺口和任务状态，并把任务迁移到 `40_已完成`。
 
 ## 项目接入与目录
@@ -63,7 +67,7 @@
 
 每次开始既有 v0.6 项目时，后台先运行 `scripts/check_skill_update.py --project <项目根路径>`。项目接入配置确认写作任务入口、终稿入口和 Faithfulness 结果根目录；无法唯一判断或需要业务决定时才请求人工处理。
 
-Faithfulness 结果采用审核 Skill 的协议 2.0：两轮独立阅读全文识别原子主张并取并集，冻结分母后再判断证据；正式指标为`明确支持 ÷（明确支持 + 尚未确认 + 明确冲突）`。DeepEval `yes/no/idk` 默认兼容率只保留在机器 JSON/CSV 中，`idk`进入兼容分子仅表示“未被明确否定”，不是“得到支持”。受管结果必须带独立的 `adversarial-review.json`和`reconciliation.gate_version=1.0`双轮自动收敛记录；只有双轮一致且结构化语义覆盖通过的主张可保持绿色 `entailed`，缺证或分歧落为黄色 `unknown`，只有同对象、范围、条件和时间/版本下的明确不相容证据经双轮确认才为红色 `contradicted`。标题、结构化表头等非主张内容显示为灰色且不计入分母。单篇记录、月报和交接页分别展示三态，不显示 DeepEval 兼容百分比。该指标没有目标值，不决定文章质量、发布资格或是否需要重写。旧协议结果仍可读取，不会被伪装成新协议结果。
+Faithfulness 由 `deepeval-article-audit` 独立审核，正式指标为`明确支持 ÷（明确支持 + 尚未确认 + 明确冲突）`：两轮独立抽取主张取并集并冻结分母，每条主张判断一次，只有第一轮判为明确支持或明确冲突的再由独立上下文复核，第一轮尚未确认的直接定为 unknown。单篇记录、月报和交接页分别展示三态（绿/黄/红，灰色非主张不计入），不显示 DeepEval 兼容百分比；该指标没有目标值，不决定文章质量、发布资格或是否需要重写。审核口径和门禁的细节以审核 Skill 的 README 与 `SKILL.md` 为准；旧协议结果仍可读取，不会被伪装成新协议结果。
 
 标准项目结构：
 
@@ -94,32 +98,31 @@ Faithfulness 结果采用审核 Skill 的协议 2.0：两轮独立阅读全文�
 
 ## 常用机器入口
 
-以下路径相对于活动包 `manage-article-knowledge-v0.6.1/`；运行脚本前先进入该目录。仓库级回归在仓库根目录运行 `python -m unittest discover -s tests`，活动包内回归运行 `python -m unittest discover -s manage-article-knowledge-v0.6.1/tests`。
-
 - `scripts/discover_workspace.py`：只读盘点待接入项目。
 - `scripts/onboard_workspace.py`：按已确认范围批量初始化和接入项目。
 - `scripts/writing_bridge.py`：写作 Skill 的 `prepare` / `finalize` 交接桥。
 - `scripts/run_knowledge_workflow.py`：批次知识准备唯一编排入口；只接收项目路径和批次 ID，自动定位账本并写入可恢复运行回执。
+- `scripts/workflow_progress.py`：核对或恢复批次续接指针；基础模式不需要 Codex 会话身份或结束钩子。
 - `scripts/batch_knowledge_run.py`：批次证据账本的内部校验/整理组件，不应由调用方直接拼接参数运行。
 - `scripts/advance_ready_tasks.py`：通过门禁后移入等待终稿。
 - `scripts/create_faithfulness_record.py`：创建 `50`、锁定 `40/30` 哈希并发出审核请求。
-- `scripts/import_faithfulness.py`：导入结果、更新治理记录并迁移状态。
+- `scripts/import_faithfulness.py`：导入结果、更新治理记录并迁移状态。受管导入只需 `--task-dir <30_等待Faithfulness 下的任务目录> --disposition <处置JSON>`，其余路径、版本、合同和日期由脚本推出；`--check-only` 只做身份、哈希、写作许可绑定和 30/35 映射预检，不写任何记录。
 - `scripts/validate_v06_project.py`：校验项目结构、模板、Claim、映射、哈希和状态。
 
 ## 边界与维护
 
 客户原始资料、外部终稿、配图和 Faithfulness 结果由各自入口保存，知识库不覆盖原件。项目运行时默认只修改项目自己的 Obsidian 文件、机器数据和运行记录；发现通用规则或工具问题时记录 Skill 反馈，不在客户任务中顺手修改 Skill 本体。修改本 Skill、references、scripts 或 agents 配置前，需获得维护负责人或用户明确授权，并同步更新更新记录和测试。
 
-本仓库保存 Skill、参考文件、模板、脚本和更新记录，不保存客户项目或 Token。详细规则按需读取 `manage-article-knowledge-v0.6.1/references/` 下的运行清单、工作流、批次合同、模板、交接、版本和治理文档。
+本仓库保存 Skill、参考文件、模板、脚本和更新记录，不保存客户项目或 Token。详细规则按需读取 `manage-article-knowledge-v0.6.4/references/` 下与当前任务相关的运行清单、工作流、批次合同、模板、交接、版本和治理文档。
 
 ## 入口文件
 
-- [v0.6.1 Skill](manage-article-knowledge-v0.6.1/SKILL.md)
-- [内容运营操作手册](manage-article-knowledge-v0.6.1/references/operator-guide.md)
-- [文章知识工作流](manage-article-knowledge-v0.6.1/references/article-knowledge-workflow.md)
-- [项目结构与模板](manage-article-knowledge-v0.6.1/references/project-structure-and-templates.md)
-- [三方交接规范](manage-article-knowledge-v0.6.1/references/skill-integration-handoff.md)
-- [机器交接合同](manage-article-knowledge-v0.6.1/references/handoff-contract.json)
-- [Faithfulness 结果交接规范](manage-article-knowledge-v0.6.1/references/faithfulness-result-contract.md)
-- [版本与归档合同](manage-article-knowledge-v0.6.1/references/version-and-archive-contract.md)
-- [v0.6.1 更新记录](changelog/企业知识库Skill_v0.6.1版本说明与更新记录.md)
+- [v0.6.4 Skill](manage-article-knowledge-v0.6.4/SKILL.md)
+- [内容运营操作手册](manage-article-knowledge-v0.6.4/references/operator-guide.md)
+- [文章知识工作流](manage-article-knowledge-v0.6.4/references/article-knowledge-workflow.md)
+- [项目结构与模板](manage-article-knowledge-v0.6.4/references/project-structure-and-templates.md)
+- [三方交接规范](manage-article-knowledge-v0.6.4/references/skill-integration-handoff.md)
+- [机器交接合同](manage-article-knowledge-v0.6.4/references/handoff-contract.json)
+- [Faithfulness 结果交接规范](manage-article-knowledge-v0.6.4/references/faithfulness-result-contract.md)
+- [版本与归档合同](manage-article-knowledge-v0.6.4/references/version-and-archive-contract.md)
+- [v0.6.4 更新记录](changelog/企业知识库Skill_v0.6.4版本说明与更新记录.md)（历史版本见 [版本记录索引](changelog/版本记录索引.md)）

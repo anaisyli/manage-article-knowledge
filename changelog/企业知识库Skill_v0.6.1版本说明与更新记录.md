@@ -23,7 +23,7 @@
 |---|---|
 | v0.6冻结位置 | `versions/manage-article-knowledge-v0.6/` |
 | v0.6兼容活动位置 | `manage-article-knowledge-v0.6/` |
-| v0.6.1活动位置 | `manage-article-knowledge-v0.6.1/` |
+| v0.6.1冻结位置 | `versions/manage-article-knowledge-v0.6.1/` |
 | v0.6.1建立方式 | 完整复制 v0.6 后增加批次运行合同和证据账本入口 |
 | v0.6原有客户兼容 | v0.6 项目仍按原版本运行；v0.6.1 项目需单独确认升级和回归 |
 
@@ -100,8 +100,7 @@
 | SK-V061-057 | 2026-10-14：15重复盘点冗余、无关联GAP残留；20可能机械复用Claim却标充分；原大纲重整缺少当前包完成后才可查看旧包的明确约束 | 新建和outline_refresh使用PR-1固定六节；来源命中与Claim核验/动作合并到九列明细，五项结论按明细计算，官网主动搜索和连续正文凭证、GC-1及特殊资料核验保持。20逐问题校验CF→Claim→35映射与覆盖/充分性一致；无GAP五列均无，审核后GAP不倒填15，新GAP只能auto，历史键可更新。run_outline_refresh在已有运行JSON登记当前需求及四文件哈希绑定的后置只读对照许可，文件变更失效，正常不加资料包变化表；内部可恢复项由知识库重建继续，不放宽writing_ready | `scripts/preparation_record.py`、`scripts/template_contract.py`、`scripts/writing_bridge.py`、`scripts/run_outline_refresh.py`、`scripts/article_state.py`、`scripts/recover_article_package.py`、`scripts/record_knowledge_gap.py`、`scripts/validate_v06_project.py`、15固定模板/工作流/清单/交接与命名说明、`tests/test_preparation_record.py`；知识库138项、审核106项回归全部通过（跨Skill导入已启用）；桥接器、模板与推进专项自测通过；两套79个脚本/测试AST检查通过，安装版Junction与D盘一致；未修改写作Skill、真实文章/Claim/历史审核或项目台账，Skill quick_validate因本机缺少PyYAML未运行成功，另行检查frontmatter基本字段与安装关联 |
 
 | SK-V061-058 | 2026-10-15：原大纲重整长时间重复恢复；当前10已升版，批次可能登记旧版本或默认new_article；官网同步把文章运行ID当成批次ID，哈希候选编号又不符合PR-1；30/35同时缺失无法首次生成；未闭环来源读取丢失、整批阻塞和迁移后未签许可可能反复空转 | 批次身份统一从提交后的10和运行JSON读取；省略模式沿用当前任务，同一请求重放幂等恢复及补登记，不再次归档或升版，显式冲突模式拒绝。官网凭证严格绑定本篇当前research/refresh运行，旧run明示跳过、版本/指纹冲突报具体恢复条件；CF使用三位流水号，capture_id独立存指纹。source_reads在Claim闭环前保存，校验失败不清空；非采用候选须有同源同run处置和具体依据，治理须有真实入口，不要求伪造Claim。恢复器从当前15逐问题映射与本轮已核验完整Claim生成缺失30/35并重算归属、行号、哈希；不读取旧包，不伪造六层检索、官网访问或GC-1通过。批次按文章独立校验和推进，保留pending_steps，已迁移任务也可恢复签许可；无输入变化的语义失败只校验一次，真实I/O失败仍有限重试 | `scripts/writing_bridge.py`、`sync_website_evidence.py`、`batch_knowledge_run.py`、`recover_article_package.py`、`run_knowledge_workflow.py`、`article_state.py`、`advance_ready_tasks.py`、`SKILL.md`、批次合同和两份恢复回归测试；知识库145项通过，审核106项兼容回归通过（含真实v0.5导入互操作）；66个脚本/测试AST通过，批次与工作流自测通过。临时项目实跑new_article/outline_refresh从缺失30/35至writing_ready、重复恢复moved_count=0、同批另一篇未完成仍逐篇推进、旧run/旧版本/错指纹拒绝、候选排除闭环及中断补登记；D盘与安装Junction一致。通用quick_validate因运行时缺PyYAML未完成，未安装额外依赖。Git最后提交为2026-09-22，不能据此归因于10月14单次更新；PR-1表格解析已有兼容，未认定其为根因。不修改写作/审核Skill、真实Obsidian文章、Claim或历史结果 |
-| SK-V061-059 | 2026-10-16：同一批次文章从v2切换到v3/新research或refresh运行后，旧evidence、capture_inbox和source_reads仍留在活动账本；当前运行没有官网凭证时，入口只重复门禁，无法继续真实来源检索，导致“候选事实未绑定当前运行ID”持续阻塞 | 提交已确认的当前10和运行JSON后，按文章身份比较版本、模式及当前research/refresh运行；发生切换时把旧文章成员、evidence、capture_inbox、source_reads和问题记录写入run_history，活动区只保留当前运行，无法唯一归属的共享来源拒绝覆盖。严格门禁覆盖三类活动记录并按文章独立推进；当前凭证为空时回执为`terminal=false`的`source_collection`，明确继续来源检索、写入当前凭证、重建证据并重跑门禁；`knowledge_reuse_rewrite`沿用旧证据，不误触发新运行隔离 | `scripts/batch_revision.py`、`writing_bridge.py`、`sync_website_evidence.py`、`batch_knowledge_run.py`、`run_knowledge_workflow.py`、`run_outline_refresh.py`、`archive_project_version.py`、`SKILL.md`、批次/归档合同、`tests/test_batch_revision.py`及工作流续跑回归；156项Skill回归通过，批次/归档/工作流self-test通过，68个Python脚本/测试AST通过；通用quick_validate因运行时缺PyYAML未执行；D盘活动版与安装Junction一致，未修改真实客户项目、写作Skill或审核Skill |
-| SK-V061-060 | 2026-10-19：PR #10 的更新分支采用根目录 Skill 布局，与 main 的版本目录、历史包及更新记录产生合并冲突 | 保留 main 的版本目录、README、历史更新记录与冻结版本；最新活动 Skill 放入 `manage-article-knowledge-v0.6.1/`。保留双方测试，修正仓库测试的脚本定位，补回 main 独有的客户标记回归；同步正式 v0.6.1 更新记录，修正导航，不修改运行规则 | PR #10 合并冲突修复；仓库入口 166 项、活动包内 157 项单元测试全部通过，两套存在重复覆盖，不合计为独立用例数；不修改真实客户数据、写作 Skill 或审核 Skill |
+| SK-V061-059 | 2026-10-16：同一批次文章从v2切换到v3/新research或refresh运行后，旧evidence、capture_inbox和source_reads仍留在活动账本；当前运行没有官网凭证时，入口只重复门禁，无法继续真实来源检索，导致“候选事实未绑定当前运行ID”持续阻塞 | 提交已确认的当前10和运行JSON后，按文章身份比较版本、模式及当前research/refresh运行；发生切换时把旧文章成员、evidence、capture_inbox、source_reads和问题记录写入run_history，活动区只保留当前运行，无法唯一归属的共享来源拒绝覆盖。严格门禁覆盖三类活动记录并按文章独立推进；当前凭证为空时回执为`terminal=false`的`source_collection`，明确继续来源检索、写入当前凭证、重建证据并重跑门禁；`knowledge_reuse_rewrite`沿用旧证据，不误触发新运行隔离 | `scripts/batch_revision.py`、`writing_bridge.py`、`sync_website_evidence.py`、`batch_knowledge_run.py`、`run_knowledge_workflow.py`、`run_outline_refresh.py`、`archive_project_version.py`、`SKILL.md`、批次/归档合同、`tests/test_batch_revision.py`及工作流续跑回归；156项Skill回归通过，批次/归档/工作流self-test通过，68个Python脚本/测试AST通过；通用quick_validate因运行时缺PyYAML未执行；D盘活动版与安装Junction一致，未修改真实客户项目、写作Skill或审核Skill | 
 
 ## 五、回归范围
 
@@ -145,3 +144,5 @@ python scripts/run_knowledge_workflow.py --project <Obsidian项目路径> --batc
 ```
 
 该入口解决参数漏传和错误误终止问题，并自动同步当前批次网页凭证；它不会把未核验候选变成有效证据，也不会绕过 Formal Claim、`30/35` 或 `writing_ready` 门禁。无法自动闭环的候选必须由知识库流程继续核验、沉淀或治理后再运行同一入口。
+
+
